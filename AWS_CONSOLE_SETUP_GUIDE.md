@@ -10,7 +10,7 @@ Liquibook 매칭 엔진을 위한 AWS 인프라 전반부 세팅 가이드입니
 ```
 Client → API Gateway (REST) → Lambda (Order Router) → MSK (Kafka) → EC2 (Matching Engine)
    ↑                              ↓                                         ↓
-   └── API Gateway (WebSocket) ←──┴── ElastiCache (Redis) ←─────── 체결 결과
+   └── API Gateway (WebSocket) ←──┴── ElastiCache (Valkey) ←─────── 체결 결과
 ```
 
 ---
@@ -19,7 +19,7 @@ Client → API Gateway (REST) → Lambda (Order Router) → MSK (Kafka) → EC2 
 
 1. [사전 준비](#1-사전-준비)
 2. [VPC 및 보안 그룹 설정](#2-vpc-및-보안-그룹-설정)
-3. [ElastiCache Redis 세팅](#3-elasticache-redis-세팅)
+3. [ElastiCache Valkey 세팅](#3-elasticache-valkey-세팅)
 4. [Amazon MSK (Kafka) 세팅](#4-amazon-msk-kafka-세팅)
 5. [Lambda 함수 세팅](#5-lambda-함수-세팅)
 6. [API Gateway REST API 세팅](#6-api-gateway-rest-api-세팅)
@@ -85,11 +85,11 @@ AWS Console 우측 상단 → **아시아 태평양 (서울) ap-northeast-2** �
 | VPC | liquibook-vpc |
 | Outbound | All traffic (0.0.0.0/0) |
 
-#### SG 2: Redis용
+#### SG 2: Valkey용
 
 | 설정 | 값 |
 |---|---|
-| Name | `liquibook-redis-sg` |
+| Name | `liquibook-valkey-sg` |
 | VPC | liquibook-vpc |
 | Inbound | TCP 6379 from `liquibook-lambda-sg` |
 
@@ -104,16 +104,18 @@ AWS Console 우측 상단 → **아시아 태평양 (서울) ap-northeast-2** �
 
 ---
 
-## 3. ElastiCache Redis 세팅
+## 3. ElastiCache Valkey 세팅
 
-**ElastiCache** → **Redis OSS caches** → **Create Redis OSS cache**
+**ElastiCache** → **Valkey caches** → **Create Valkey cache**
+
+> **Valkey란?** Redis의 오픈소스 포크로, Redis와 100% 호환되면서 BSD 라이선스를 유지합니다. AWS ElastiCache가 2024년부터 공식 지원합니다.
 
 ### 3.1 기본 설정
 
 | 설정 | 값 | 설명 |
 |---|---|---|
 | Cluster mode | Disabled | MVP 규모에 적합 |
-| Name | `liquibook-redis` | |
+| Name | `liquibook-valkey` | |
 | Location | AWS Cloud | |
 | Multi-AZ | Disabled | 비용 절감 (MVP) |
 
@@ -123,16 +125,16 @@ AWS Console 우측 상단 → **아시아 태평양 (서울) ap-northeast-2** �
 |---|---|
 | Node type | `cache.t3.micro` |
 | Number of replicas | 0 (MVP) |
-| Engine version | 7.x (최신) |
+| Engine version | 7.2 (Valkey 호환) |
 
 ### 3.3 연결 설정
 
 | 설정 | 값 |
 |---|---|
 | Network type | IPv4 |
-| Subnet group | 새로 생성 → `liquibook-redis-subnet` |
+| Subnet group | 새로 생성 → `liquibook-valkey-subnet` |
 | Subnets | 위에서 만든 private 서브넷들 선택 |
-| Security groups | `liquibook-redis-sg` |
+| Security groups | `liquibook-valkey-sg` |
 
 ### 3.4 보안 설정
 
@@ -149,7 +151,7 @@ AWS Console 우측 상단 → **아시아 태평양 (서울) ap-northeast-2** �
 ### 3.5 엔드포인트 확인
 
 생성 완료 후:
-- **Primary endpoint** 복사 (예: `liquibook-redis.xxxxx.apn2.cache.amazonaws.com:6379`)
+- **Primary endpoint** 복사 (예: `liquibook-valkey.xxxxx.apn2.cache.amazonaws.com:6379`)
 
 ---
 
@@ -167,7 +169,7 @@ AWS Console 우측 상단 → **아시아 태평양 (서울) ap-northeast-2** �
 |---|---|
 | Cluster name | `liquibook-msk` |
 | Cluster type | Provisioned |
-| Apache Kafka version | 3.5.x (최신 안정 버전) |
+| Apache Kafka version | 3.5.x (MSK에서 지원하는 최신 안정 버전) |
 | Broker type | `kafka.t3.small` |
 | Number of zones | 2 |
 | Storage | 100 GiB per broker |
@@ -224,7 +226,7 @@ kafka-topics.sh --create --topic fills --bootstrap-server <bootstrap-servers> \
 - `AWSLambdaVPCAccessExecutionRole`
 - `AWSLambdaBasicExecutionRole`
 
-**인라인 정책 추가** (MSK, ElastiCache 접근용):
+**인라인 정책 추가** (MSK, ElastiCache Valkey 접근용):
 
 ```json
 {
@@ -281,9 +283,9 @@ kafka-topics.sh --create --topic fills --bootstrap-server <bootstrap-servers> \
 
 | Key | Value |
 |---|---|
-| `REDIS_HOST` | liquibook-redis 엔드포인트 |
-| `REDIS_PORT` | 6379 |
-| `REDIS_AUTH_TOKEN` | Redis 생성 시 설정한 토큰 |
+| `VALKEY_HOST` | liquibook-valkey 엔드포인트 |
+| `VALKEY_PORT` | 6379 |
+| `VALKEY_AUTH_TOKEN` | Valkey 생성 시 설정한 토큰 |
 | `MSK_BOOTSTRAP_SERVERS` | MSK 부트스트랩 서버 |
 | `ORDERS_TOPIC` | orders |
 
@@ -301,7 +303,7 @@ kafka-topics.sh --create --topic fills --bootstrap-server <bootstrap-servers> \
 
 ```javascript
 import { Kafka } from 'kafkajs';
-import Redis from 'ioredis';
+import Redis from 'ioredis'; // Valkey는 Redis 프로토콜 호환
 
 const kafka = new Kafka({
   clientId: 'order-router',
@@ -316,10 +318,11 @@ const kafka = new Kafka({
   },
 });
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST,
-  port: process.env.REDIS_PORT,
-  password: process.env.REDIS_AUTH_TOKEN,
+// Valkey는 Redis 클라이언트와 100% 호환
+const valkey = new Redis({
+  host: process.env.VALKEY_HOST,
+  port: process.env.VALKEY_PORT,
+  password: process.env.VALKEY_AUTH_TOKEN,
   tls: {},
 });
 
@@ -339,10 +342,10 @@ export const handler = async (event) => {
     }
     
     // 2. 라우팅 상태 확인
-    const routeInfo = await redis.get(`route:${order.symbol}`);
+    const routeInfo = await valkey.get(`route:${order.symbol}`);
     const route = routeInfo ? JSON.parse(routeInfo) : { status: 'ACTIVE' };
     
-    // 3. Kafka로 주문 전송
+    // 3. MSK로 주문 전송
     if (!producerConnected) {
       await producer.connect();
       producerConnected = true;
@@ -386,7 +389,7 @@ export const handler = async (event) => {
 
 Lambda Layer를 생성하여 `kafkajs`, `ioredis` 등의 의존성을 추가해야 합니다.
 
-로컬에서:
+로컬에서 (ioredis는 Valkey와 호환):
 ```bash
 mkdir nodejs && cd nodejs
 npm init -y
@@ -578,12 +581,12 @@ Lambda 통합 필요 (연결 ID 저장용):
 
 ```javascript
 // connect-handler Lambda
-import Redis from 'ioredis';
+import Redis from 'ioredis'; // Valkey 호환
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST,
-  port: process.env.REDIS_PORT,
-  password: process.env.REDIS_AUTH_TOKEN,
+const valkey = new Redis({
+  host: process.env.VALKEY_HOST,
+  port: process.env.VALKEY_PORT,
+  password: process.env.VALKEY_AUTH_TOKEN,
   tls: {},
 });
 
@@ -592,13 +595,13 @@ export const handler = async (event) => {
   const userId = event.queryStringParameters?.userId || 'anonymous';
   
   // 연결 정보 저장 (24시간 TTL)
-  await redis.setex(`ws:${connectionId}`, 86400, JSON.stringify({
+  await valkey.setex(`ws:${connectionId}`, 86400, JSON.stringify({
     userId,
     connectedAt: Date.now(),
   }));
   
   // 사용자별 연결 목록에 추가
-  await redis.sadd(`user:${userId}:connections`, connectionId);
+  await valkey.sadd(`user:${userId}:connections`, connectionId);
   
   return { statusCode: 200, body: 'Connected' };
 };
@@ -613,13 +616,13 @@ export const handler = async (event) => {
 export const handler = async (event) => {
   const connectionId = event.requestContext.connectionId;
   
-  const connInfo = await redis.get(`ws:${connectionId}`);
+  const connInfo = await valkey.get(`ws:${connectionId}`);
   if (connInfo) {
     const { userId } = JSON.parse(connInfo);
-    await redis.srem(`user:${userId}:connections`, connectionId);
+    await valkey.srem(`user:${userId}:connections`, connectionId);
   }
   
-  await redis.del(`ws:${connectionId}`);
+  await valkey.del(`ws:${connectionId}`);
   
   return { statusCode: 200, body: 'Disconnected' };
 };
@@ -637,7 +640,7 @@ export const handler = async (event) => {
   const { symbols } = body; // ["AAPL", "GOOGL"]
   
   for (const symbol of symbols) {
-    await redis.sadd(`symbol:${symbol}:subscribers`, connectionId);
+    await valkey.sadd(`symbol:${symbol}:subscribers`, connectionId);
   }
   
   return { statusCode: 200, body: 'Subscribed' };
@@ -666,8 +669,8 @@ const client = new ApiGatewayManagementApiClient({
 });
 
 async function broadcastFill(symbol, fillData) {
-  // 해당 종목 구독자 조회
-  const subscribers = await redis.smembers(`symbol:${symbol}:subscribers`);
+  // 해당 종목 구독자 조회 (Valkey에서)
+  const subscribers = await valkey.smembers(`symbol:${symbol}:subscribers`);
   
   for (const connectionId of subscribers) {
     try {
@@ -678,7 +681,7 @@ async function broadcastFill(symbol, fillData) {
     } catch (error) {
       if (error.statusCode === 410) {
         // 연결 끊김 - 정리
-        await redis.srem(`symbol:${symbol}:subscribers`, connectionId);
+        await valkey.srem(`symbol:${symbol}:subscribers`, connectionId);
       }
     }
   }
@@ -765,7 +768,7 @@ ws.onmessage = (event) => {
 
 - [ ] VPC 서브넷이 최소 2개 AZ에 구성됨
 - [ ] 보안 그룹 인바운드/아웃바운드 규칙 확인
-- [ ] Redis AUTH 토큰 안전하게 저장
+- [ ] Valkey AUTH 토큰 안전하게 저장
 - [ ] MSK 부트스트랩 서버 주소 확인
 - [ ] Lambda VPC 설정 완료
 - [ ] API Gateway API Key 생성 및 Usage Plan 연결
@@ -775,7 +778,7 @@ ws.onmessage = (event) => {
 ### 보안 점검
 
 - [ ] API Key가 클라이언트에 안전하게 배포됨
-- [ ] Redis 암호화 활성화 (in-transit, at-rest)
+- [ ] Valkey 암호화 활성화 (in-transit, at-rest)
 - [ ] MSK TLS 암호화 활성화
 - [ ] Lambda 환경 변수에 민감 정보 없음 (Secrets Manager 사용 권장)
 - [ ] Rate limiting 설정됨
@@ -787,7 +790,7 @@ ws.onmessage = (event) => {
 | 서비스 | 사양 | 월 예상 비용 |
 |---|---|---|
 | MSK | kafka.t3.small × 2 | ~$100 |
-| ElastiCache Redis | cache.t3.micro | ~$15 |
+| ElastiCache Valkey | cache.t3.micro | ~$15 |
 | API Gateway | 100만 요청 | ~$3.50 |
 | Lambda | 100만 호출, 256MB | ~$5 |
 | CloudWatch | 기본 메트릭 | ~$10 |
@@ -795,10 +798,412 @@ ws.onmessage = (event) => {
 
 ---
 
+## 9. 트러블슈팅 가이드
+
+> ⚠️ **이 섹션은 실제 세팅 과정에서 겪은 시행착오를 기록한 것입니다.**
+
+### 9.1 Lambda 핸들러 설정 오류
+
+#### 문제: `Runtime.ImportModuleError: Cannot find module 'index'`
+
+**원인**: Lambda Runtime settings의 Handler 값이 잘못 설정됨
+
+**해결**:
+| 잘못된 설정 | 올바른 설정 |
+|---|---|
+| `index.mjs` | `index.handler` |
+| `handler` | `index.handler` |
+| `index` | `index.handler` |
+
+**핸들러 형식**: `파일명.함수명` (확장자 없이!)
+
+**확인 위치**: Lambda → Code 탭 → 아래쪽 **Runtime settings**
+
+---
+
+### 9.2 Lambda Layer 패키지 누락
+
+#### 문제: `Cannot find package 'kafkajs' imported from /var/task/index.mjs`
+
+**원인**: Lambda Layer의 런타임 호환성 문제 또는 패키지 미설치
+
+**해결**:
+1. Lambda 함수 런타임을 **Node.js 20.x**로 설정 (24.x는 호환성 문제 있음)
+2. Layer의 Compatible runtimes에 **Node.js 20.x** 포함 확인
+3. Layer 구조가 올바른지 확인:
+
+```
+layer.zip
+└── nodejs/
+    ├── node_modules/
+    │   ├── kafkajs/
+    │   ├── ioredis/
+    │   └── aws-msk-iam-sasl-signer-js/  ← MSK IAM 인증용
+    ├── package.json
+    └── package-lock.json
+```
+
+**Layer 생성 명령어**:
+```bash
+mkdir nodejs && cd nodejs
+npm init -y
+npm install kafkajs ioredis aws-msk-iam-sasl-signer-js
+cd ..
+zip -r layer.zip nodejs
+```
+
+---
+
+### 9.3 환경 변수 설정 주의사항
+
+#### 문제: `TypeError: Cannot read properties of undefined (reading 'split')`
+
+**원인**: 환경 변수가 설정되지 않았거나 형식이 잘못됨
+
+**올바른 환경 변수 형식**:
+
+| Key | 올바른 형식 | ❌ 잘못된 형식 |
+|---|---|---|
+| `VALKEY_HOST` | `xxx.cache.amazonaws.com` | `xxx.cache.amazonaws.com:6379` (포트 포함하면 안 됨!) |
+| `VALKEY_PORT` | `6379` | |
+| `MSK_BOOTSTRAP_SERVERS` | `b-1.xxx:9098,b-2.xxx:9098` | `b-1.xxx:9092` (IAM은 9098 포트!) |
+| `ORDERS_TOPIC` | `orders` | |
+
+---
+
+### 9.4 MSK 포트 번호 (중요!)
+
+MSK 인증 방식에 따라 포트가 다릅니다:
+
+| 인증 방식 | 포트 |
+|---|---|
+| Plaintext (암호화 없음) | 9092 |
+| TLS | 9094 |
+| SASL/SCRAM | 9096 |
+| **IAM** | **9098** ← 가장 많이 사용 |
+
+> ⚠️ **IAM role-based authentication** 사용 시 반드시 **9098** 포트 사용!
+
+---
+
+### 9.5 보안 그룹 설정
+
+#### 문제: Lambda → MSK/Valkey 연결 타임아웃
+
+**체크리스트**:
+
+1. **MSK 보안 그룹** Inbound Rules:
+   - TCP **9098** from Lambda Security Group
+
+2. **Valkey 보안 그룹** Inbound Rules:
+   - TCP **6379** from Lambda Security Group
+
+3. **Lambda**가 MSK/Valkey와 **같은 VPC**에 있어야 함
+
+4. **Lambda**가 **Private 서브넷**에 배치되어야 함
+
+**보안 그룹 규칙 추가 방법**:
+```
+VPC → Security Groups → MSK 보안그룹 선택 → Inbound rules → Edit
+→ Add rule:
+  Type: Custom TCP
+  Port: 9098
+  Source: Lambda 보안그룹 ID (sg-xxxxxxxx)
+  Description: Lambda to MSK
+```
+
+---
+
+### 9.6 MSK IAM 인증 코드
+
+#### 문제: 일반 Kafka 코드로 MSK IAM 인증 실패
+
+**원인**: MSK IAM 인증에는 특별한 SASL 설정이 필요
+
+**올바른 코드**:
+
+```javascript
+import { Kafka } from 'kafkajs';
+import { generateAuthToken } from 'aws-msk-iam-sasl-signer-js';
+
+async function createKafkaClient() {
+  const region = 'ap-northeast-2';
+  
+  return new Kafka({
+    clientId: 'order-router',
+    brokers: process.env.MSK_BOOTSTRAP_SERVERS.split(','),
+    ssl: true,
+    sasl: {
+      mechanism: 'oauthbearer',
+      oauthBearerProvider: async () => {
+        const token = await generateAuthToken({ region });
+        return { value: token.token };
+      },
+    },
+  });
+}
+```
+
+**필요한 패키지**:
+- `kafkajs`
+- `aws-msk-iam-sasl-signer-js`
+
+---
+
+### 9.7 MSK 토픽 생성 권한 오류
+
+#### 문제: `TOPIC_AUTHORIZATION_FAILED`
+
+**원인**: Lambda IAM Role에 MSK 토픽 접근 권한이 없음
+
+**해결 1: Lambda IAM Role에 정책 추가**
+
+Lambda 실행 역할에 다음 정책 추가:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kafka-cluster:*"],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+**해결 2: MSK 클러스터 정책 설정 (권장)**
+
+MSK → Clusters → 클러스터 선택 → Properties → Cluster policy → Edit
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE"]
+      },
+      "Action": [
+        "kafka-cluster:Connect",
+        "kafka-cluster:AlterCluster",
+        "kafka-cluster:DescribeCluster"
+      ],
+      "Resource": "arn:aws:kafka:ap-northeast-2:ACCOUNT_ID:cluster/CLUSTER-NAME/CLUSTER-UUID"
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE"]
+      },
+      "Action": [
+        "kafka-cluster:CreateTopic",
+        "kafka-cluster:DeleteTopic",
+        "kafka-cluster:DescribeTopic",
+        "kafka-cluster:AlterTopic",
+        "kafka-cluster:ReadData",
+        "kafka-cluster:WriteData"
+      ],
+      "Resource": "arn:aws:kafka:ap-northeast-2:ACCOUNT_ID:topic/CLUSTER-NAME/*/*"
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["arn:aws:iam::ACCOUNT_ID:role/YOUR-LAMBDA-ROLE"]
+      },
+      "Action": [
+        "kafka-cluster:DescribeGroup",
+        "kafka-cluster:AlterGroup"
+      ],
+      "Resource": "arn:aws:kafka:ap-northeast-2:ACCOUNT_ID:group/CLUSTER-NAME/*/*"
+    }
+  ]
+}
+```
+
+> ⚠️ `ACCOUNT_ID`, `YOUR-LAMBDA-ROLE`, `CLUSTER-NAME`, `CLUSTER-UUID`를 실제 값으로 교체!
+
+---
+
+### 9.8 Admin Lambda 생성 (토픽 관리용)
+
+Order Router Lambda에 토픽 생성 로직을 넣으면 성능이 저하됩니다.
+**별도 Admin Lambda**를 생성하여 토픽을 관리하세요.
+
+**Admin Lambda 설정**:
+
+| 설정 | 값 |
+|---|---|
+| Function name | `Supernoba-admin` |
+| Runtime | Node.js 20.x |
+| Timeout | **60 seconds** |
+| VPC | Order Router와 동일 |
+| Layer | MSK용 Layer 동일 |
+
+**Admin Lambda 코드**:
+
+```javascript
+import { Kafka } from 'kafkajs';
+import { generateAuthToken } from 'aws-msk-iam-sasl-signer-js';
+
+async function createKafkaClient() {
+  const region = 'ap-northeast-2';
+  return new Kafka({
+    clientId: 'msk-admin',
+    brokers: process.env.MSK_BOOTSTRAP_SERVERS.split(','),
+    ssl: true,
+    sasl: {
+      mechanism: 'oauthbearer',
+      oauthBearerProvider: async () => {
+        const token = await generateAuthToken({ region });
+        return { value: token.token };
+      },
+    },
+  });
+}
+
+export const handler = async (event) => {
+  try {
+    const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body || event;
+    const { action, topic, partitions = 3, replicationFactor = 2 } = body;
+    
+    const kafka = await createKafkaClient();
+    const admin = kafka.admin();
+    await admin.connect();
+    
+    let result;
+    switch (action) {
+      case 'listTopics':
+        result = await admin.listTopics();
+        break;
+      case 'createTopic':
+        if (!topic) throw new Error('topic is required');
+        await admin.createTopics({
+          topics: [{ topic, numPartitions: partitions, replicationFactor }],
+        });
+        result = { created: topic };
+        break;
+      case 'deleteTopic':
+        if (!topic) throw new Error('topic is required');
+        await admin.deleteTopics({ topics: [topic] });
+        result = { deleted: topic };
+        break;
+      default:
+        throw new Error(`Unknown action: ${action}`);
+    }
+    
+    await admin.disconnect();
+    return { statusCode: 200, body: JSON.stringify({ success: true, result }) };
+  } catch (error) {
+    console.error('Error:', error);
+    return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+  }
+};
+```
+
+**테스트 이벤트**:
+```json
+{
+  "action": "createTopic",
+  "topic": "orders",
+  "partitions": 3,
+  "replicationFactor": 2
+}
+```
+
+---
+
+### 9.9 Valkey TLS 설정
+
+#### 문제: Valkey 연결 실패
+
+**확인 사항**:
+
+1. **Encryption in-transit** 활성화 여부 확인 (ElastiCache 콘솔에서)
+
+2. TLS 활성화된 경우 코드에 `tls: {}` 추가:
+```javascript
+const valkey = new Redis({
+  host: process.env.VALKEY_HOST,
+  port: parseInt(process.env.VALKEY_PORT || '6379'),
+  tls: {},  // TLS 활성화 시 필요
+});
+```
+
+3. TLS 비활성화된 경우 `tls: {}` 제거:
+```javascript
+const valkey = new Redis({
+  host: process.env.VALKEY_HOST,
+  port: parseInt(process.env.VALKEY_PORT || '6379'),
+  // tls: {} 제거
+});
+```
+
+---
+
+### 9.10 API Gateway 테스트 시 주의사항
+
+#### API Gateway 콘솔 테스트 vs 외부 호출
+
+| 항목 | 콘솔 테스트 | 외부 호출 (curl, Postman) |
+|---|---|---|
+| `x-api-key` 헤더 | 불필요 (자동 bypass) | **필수** |
+| URL | 테스트 콘솔에서 자동 처리 | 전체 URL 필요 |
+| Body | Request Body 필드에 입력 | `-d` 옵션으로 전달 |
+
+**외부 호출 예시**:
+```bash
+curl -X POST https://API_ID.execute-api.ap-northeast-2.amazonaws.com/prod/orders \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{"symbol":"AAPL","side":"BUY","quantity":100,"price":150.00,"orderType":"LIMIT","userId":"user123"}'
+```
+
+---
+
+### 9.11 event.body 파싱 오류
+
+#### 문제: `"undefined" is not valid JSON`
+
+**원인**: Lambda Proxy Integration에서 body가 항상 문자열로 오지 않음
+
+**해결**: 여러 케이스를 처리하는 파싱 로직:
+
+```javascript
+export const handler = async (event) => {
+  try {
+    let order;
+    if (typeof event.body === 'string') {
+      order = JSON.parse(event.body);
+    } else if (event.body) {
+      order = event.body;
+    } else {
+      order = event;  // 직접 테스트 시
+    }
+    // ...
+  }
+};
+```
+
+---
+
+### 9.12 Lambda 타임아웃 설정
+
+| 용도 | 권장 타임아웃 |
+|---|---|
+| Order Router (일반 요청) | 10 ~ 30초 |
+| Admin Lambda (토픽 생성) | 60초 |
+| WebSocket Handler | 10초 |
+
+**설정 위치**: Lambda → Configuration → General configuration → Timeout
+
+---
+
 ## 다음 단계
 
 1. **EC2 매칭 엔진 세팅** - MSK Consumer + Liquibook
-2. **체결 결과 Kafka → WebSocket 푸시** 구현
+2. **체결 결과 MSK → WebSocket 푸시** 구현
 3. **모니터링 대시보드** - CloudWatch Dashboard 구성
 4. **알람 설정** - CPU, 에러율 임계치 알람
 

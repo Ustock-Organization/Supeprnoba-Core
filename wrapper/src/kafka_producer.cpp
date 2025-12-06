@@ -1,9 +1,13 @@
 #include "kafka_producer.h"
+#include "msk_iam_auth.h"
 #include "config.h"
 #include "logger.h"
 #include <chrono>
 
 namespace aws_wrapper {
+
+// Static callback holder
+static std::unique_ptr<MskOauthCallback> g_producer_oauth_callback;
 
 KafkaProducer::KafkaProducer(const std::string& brokers) {
     std::string errstr;
@@ -14,6 +18,23 @@ KafkaProducer::KafkaProducer(const std::string& brokers) {
     conf->set("bootstrap.servers", brokers, errstr);
     conf->set("acks", "1", errstr);  // Leader ack만 대기 (빠름)
     conf->set("linger.ms", "5", errstr);  // 배칭 딜레이
+    
+    // MSK IAM 인증 사용 여부 확인
+    bool use_iam = Config::getBool("MSK_USE_IAM", true);
+    std::string region = Config::get("AWS_REGION", "ap-northeast-2");
+    
+    if (use_iam) {
+        Logger::info("Configuring MSK IAM authentication for producer...");
+        if (!MskIamAuth::configure(conf.get(), region)) {
+            throw std::runtime_error("Failed to configure MSK IAM authentication");
+        }
+        
+        // OAUTHBEARER 콜백 설정
+        g_producer_oauth_callback = std::make_unique<MskOauthCallback>(region);
+        if (conf->set("oauthbearer_token_refresh_cb", g_producer_oauth_callback.get(), errstr) != RdKafka::Conf::CONF_OK) {
+            Logger::warn("Failed to set oauth callback:", errstr);
+        }
+    }
     
     producer_.reset(RdKafka::Producer::create(conf.get(), errstr));
     if (!producer_) {
@@ -27,7 +48,8 @@ KafkaProducer::KafkaProducer(const std::string& brokers) {
     depth_topic_ = Config::get(Config::KAFKA_DEPTH_TOPIC, "depth");
     status_topic_ = Config::get("KAFKA_STATUS_TOPIC", "order_status");
     
-    Logger::info("KafkaProducer created, brokers:", brokers);
+    Logger::info("KafkaProducer created, brokers:", brokers,
+                 "IAM auth:", use_iam ? "enabled" : "disabled");
 }
 
 KafkaProducer::~KafkaProducer() {

@@ -29,7 +29,7 @@ export GRPC_PORT="50051"
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `KAFKA_BROKERS` | localhost:9092 | MSK 브로커 주소 |
+| `KAFKA_BROKERS` | localhost:9092 | MSK 브로커 주소 (**IAM 사용 시 9098 포트!**) |
 | `KAFKA_ORDER_TOPIC` | orders | 주문 수신 토픽 |
 | `KAFKA_GROUP_ID` | matching-engine | Consumer 그룹 ID |
 | `KAFKA_FILLS_TOPIC` | fills | 체결 발행 토픽 |
@@ -39,8 +39,12 @@ export GRPC_PORT="50051"
 | `REDIS_PORT` | 6379 | Redis 포트 |
 | `GRPC_PORT` | 50051 | gRPC 서버 포트 |
 | `LOG_LEVEL` | INFO | 로그 레벨 (DEBUG/INFO/WARN/ERROR) |
+| `MSK_USE_IAM` | true | MSK IAM 인증 사용 여부 |
+| `AWS_REGION` | ap-northeast-2 | AWS 리전 |
+| `AWS_ACCESS_KEY_ID` | (IMDS) | AWS 자격 증명 (EC2 인스턴스 프로파일 사용 시 자동) |
+| `AWS_SECRET_ACCESS_KEY` | (IMDS) | AWS 자격 증명 (EC2 인스턴스 프로파일 사용 시 자동) |
 
-## Kafka 토픽 구조
+## MSK 토픽 구조
 
 **입력 (orders):**
 ```json

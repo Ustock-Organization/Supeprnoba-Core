@@ -1,8 +1,12 @@
 #include "kafka_consumer.h"
+#include "msk_iam_auth.h"
 #include "logger.h"
 #include "config.h"
 
 namespace aws_wrapper {
+
+// Static callback holder
+static std::unique_ptr<MskOauthCallback> g_consumer_oauth_callback;
 
 KafkaConsumer::KafkaConsumer(const std::string& brokers,
                               const std::string& topic,
@@ -18,13 +22,31 @@ KafkaConsumer::KafkaConsumer(const std::string& brokers,
     conf->set("auto.offset.reset", "earliest", errstr);
     conf->set("enable.auto.commit", "true", errstr);
     
+    // MSK IAM 인증 사용 여부 확인
+    bool use_iam = Config::getBool("MSK_USE_IAM", true);
+    std::string region = Config::get("AWS_REGION", "ap-northeast-2");
+    
+    if (use_iam) {
+        Logger::info("Configuring MSK IAM authentication for consumer...");
+        if (!MskIamAuth::configure(conf.get(), region)) {
+            throw std::runtime_error("Failed to configure MSK IAM authentication");
+        }
+        
+        // OAUTHBEARER 콜백 설정
+        g_consumer_oauth_callback = std::make_unique<MskOauthCallback>(region);
+        if (conf->set("oauthbearer_token_refresh_cb", g_consumer_oauth_callback.get(), errstr) != RdKafka::Conf::CONF_OK) {
+            Logger::warn("Failed to set oauth callback:", errstr);
+        }
+    }
+    
     consumer_.reset(RdKafka::KafkaConsumer::create(conf.get(), errstr));
     if (!consumer_) {
         Logger::error("Failed to create Kafka consumer:", errstr);
         throw std::runtime_error("Kafka consumer creation failed: " + errstr);
     }
     
-    Logger::info("KafkaConsumer created, brokers:", brokers, "group:", group_id);
+    Logger::info("KafkaConsumer created, brokers:", brokers, "group:", group_id,
+                 "IAM auth:", use_iam ? "enabled" : "disabled");
 }
 
 KafkaConsumer::~KafkaConsumer() {

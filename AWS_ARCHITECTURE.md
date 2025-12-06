@@ -5,7 +5,7 @@
 ## 전체 아키텍처 개요
 
 ```
-[Client] -> [API Gateway] -> [Order Router] -> [Kafka] -> [Matching Engine Cluster]
+[Client] -> [API Gateway] -> [Order Router] -> [MSK] -> [Matching Engine Cluster]
                                   |                              |
                                   v                              v
                               [Redis]                    [State Snapshot S3]
@@ -25,7 +25,7 @@
 | **인증**                | Amazon Cognito 또는 자체 JWT             | 사용자 인증 및 토큰 검증           |
 
 ### 구현 포인트
-- API Gateway는 직접 Kafka로 쏘지 못하므로, Lambda 또는 Fargate로 구현된 **Order Router**를 붙입니다.
+- API Gateway는 직접 MSK로 쏘지 못하므로, Lambda 또는 Fargate로 구현된 **Order Router**를 붙입니다.
 - WebSocket은 연결 ID를 DynamoDB/Redis에 저장하여 체결 시 푸시 대상을 식별합니다.
 
 ---
@@ -36,7 +36,7 @@
 |---|---|---|
 | **라우터 서비스** | Go 또는 Rust on ECS Fargate / EC2 | 종목코드 기반 라우팅 결정, 핫샤드 감지 시 주문 일시정지(Pause) |
 | **라우팅 테이블** | Amazon ElastiCache (Redis) | 종목 -> 인스턴스 매핑 정보 저장, 실시간 조회 |
-| **주문 큐** | Amazon MSK (Managed Kafka) 또는 Kinesis Data Streams | 종목별 파티셔닝, 주문 버퍼링 |
+| **주문 큐** | Amazon MSK | 종목별 파티셔닝, 주문 버퍼링 |
 
 ### 구현 포인트 (Order Router)
 ```go
@@ -45,14 +45,14 @@ func RouteOrder(order Order) {
     // 1. Redis에서 종목 라우팅 정보 조회
     routeInfo := redis.Get("route:" + order.Symbol)
 
-    // 2. 해당 종목이 마이그레이션 중(Paused)이면 Kafka에만 적재
+    // 2. 해당 종목이 마이그레이션 중(Paused)이면 MSK에만 적재
     if routeInfo.Status == "MIGRATING" {
-        kafka.Send("pending-orders", order.Symbol, order) // 파티션 키 = 종목
+        msk.Send("pending-orders", order.Symbol, order) // 파티션 키 = 종목
         return
     }
 
     // 3. 정상이면 해당 파티션(인스턴스)으로 라우팅
-    kafka.Send("orders", order.Symbol, order)
+    msk.Send("orders", order.Symbol, order)
 }
 ```
 
@@ -67,12 +67,12 @@ func RouteOrder(order Order) {
 | 컴포넌트 | 기술 스택 | 역할 |
 |---|---|---|
 | **매칭 엔진** | Liquibook (C++) + 커스텀 래퍼 on EC2 (c6i.xlarge 이상) | 주문 매칭 핵심 로직 |
-| **Kafka Consumer** | librdkafka (C++) 또는 Sarama (Go) | Kafka에서 주문 소비 |
+| **MSK Consumer** | librdkafka (C++) 또는 Sarama (Go) | MSK에서 주문 소비 |
 | **gRPC/TCP Server** | gRPC (C++) 또는 Boost.Asio | 오케스트레이터(Step Functions)와 통신, 스냅샷 요청/응답 |
 | **상태 스냅샷 저장소** | Amazon S3 (대용량) 또는 Redis (저지연) | 오더북 직렬화 데이터 저장 |
 
 ### Liquibook 추가 구현 필요 사항
-1. **Kafka Consumer Thread**: Kafka에서 주문을 읽어 `OrderBook::add()` 호출.
+1. **MSK Consumer Thread**: MSK에서 주문을 읽어 `OrderBook::add()` 호출.
 2. **gRPC Server**:
    - `SnapshotOrderBook(symbol)`: 해당 종목 오더북 직렬화 후 반환.
    - `RestoreOrderBook(symbol, data)`: 직렬화 데이터로 오더북 복원.
@@ -107,7 +107,7 @@ func RouteOrder(order Order) {
 
 | 컴포넌트 | 기술 스택 | 역할 |
 |---|---|---|
-| **체결 이벤트 발행** | Kafka (MSK) 또는 Kinesis | 체결 발생 시 `fills` 토픽으로 발행 |
+| **체결 이벤트 발행** | Amazon MSK | 체결 발생 시 `fills` 토픽으로 발행 |
 | **시장 데이터 처리** | Flink on Kinesis Data Analytics 또는 Lambda Consumer | `fills`, `depth` 토픽 소비 후 가공 |
 | **클라이언트 푸시** | API Gateway Management API (WebSocket) | 연결된 클라이언트에 JSON 푸시 |
 | **호가 캐싱** | ElastiCache (Redis) | 최신 호가창 저장, 클라이언트 폴링 대응 |
@@ -131,10 +131,10 @@ func RouteOrder(order Order) {
 | 클라이언트 진입 | API Gateway (HTTP/WebSocket), Cognito |
 | 라우팅 | Go/Rust on Fargate, ElastiCache Redis |
 | 메시지 큐 | Amazon MSK (Kafka) |
-| 매칭 엔진 | Liquibook C++ + gRPC + librdkafka on EC2 |
+| 매칭 엔진 | Liquibook C++ + gRPC + MSK Client (librdkafka) on EC2 |
 | 오케스트레이션 | Step Functions, Lambda, CloudWatch Alarms |
 | 스냅샷 저장 | S3 (또는 Redis for low latency) |
-| 시장 데이터 | Kinesis/Kafka, Lambda, API Gateway Push |
+| 시장 데이터 | MSK, Lambda, API Gateway Push |
 
 ---
 
@@ -238,7 +238,7 @@ func RouteOrder(order Order) {
 
 | 서비스 | 사양 | 월 비용 |
 |---|---|---|
-| **MSK (Kafka)** | kafka.t3.small × 2 | ~$100 |
+| **Amazon MSK** | kafka.t3.small × 2 | ~$100 |
 | **ElastiCache Redis** | cache.t3.micro | ~$15 |
 | **API Gateway** | 100만 요청 | ~$3.50 |
 | **S3** | 10GB 스냅샷 | ~$0.25 |
@@ -278,8 +278,8 @@ Liquibook 핵심 엔진을 AWS 프로덕션에 배포하려면 다음 래퍼 코
 
 | 컴포넌트 | 역할 | 기술 스택 |
 |---|---|---|
-| **Kafka Consumer** | Kafka → Liquibook 연결 | C++: librdkafka / Go: sarama |
-| **TradeListener** | 체결 → Kafka 발행 | Liquibook 콜백 구현 |
+| **MSK Consumer** | MSK → Liquibook 연결 | C++: librdkafka / Go: sarama |
+| **TradeListener** | 체결 → MSK 발행 | Liquibook 콜백 구현 |
 | **잔고 확인** | 주문 전 잔고 검증 | Order Router에서 처리 |
 | **가격 검증** | 호가 제한 (상한가/하한가) | Order Router에서 처리 |
 
@@ -309,7 +309,7 @@ Liquibook은 인메모리 엔진이므로, 데이터 영속성을 별도로 구�
 |---|---|---|
 | **오더북 스냅샷** | S3 | 주기적 직렬화 (1분 간격) |
 | **체결 기록** | DynamoDB / RDS | TradeListener에서 기록 |
-| **주문 로그** | Kafka (보존) | 주문 토픽 retention 설정 |
+| **주문 로그** | Amazon MSK (보존) | 주문 토픽 retention 설정 |
 | **사용자 잔고** | DynamoDB | 체결 시 업데이트 |
 
 ### 장애 복구 시나리오
@@ -318,7 +318,7 @@ Liquibook은 인메모리 엔진이므로, 데이터 영속성을 별도로 구�
 1. 인스턴스 다운 감지 (CloudWatch)
 2. Warm Pool에서 새 인스턴스 시작
 3. S3에서 최신 스냅샷 복원
-4. Kafka에서 스냅샷 이후 주문 리플레이
+4. MSK에서 스냅샷 이후 주문 리플레이
 5. 라우팅 테이블 업데이트
 6. 서비스 재개
 ```
@@ -327,46 +327,80 @@ Liquibook은 인메모리 엔진이므로, 데이터 영속성을 별도로 구�
 
 ## 13. 전체 아키텍처 상세 다이어그램
 
+```mermaid
+graph TD
+    %% Styles
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:white;
+    classDef cpp fill:#00599C,stroke:#004482,stroke-width:2px,color:white;
+    classDef client fill:#808080,stroke:#333,stroke-width:2px,color:white;
+
+    subgraph Clients ["Clients (Mobile/Web)"]
+        UserApp[User App]:::client
+    end
+
+    subgraph AWS_Cloud ["AWS Cloud"]
+        style AWS_Cloud fill:#f9f9f9,stroke:#232F3E,stroke-dasharray: 5 5
+
+        APIG[API Gateway]:::aws
+        
+        subgraph Serverless ["Serverless Layer"]
+            OrderRouter[Order Router Lambda]:::aws
+            StreamHandler[Stream Handler Lambda]:::aws
+        end
+
+        subgraph MSK_Cluster ["Amazon MSK (Kafka)"]
+            Topic_Orders[Topic: orders]:::aws
+            Topic_Fills[Topic: fills]:::aws
+        end
+
+        subgraph EC2_Layer ["Matching Engine (EC2)"]
+            style EC2_Layer fill:#e6f3ff,stroke:#00599C
+            
+            Wrapper[C++ AWS Wrapper]:::cpp
+            Liquibook[Liquibook Core]:::cpp
+            
+            Wrapper <-->|Matches| Liquibook
+        end
+
+        subgraph Persistence ["Persistence Layer"]
+            Redis[(ElastiCache Redis)]:::aws
+            S3[(S3 Snapshots)]:::aws
+            DB[(User DB)]:::aws
+        end
+    end
+
+    %% Connections
+    UserApp -->|REST/WS| APIG
+    APIG -->|Route| OrderRouter
+    APIG <-->|Push Updates| StreamHandler
+
+    OrderRouter -->|Check Balance| DB
+    OrderRouter -->|Publish| Topic_Orders
+    
+    Topic_Orders -->|Consume| Wrapper
+    Wrapper -->|Publish Fills| Topic_Fills
+    
+    Topic_Fills -->|Consume| StreamHandler
+    
+    Wrapper -.->|Snapshot| S3
+    Wrapper -.->|Cache State| Redis
 ```
-                          ┌────────────────────────────────┐
-                          │        사용자 잔고 DB           │
-                          │     (DynamoDB / RDS)           │
-                          └───────────────┬────────────────┘
-                                          │ 잔고 확인
-┌──────────┐    ┌──────────┐    ┌─────────▼─────────┐    ┌─────────────┐
-│  Client  │───▶│   API    │───▶│   Order Router    │───▶│    Kafka    │
-│  (App)   │    │ Gateway  │    │  (잔고/가격 검증)  │    │    (MSK)    │
-└──────────┘    └──────────┘    └───────────────────┘    └──────┬──────┘
-                                                                 │
-                          ┌──────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Matching Engine (EC2)                            │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────────────────┐   │
-│  │   Kafka     │──▶│  Liquibook  │──▶│   TradeListener         │   │
-│  │  Consumer   │   │   Engine    │   │  (체결→Kafka 발행)       │   │
-│  └─────────────┘   └─────────────┘   └─────────────────────────┘   │
-│                           │                                         │
-│                    ┌──────▼──────┐                                  │
-│                    │  Snapshot   │──▶ S3                            │
-│                    │  Manager    │                                  │
-│                    └─────────────┘                                  │
-└─────────────────────────────────────────────────────────────────────┘
-                          │
-                          ▼ 체결 이벤트
-                    ┌───────────┐
-                    │   Kafka   │
-                    │  (fills)  │
-                    └─────┬─────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-    ┌──────────┐   ┌──────────┐   ┌──────────────┐
-    │  잔고    │   │  체결    │   │  WebSocket   │
-    │  업데이트 │   │  기록    │   │  푸시        │
-    └──────────┘   └──────────┘   └──────────────┘
-```
+
+## 14. 고화질 아키텍처 다이어그램 생성 (Official Icons)
+
+AWS 공식 아이콘을 사용한 고화질 다이어그램(PNG)을 생성하려면 다음 단계를 따르세요.
+
+1.  **Graphviz 설치**: [Graphviz 다운로드](https://graphviz.org/download/) 및 설치 (시스템 PATH에 추가 필수).
+2.  **Python 라이브러리 설치**:
+    ```bash
+    pip install diagrams
+    ```
+3.  **스크립트 실행**:
+    ```bash
+    python generate_architecture.py
+    ```
+4.  결과물 `liquibook_aws_architecture.png` 확인.
+
 
 ---
 

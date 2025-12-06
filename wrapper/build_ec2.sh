@@ -20,11 +20,11 @@ echo -e "${YELLOW}[1/5] Checking system dependencies...${NC}"
 if command -v apt-get &> /dev/null; then
     # Ubuntu/Debian
     sudo apt-get update
-    sudo apt-get install -y build-essential cmake git pkg-config curl zip unzip tar
+    sudo apt-get install -y build-essential cmake git pkg-config curl zip unzip tar libcurl4-openssl-dev libssl-dev
 elif command -v yum &> /dev/null; then
     # Amazon Linux/CentOS
     sudo yum groupinstall -y "Development Tools"
-    sudo yum install -y cmake3 git pkgconfig curl zip unzip tar
+    sudo yum install -y cmake3 git pkgconfig curl zip unzip tar libcurl-devel openssl-devel
     # cmake3를 cmake로 링크
     if ! command -v cmake &> /dev/null; then
         sudo ln -sf /usr/bin/cmake3 /usr/bin/cmake
@@ -58,7 +58,7 @@ echo -e "${GREEN}✓ vcpkg ready at ${VCPKG_ROOT}${NC}"
 echo -e "${YELLOW}[3/5] Installing wrapper dependencies (this may take 10-15 minutes)...${NC}"
 
 cd "$VCPKG_ROOT"
-./vcpkg install librdkafka grpc protobuf nlohmann-json hiredis
+./vcpkg install librdkafka grpc protobuf nlohmann-json hiredis curl openssl
 
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 
