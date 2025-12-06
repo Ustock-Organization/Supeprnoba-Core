@@ -401,7 +401,164 @@ AWS 공식 아이콘을 사용한 고화질 다이어그램(PNG)을 생성하려
     ```
 4.  결과물 `liquibook_aws_architecture.png` 확인.
 
+---
+
+## 15. 전체 데이터 흐름도 (End-to-End Data Flow)
+
+아래는 사용자가 주문을 넣고 체결 결과를 받기까지의 **전체 데이터 흐름**입니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 👤 사용자 앱
+    participant APIG as API Gateway
+    participant Router as Order Router (Lambda)
+    participant DB as User DB (DynamoDB)
+    participant MSK_Orders as MSK (orders 토픽)
+    participant Engine as C++ Matching Engine (EC2)
+    participant MSK_Fills as MSK (fills 토픽)
+    participant Stream as Stream Handler (Lambda)
+    participant Redis as ElastiCache (Redis)
+
+    User->>APIG: 1. 주문 요청 (REST)
+    APIG->>Router: 2. 주문 라우팅
+    Router->>DB: 3. 잔고 확인
+    DB-->>Router: 4. 잔고 OK (₩1,000,000)
+    Router->>MSK_Orders: 5. 주문 발행
+
+    MSK_Orders->>Engine: 6. 주문 소비
+    Note over Engine: 7. Liquibook 매칭 처리
+    Engine->>MSK_Fills: 8. 체결 결과 발행
+    Engine->>Redis: 9. 호가창 캐시 업데이트
+
+    MSK_Fills->>Stream: 10. 체결 소비
+    Stream->>APIG: 11. WebSocket 푸시
+    APIG->>User: 12. 체결 알림 수신
+```
+
+### 15.1 단계별 데이터 예시
+
+#### 1️⃣ 사용자 → API Gateway: 주문 요청
+
+```json
+// POST /orders
+{
+  "user_id": "user_12345",
+  "symbol": "TSLA",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "price": 250.50,
+  "quantity": 10
+}
+```
+
+#### 2️⃣ Order Router → User DB: 잔고 확인
+
+```json
+// DynamoDB Query: Key = { "user_id": "user_12345" }
+// Response:
+{
+  "user_id": "user_12345",
+  "balance": 1000000,
+  "positions": { "TSLA": { "qty": 5, "avg_price": 245.00 } }
+}
+```
+
+**검증**: `250.50 × 10 = ₩2,505` ≤ `₩1,000,000` ✅
+
+#### 3️⃣ Order Router → MSK (orders 토픽): 주문 발행
+
+```json
+// Topic: orders, Partition Key: "TSLA"
+{
+  "order_id": "ord_abc123",
+  "user_id": "user_12345",
+  "symbol": "TSLA",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "price": 250.50,
+  "quantity": 10,
+  "timestamp": "2025-12-06T11:50:00.123Z"
+}
+```
+
+#### 4️⃣ C++ Engine: Liquibook 매칭 처리
+
+**매칭 전 오더북 상태 (TSLA)**:
+```
+        ASK (매도)             |         BID (매수)
+   수량    가격                |    가격      수량
+   ─────────────────────────────────────────────────
+    15    251.00              |    249.50     20
+     8    250.50  ← 매칭 대상  |    249.00     30
+    25    250.00              |    248.50     15
+```
+
+**매칭 결과**: 매수 `10주 @ 250.50` vs 매도 `8주 @ 250.50` → **8주 체결**, 잔량 **2주** 오더북 등록
+
+#### 5️⃣ C++ Engine → MSK (fills 토픽): 체결 결과 발행
+
+```json
+// Topic: fills
+{
+  "trade_id": "trd_xyz789",
+  "symbol": "TSLA",
+  "price": 250.50,
+  "quantity": 8,
+  "buyer": { "order_id": "ord_abc123", "user_id": "user_12345" },
+  "seller": { "order_id": "ord_def456", "user_id": "user_67890" },
+  "timestamp": "2025-12-06T11:50:00.456Z"
+}
+```
+
+#### 6️⃣ C++ Engine → Redis: 호가창 캐시 업데이트
+
+```json
+// Redis Key: orderbook:TSLA
+{
+  "symbol": "TSLA",
+  "asks": [
+    { "price": 250.00, "qty": 25 },
+    { "price": 251.00, "qty": 15 }
+  ],
+  "bids": [
+    { "price": 250.50, "qty": 2 },
+    { "price": 249.50, "qty": 20 },
+    { "price": 249.00, "qty": 30 }
+  ],
+  "last_price": 250.50,
+  "last_qty": 8
+}
+```
+
+#### 7️⃣ Stream Handler → 사용자 앱: WebSocket 푸시
+
+```json
+// WebSocket to user_12345
+{
+  "type": "FILL",
+  "data": {
+    "order_id": "ord_abc123",
+    "symbol": "TSLA",
+    "side": "BUY",
+    "filled_qty": 8,
+    "filled_price": 250.50,
+    "remaining_qty": 2,
+    "status": "PARTIALLY_FILLED"
+  }
+}
+```
+
+### 15.2 데이터 타입별 저장소 요약
+
+| 데이터 | 저장소 | 목적 |
+|---|---|---|
+| **주문 메시지** | MSK (orders) | 비동기 주문 큐 |
+| **체결 메시지** | MSK (fills) | 비동기 체결 알림 |
+| **사용자 잔고** | DynamoDB | 영구 저장 |
+| **실시간 호가창** | Redis | 저지연 캐시 |
+| **오더북 스냅샷** | S3 | 장애 복구용 백업 |
 
 ---
 
-*최종 업데이트: 2025-12-05*
+*최종 업데이트: 2025-12-06*

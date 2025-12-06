@@ -1,13 +1,14 @@
 #include "market_data_handler.h"
 #include "kafka_producer.h"
+#include "websocket_server.h"
 #include "logger.h"
 #include "metrics.h"
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(KafkaProducer* producer)
-    : producer_(producer) {
+MarketDataHandler::MarketDataHandler(KafkaProducer* producer, WebSocketServer* ws)
+    : producer_(producer), ws_server_(ws) {
     Logger::info("MarketDataHandler initialized");
 }
 
@@ -144,6 +145,11 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     
     if (producer_) {
         producer_->publishDepth(symbol, depth_json);
+    }
+    
+    // WebSocket으로도 푸시 (실시간 호가)
+    if (ws_server_) {
+        ws_server_->pushToSymbol(symbol, depth_json);
     }
 }
 
