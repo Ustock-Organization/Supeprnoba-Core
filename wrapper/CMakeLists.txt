@@ -17,8 +17,6 @@ find_package(gRPC CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
-find_package(CURL REQUIRED)
-find_package(OpenSSL REQUIRED)
 
 # Proto 파일 컴파일
 set(PROTO_FILES proto/snapshot.proto)
@@ -51,12 +49,13 @@ add_executable(matching_engine
     src/engine_core.cpp
     src/kafka_consumer.cpp
     src/kafka_producer.cpp
-    src/msk_iam_auth.cpp
     src/market_data_handler.cpp
     src/grpc_service.cpp
     src/redis_client.cpp
     src/metrics.cpp
     src/logger.cpp
+    src/msk_iam_auth.cpp
+    src/websocket_server.cpp
 )
 
 target_link_libraries(matching_engine PRIVATE
@@ -65,27 +64,27 @@ target_link_libraries(matching_engine PRIVATE
     gRPC::grpc++
     nlohmann_json::nlohmann_json
     hiredis::hiredis
-    CURL::libcurl
     OpenSSL::SSL
     OpenSSL::Crypto
 )
 
-# 테스트
-enable_testing()
-find_package(GTest CONFIG)
-if(GTest_FOUND)
-    add_executable(test_engine
-        test/test_order.cpp
-        test/test_engine_core.cpp
-        src/order.cpp
-        src/engine_core.cpp
-        src/market_data_handler.cpp
-    )
-    target_link_libraries(test_engine PRIVATE
-        proto_lib
-        GTest::gtest_main
-        RdKafka::rdkafka++
-        nlohmann_json::nlohmann_json
-    )
-    add_test(NAME EngineTests COMMAND test_engine)
-endif()
+# 테스트 (테스트 파일 생성 후 활성화)
+# enable_testing()
+# find_package(GTest CONFIG)
+# if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/test/test_order.cpp")
+#     add_executable(test_engine
+#         test/test_order.cpp
+#         test/test_engine_core.cpp
+#         src/order.cpp
+#         src/engine_core.cpp
+#         src/market_data_handler.cpp
+#     )
+#     target_link_libraries(test_engine PRIVATE
+#         proto_lib
+#         GTest::gtest_main
+#         RdKafka::rdkafka++
+#         nlohmann_json::nlohmann_json
+#     )
+#     add_test(NAME EngineTests COMMAND test_engine)
+# endif()
+
