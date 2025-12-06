@@ -1,14 +1,14 @@
 #include "market_data_handler.h"
 #include "kafka_producer.h"
-#include "websocket_server.h"
 #include "logger.h"
 #include "metrics.h"
+#include <book/depth_level.h>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(KafkaProducer* producer, WebSocketServer* ws)
-    : producer_(producer), ws_server_(ws) {
+MarketDataHandler::MarketDataHandler(KafkaProducer* producer)
+    : producer_(producer) {
     Logger::info("MarketDataHandler initialized");
 }
 
@@ -114,42 +114,41 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     depth_json["event"] = "DEPTH";
     depth_json["symbol"] = symbol;
     
-    // Bids
-    nlohmann::json bids = nlohmann::json::array();
-    for (auto& level : depth->bids()) {
-        if (level.order_count() > 0) {
-            bids.push_back({
-                {"price", level.price()},
-                {"quantity", level.aggregate_qty()},
-                {"count", level.order_count()}
-            });
+    // Bids (포인터 이터레이션)
+    nlohmann::json bids_arr = nlohmann::json::array();
+    const liquibook::book::DepthLevel* bid = depth->bids();
+    const liquibook::book::DepthLevel* bid_end = depth->last_bid_level() + 1;
+    for (; bid != bid_end; ++bid) {
+        if (bid->order_count() > 0) {
+            nlohmann::json level;
+            level["price"] = bid->price();
+            level["quantity"] = bid->aggregate_qty();
+            level["count"] = bid->order_count();
+            bids_arr.push_back(level);
         }
     }
-    depth_json["bids"] = bids;
+    depth_json["bids"] = bids_arr;
     
-    // Asks
-    nlohmann::json asks = nlohmann::json::array();
-    for (auto& level : depth->asks()) {
-        if (level.order_count() > 0) {
-            asks.push_back({
-                {"price", level.price()},
-                {"quantity", level.aggregate_qty()},
-                {"count", level.order_count()}
-            });
+    // Asks (포인터 이터레이션)
+    nlohmann::json asks_arr = nlohmann::json::array();
+    const liquibook::book::DepthLevel* ask = depth->asks();
+    const liquibook::book::DepthLevel* ask_end = depth->last_ask_level() + 1;
+    for (; ask != ask_end; ++ask) {
+        if (ask->order_count() > 0) {
+            nlohmann::json level;
+            level["price"] = ask->price();
+            level["quantity"] = ask->aggregate_qty();
+            level["count"] = ask->order_count();
+            asks_arr.push_back(level);
         }
     }
-    depth_json["asks"] = asks;
+    depth_json["asks"] = asks_arr;
     
     depth_json["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
     if (producer_) {
         producer_->publishDepth(symbol, depth_json);
-    }
-    
-    // WebSocket으로도 푸시 (실시간 호가)
-    if (ws_server_) {
-        ws_server_->pushToSymbol(symbol, depth_json);
     }
 }
 

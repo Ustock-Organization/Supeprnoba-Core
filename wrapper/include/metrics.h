@@ -5,6 +5,8 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <functional>
+#include <cstdint>
 
 namespace aws_wrapper {
 

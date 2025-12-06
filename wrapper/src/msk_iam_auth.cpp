@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <set>
 #include <curl/curl.h>
 
 namespace aws_wrapper {

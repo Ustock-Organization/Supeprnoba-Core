@@ -4,6 +4,7 @@
 #include <book/types.h>
 #include <string>
 #include <memory>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
@@ -22,13 +23,7 @@ public:
     bool is_buy() const override { return is_buy_; }
     liquibook::book::Price price() const override { return price_; }
     liquibook::book::Quantity order_qty() const override { return order_qty_; }
-    liquibook::book::Quantity open_qty() const override { 
-        return order_qty_ - filled_qty_; 
-    }
     liquibook::book::Price stop_price() const override { return stop_price_; }
-    liquibook::book::OrderConditions conditions() const override { 
-        return conditions_; 
-    }
     bool all_or_none() const override { 
         return (conditions_ & liquibook::book::oc_all_or_none) != 0; 
     }
@@ -36,10 +31,18 @@ public:
         return (conditions_ & liquibook::book::oc_immediate_or_cancel) != 0; 
     }
     
-    // 체결 처리
+    // === 추가 메서드 (non-virtual) ===
+    liquibook::book::Quantity open_qty() const { 
+        return order_qty_ - filled_qty_; 
+    }
+    liquibook::book::OrderConditions conditions() const { 
+        return conditions_; 
+    }
+    
+    // 체결 처리 (OrderBook에서 호출)
     void fill(liquibook::book::Quantity fill_qty,
               liquibook::book::Cost fill_cost,
-              liquibook::book::FillId fill_id) override;
+              liquibook::book::FillId fill_id);
     
     // Getters
     const std::string& order_id() const { return order_id_; }
@@ -77,3 +80,4 @@ private:
 using OrderPtr = std::shared_ptr<Order>;
 
 } // namespace aws_wrapper
+

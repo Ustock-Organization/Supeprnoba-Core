@@ -3,6 +3,9 @@
 // See the file license.txt for licensing information.
 #pragma once
 
+#include <cstdint>
+#include "types.h"
+
 namespace liquibook { namespace book {
 
 /// @brief generic listener of order events.  Implement to build a full order book feed.

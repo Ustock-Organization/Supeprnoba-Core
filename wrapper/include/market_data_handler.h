@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <book/order_listener.h>
 #include <book/trade_listener.h>
 #include <book/depth_listener.h>
@@ -10,7 +11,6 @@
 namespace aws_wrapper {
 
 class KafkaProducer;
-class WebSocketServer;
 
 using OrderBook = liquibook::book::DepthOrderBook<OrderPtr>;
 using BookDepth = liquibook::book::Depth<>;
@@ -22,10 +22,7 @@ class MarketDataHandler
     , public liquibook::book::BboListener<OrderBook>
 {
 public:
-    explicit MarketDataHandler(KafkaProducer* producer, WebSocketServer* ws = nullptr);
-    
-    // WebSocket 서버 설정 (선택적)
-    void setWebSocketServer(WebSocketServer* ws) { ws_server_ = ws; }
+    explicit MarketDataHandler(KafkaProducer* producer);
     
     // === OrderListener ===
     void on_accept(const OrderPtr& order) override;
@@ -56,7 +53,6 @@ public:
 
 private:
     KafkaProducer* producer_;
-    WebSocketServer* ws_server_ = nullptr;
 };
 
 } // namespace aws_wrapper
