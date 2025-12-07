@@ -1,6 +1,7 @@
 #include "kafka_consumer.h"
 #include "logger.h"
 #include "config.h"
+#include "msk_iam_auth.h"
 
 namespace aws_wrapper {
 
@@ -17,6 +18,19 @@ KafkaConsumer::KafkaConsumer(const std::string& brokers,
     conf->set("group.id", group_id, errstr);
     conf->set("auto.offset.reset", "earliest", errstr);
     conf->set("enable.auto.commit", "true", errstr);
+    
+    // MSK IAM 인증 설정 (포트 9098 사용 시)
+    std::string aws_region = Config::get("AWS_REGION", "ap-northeast-2");
+    if (brokers.find(":9098") != std::string::npos) {
+        Logger::info("Configuring MSK IAM authentication for consumer");
+        if (!MskIamAuth::configure(conf.get(), aws_region)) {
+            Logger::error("Failed to configure MSK IAM auth");
+        }
+        
+        // OAUTHBEARER 콜백 등록
+        static MskOauthCallback oauth_cb(aws_region);
+        conf->set("oauthbearer_token_refresh_cb", &oauth_cb, errstr);
+    }
     
     consumer_.reset(RdKafka::KafkaConsumer::create(conf.get(), errstr));
     if (!consumer_) {

@@ -1,6 +1,7 @@
 #include "kafka_producer.h"
 #include "config.h"
 #include "logger.h"
+#include "msk_iam_auth.h"
 #include <chrono>
 
 namespace aws_wrapper {
@@ -14,6 +15,19 @@ KafkaProducer::KafkaProducer(const std::string& brokers) {
     conf->set("bootstrap.servers", brokers, errstr);
     conf->set("acks", "1", errstr);  // Leader ack만 대기 (빠름)
     conf->set("linger.ms", "5", errstr);  // 배칭 딜레이
+    
+    // MSK IAM 인증 설정 (포트 9098 사용 시)
+    std::string aws_region = Config::get("AWS_REGION", "ap-northeast-2");
+    if (brokers.find(":9098") != std::string::npos) {
+        Logger::info("Configuring MSK IAM authentication for producer");
+        if (!MskIamAuth::configure(conf.get(), aws_region)) {
+            Logger::error("Failed to configure MSK IAM auth");
+        }
+        
+        // OAUTHBEARER 콜백 등록
+        static MskOauthCallback oauth_cb(aws_region);
+        conf->set("oauthbearer_token_refresh_cb", &oauth_cb, errstr);
+    }
     
     producer_.reset(RdKafka::Producer::create(conf.get(), errstr));
     if (!producer_) {
