@@ -56,6 +56,8 @@ private:
                                         const std::string& date_stamp,
                                         const std::string& region_name,
                                         const std::string& service_name);
+    static std::string urlEncode(const std::string& value);
+    static std::string base64Encode(const std::string& input);
 };
 
 /**

@@ -198,26 +198,30 @@ std::string MskIamAuth::generateAuthToken(const std::string& region) {
     
     std::string service = "kafka-cluster";
     std::string host = "kafka." + region + ".amazonaws.com";
-    
-    // Canonical Request 생성
     std::string method = "GET";
     std::string canonical_uri = "/";
-    std::string canonical_querystring = "Action=kafka-cluster%3AConnect";
+    std::string algorithm = "AWS4-HMAC-SHA256";
+    std::string credential_scope = std::string(date_stamp) + "/" + region + "/" + service + "/aws4_request";
     
-    std::stringstream signed_headers_ss;
-    signed_headers_ss << "host:" << host << "\n";
-    signed_headers_ss << "x-amz-date:" << amz_date << "\n";
-    if (!creds.session_token.empty()) {
-        signed_headers_ss << "x-amz-security-token:" << creds.session_token << "\n";
-    }
-    std::string canonical_headers = signed_headers_ss.str();
-    
-    std::string signed_headers = creds.session_token.empty() 
-        ? "host;x-amz-date" 
-        : "host;x-amz-date;x-amz-security-token";
-    
+    // Query string 생성 (presigned URL 형식)
+    std::string signed_headers = "host";
+    std::string canonical_headers = "host:" + host + "\n";
     std::string payload_hash = sha256("");
     
+    // X-Amz-Expires 추가 (900초 = 15분)
+    std::stringstream qs_ss;
+    qs_ss << "Action=kafka-cluster%3AConnect"
+          << "&X-Amz-Algorithm=" << algorithm
+          << "&X-Amz-Credential=" << urlEncode(creds.access_key_id + "/" + credential_scope)
+          << "&X-Amz-Date=" << amz_date
+          << "&X-Amz-Expires=900"
+          << "&X-Amz-SignedHeaders=" << signed_headers;
+    if (!creds.session_token.empty()) {
+        qs_ss << "&X-Amz-Security-Token=" << urlEncode(creds.session_token);
+    }
+    std::string canonical_querystring = qs_ss.str();
+    
+    // Canonical Request
     std::stringstream canonical_request_ss;
     canonical_request_ss << method << "\n"
                          << canonical_uri << "\n"
@@ -227,10 +231,7 @@ std::string MskIamAuth::generateAuthToken(const std::string& region) {
                          << payload_hash;
     std::string canonical_request = canonical_request_ss.str();
     
-    // String to Sign 생성
-    std::string algorithm = "AWS4-HMAC-SHA256";
-    std::string credential_scope = std::string(date_stamp) + "/" + region + "/" + service + "/aws4_request";
-    
+    // String to Sign
     std::stringstream string_to_sign_ss;
     string_to_sign_ss << algorithm << "\n"
                       << amz_date << "\n"
@@ -244,21 +245,62 @@ std::string MskIamAuth::generateAuthToken(const std::string& region) {
         reinterpret_cast<const unsigned char*>(hmacSha256(signing_key, string_to_sign).c_str()),
         SHA256_DIGEST_LENGTH);
     
-    // OAUTHBEARER 토큰 형식으로 생성
-    std::stringstream token_ss;
-    token_ss << "n,,\x01"
-             << "host=" << host << "\x01"
-             << "x-amz-date=" << amz_date << "\x01"
-             << "x-amz-credential=" << creds.access_key_id << "/" << credential_scope << "\x01"
-             << "x-amz-algorithm=" << algorithm << "\x01"
-             << "x-amz-signature=" << signature << "\x01";
-    if (!creds.session_token.empty()) {
-        token_ss << "x-amz-security-token=" << creds.session_token << "\x01";
-    }
-    token_ss << "\x01";
+    // Presigned URL 생성
+    std::stringstream url_ss;
+    url_ss << "https://" << host << canonical_uri << "?" 
+           << canonical_querystring 
+           << "&X-Amz-Signature=" << signature;
+    std::string presigned_url = url_ss.str();
+    
+    // Base64 인코딩
+    std::string token = base64Encode(presigned_url);
     
     Logger::debug("Generated MSK IAM auth token");
-    return token_ss.str();
+    return token;
+}
+
+// URL 인코딩 함수
+std::string MskIamAuth::urlEncode(const std::string& value) {
+    std::ostringstream escaped;
+    escaped.fill('0');
+    escaped << std::hex;
+    
+    for (char c : value) {
+        if (isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '~') {
+            escaped << c;
+        } else {
+            escaped << std::uppercase;
+            escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
+            escaped << std::nouppercase;
+        }
+    }
+    return escaped.str();
+}
+
+// Base64 인코딩 함수
+std::string MskIamAuth::base64Encode(const std::string& input) {
+    static const char* base64_chars = 
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
+    
+    std::string output;
+    int val = 0, valb = -6;
+    for (unsigned char c : input) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            output.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) {
+        output.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+    while (output.size() % 4) {
+        output.push_back('=');
+    }
+    return output;
 }
 
 bool MskIamAuth::configure(RdKafka::Conf* conf, const std::string& region) {
