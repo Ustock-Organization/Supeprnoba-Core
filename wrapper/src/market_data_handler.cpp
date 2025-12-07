@@ -154,8 +154,9 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
 
 void MarketDataHandler::on_bbo_change(const OrderBook* book,
                                        const BookDepth* depth) {
-    // BBO 변경은 depth_change로 처리됨
+    // BBO 변경 시 depth 업데이트도 발행
     Logger::debug("BBO change for:", book->symbol());
+    on_depth_change(book, depth);
 }
 
 } // namespace aws_wrapper

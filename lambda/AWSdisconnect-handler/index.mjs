@@ -3,8 +3,6 @@ import Redis from 'ioredis';
 const valkey = new Redis({
   host: process.env.VALKEY_HOST,
   port: process.env.VALKEY_PORT,
-  password: process.env.VALKEY_AUTH_TOKEN,
-  tls: {},
 });
 
 export const handler = async (event) => {

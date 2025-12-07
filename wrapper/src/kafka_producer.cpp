@@ -107,6 +107,7 @@ void KafkaProducer::publishTrade(const std::string& symbol,
 void KafkaProducer::publishDepth(const std::string& symbol,
                                   const nlohmann::json& depth) {
     produce(depth_topic_, symbol, depth.dump());
+    Logger::debug("Published depth:", symbol);
 }
 
 void KafkaProducer::publishOrderStatus(const std::string& symbol,

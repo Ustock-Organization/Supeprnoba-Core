@@ -352,16 +352,21 @@
                 <h2>WebSocket 연결</h2>
                 <div class="form-group">
                     <label>WebSocket Endpoint</label>
-                    <input type="text" id="wsEndpoint" placeholder="wss://xxx.execute-api.ap-northeast-2.amazonaws.com/prod">
+                    <input type="text" id="wsEndpoint" value="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/">
                 </div>
                 <div class="form-group">
                     <label>User ID (로그인 시)</label>
-                    <input type="text" id="wsUserId" placeholder="anonymous">
+                    <input type="text" id="wsUserId" placeholder="anonymous" value="test-user-1">
                 </div>
                 <div class="btn-group">
                     <button class="btn btn-success" onclick="connectWS()">연결</button>
                     <button class="btn btn-danger" onclick="disconnectWS()">연결 해제</button>
                     <span id="wsStatus" class="status status-disconnected">Disconnected</span>
+                </div>
+                <div id="connectionInfo" style="margin-top: 10px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.8rem; display: none;">
+                    <div><strong>연결 URL:</strong> <span id="connectedUrl">-</span></div>
+                    <div><strong>User ID:</strong> <span id="connectedUserId">-</span></div>
+                    <div><strong>연결 시간:</strong> <span id="connectedTime">-</span></div>
                 </div>
             </div>
 
@@ -385,7 +390,11 @@
                 <h2>주문 제출</h2>
                 <div class="form-group">
                     <label>API Endpoint (order-router)</label>
-                    <input type="text" id="orderEndpoint" placeholder="https://xxx.execute-api.ap-northeast-2.amazonaws.com/orders">
+                    <input type="text" id="orderEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/prod/orders">
+                </div>
+                <div class="form-group">
+                    <label>API Key (x-api-key)</label>
+                    <input type="text" id="apiKey" value="S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf">
                 </div>
                 <div class="form-group">
                     <label>심볼</label>
@@ -491,6 +500,9 @@
         let orderbooks = {};
 
         // WebSocket 연결
+        let connectedEndpoint = '';
+        let connectedUser = '';
+        
         function connectWS() {
             const endpoint = document.getElementById('wsEndpoint').value;
             const userId = document.getElementById('wsUserId').value || 'anonymous';
@@ -501,6 +513,8 @@
             }
 
             const url = `${endpoint}?userId=${userId}`;
+            connectedEndpoint = endpoint;
+            connectedUser = userId;
             addLog('INFO', `연결 시도: ${url}`);
 
             try {
@@ -508,11 +522,13 @@
 
                 ws.onopen = () => {
                     updateStatus(true);
+                    showConnectionInfo(endpoint, userId);
                     addLog('INFO', '✅ WebSocket 연결됨');
                 };
 
                 ws.onclose = () => {
                     updateStatus(false);
+                    hideConnectionInfo();
                     addLog('INFO', '❌ WebSocket 연결 해제됨');
                 };
 
@@ -538,12 +554,25 @@
                 ws.close();
                 ws = null;
             }
+            hideConnectionInfo();
         }
 
         function updateStatus(connected) {
             const status = document.getElementById('wsStatus');
             status.className = connected ? 'status status-connected' : 'status status-disconnected';
             status.textContent = connected ? 'Connected' : 'Disconnected';
+        }
+        
+        function showConnectionInfo(endpoint, userId) {
+            const info = document.getElementById('connectionInfo');
+            info.style.display = 'block';
+            document.getElementById('connectedUrl').textContent = endpoint;
+            document.getElementById('connectedUserId').textContent = userId;
+            document.getElementById('connectedTime').textContent = new Date().toLocaleString();
+        }
+        
+        function hideConnectionInfo() {
+            document.getElementById('connectionInfo').style.display = 'none';
         }
 
         // 메시지 처리
@@ -622,9 +651,13 @@
             addLog('INFO', `주문 제출: ${JSON.stringify(order)}`);
 
             try {
+                const apiKey = document.getElementById('apiKey').value;
                 const response = await fetch(endpoint, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'x-api-key': apiKey
+                    },
                     body: JSON.stringify(order)
                 });
 

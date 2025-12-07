@@ -8,15 +8,21 @@ import { createClient } from '@supabase/supabase-js';
 const valkey = new Redis({
   host: process.env.VALKEY_HOST,
   port: parseInt(process.env.VALKEY_PORT || '6379'),
-  password: process.env.VALKEY_AUTH_TOKEN,
-  tls: {},
+  //password: process.env.VALKEY_AUTH_TOKEN,
+  //tls: {},
 });
 
-// Supabase 클라이언트
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+// Supabase 클라이언트 (지연 초기화 - NAT Gateway 없을 시 사용 안함)
+let supabase = null;
+function getSupabase() {
+  if (!supabase && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
+    );
+  }
+  return supabase;
+}
 
 // UUID v4 생성 (crypto 사용)
 function generateOrderId() {
@@ -44,10 +50,19 @@ async function createKafkaClient() {
   });
 }
 
-// Supabase에서 사용자 잔고 확인
-async function checkBalance(userId, side, price, quantity) {
+// Supabase에서 사용자 잔고 확인 (현재 비활성화 - NAT Gateway 필요)
+async function checkBalance(userId, side, symbol, price, quantity) {
+  // TODO: NAT Gateway 추가 후 활성화
+  return { success: true, skipped: true };
+  
+  /*
+  const sb = getSupabase();
+  if (!sb) {
+    return { success: true, skipped: true };
+  }
+  
   try {
-    const { data, error } = await supabase
+    const { data, error } = await sb
       .from('user_balances')
       .select('cash_balance, positions')
       .eq('user_id', userId)
@@ -67,7 +82,6 @@ async function checkBalance(userId, side, price, quantity) {
         };
       }
     } else if (side === 'SELL') {
-      // 매도 시 보유 수량 확인
       const positions = data.positions || {};
       const heldQty = positions[symbol]?.quantity || 0;
       if (heldQty < quantity) {
@@ -81,11 +95,25 @@ async function checkBalance(userId, side, price, quantity) {
     return { success: true, balance: data.cash_balance };
   } catch (error) {
     console.error('Balance check exception:', error);
-    return { success: false, reason: error.message };
+    // 에러 시 통과 (NAT Gateway 없을 경우)
+    return { success: true, skipped: true, error: error.message };
   }
+  */
 }
 
 export const handler = async (event) => {
+  // CORS 헤더
+  const headers = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  };
+  
+  // OPTIONS 요청 처리 (CORS preflight)
+  if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
+    return { statusCode: 200, headers, body: '' };
+  }
+  
   try {
     let order;
     if (typeof event.body === 'string') {
@@ -100,6 +128,7 @@ export const handler = async (event) => {
     if (!order.symbol || !order.side || !order.quantity) {
       return {
         statusCode: 400,
+        headers,
         body: JSON.stringify({ error: 'Invalid order format: symbol, side, quantity required' }),
       };
     }
@@ -109,32 +138,38 @@ export const handler = async (event) => {
     if (!userId) {
       return {
         statusCode: 401,
+        headers,
         body: JSON.stringify({ error: 'user_id is required' }),
       };
     }
     
-    // Supabase 잔고 확인 (환경변수 설정 시)
-    if (process.env.SUPABASE_URL) {
-      const balanceCheck = await checkBalance(userId, order.side, order.price || 0, order.quantity);
-      if (!balanceCheck.success) {
-        return {
-          statusCode: 400,
-          body: JSON.stringify({ 
-            error: 'Balance check failed', 
-            reason: balanceCheck.reason 
-          }),
-        };
-      }
+    // Supabase 잔고 확인 (선택적 - 미설정 시 건너뜀)
+    console.log('Step 1: Balance check starting...');
+    const balanceCheck = await checkBalance(userId, order.side, order.symbol, order.price || 0, order.quantity);
+    console.log('Step 1: Balance check done:', balanceCheck);
+    if (!balanceCheck.success) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ 
+          error: 'Balance check failed', 
+          reason: balanceCheck.reason 
+        }),
+      };
     }
     
     // Valkey에서 라우팅 정보 조회
+    console.log('Step 2: Valkey get starting...');
     const routeInfo = await valkey.get(`route:${order.symbol}`);
+    console.log('Step 2: Valkey get done:', routeInfo);
     const route = routeInfo ? JSON.parse(routeInfo) : { status: 'ACTIVE' };
     
     // Kafka 연결
+    console.log('Step 3: Kafka connect starting...');
     const kafka = await createKafkaClient();
     const producer = kafka.producer();
     await producer.connect();
+    console.log('Step 3: Kafka connected!');
     
     const topic = route.status === 'MIGRATING' ? 'pending-orders' : (process.env.ORDERS_TOPIC || 'orders');
     
@@ -166,6 +201,7 @@ export const handler = async (event) => {
     
     return {
       statusCode: 200,
+      headers,
       body: JSON.stringify({ 
         message: 'Order accepted',
         order_id: orderId,
@@ -178,6 +214,7 @@ export const handler = async (event) => {
     console.error('Error:', error);
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({ error: error.message }),
     };
   }

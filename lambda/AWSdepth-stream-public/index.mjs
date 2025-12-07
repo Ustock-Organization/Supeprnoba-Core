@@ -6,8 +6,6 @@ import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk
 const valkey = new Redis({
   host: process.env.VALKEY_HOST,
   port: parseInt(process.env.VALKEY_PORT || '6379'),
-  password: process.env.VALKEY_AUTH_TOKEN,
-  tls: {},
 });
 
 // 마지막 전송 시간 캐시 (심볼별)

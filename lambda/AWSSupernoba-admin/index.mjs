@@ -1,5 +1,13 @@
 import { Kafka } from 'kafkajs';
 import { generateAuthToken } from 'aws-msk-iam-sasl-signer-js';
+
+// CORS 헤더
+const headers = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+
 async function createKafkaClient() {
   const region = 'ap-northeast-2';
   
@@ -16,7 +24,13 @@ async function createKafkaClient() {
     },
   });
 }
+
 export const handler = async (event) => {
+  // OPTIONS 요청 처리 (CORS preflight)
+  if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
+    return { statusCode: 200, headers, body: '' };
+  }
+
   try {
     let body;
     if (typeof event.body === 'string') {
@@ -65,12 +79,14 @@ export const handler = async (event) => {
     
     return {
       statusCode: 200,
+      headers,
       body: JSON.stringify({ success: true, result }),
     };
   } catch (error) {
     console.error('Error:', error);
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({ error: error.message }),
     };
   }
