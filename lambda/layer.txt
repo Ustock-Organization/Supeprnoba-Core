@@ -1,6 +1,6 @@
 nodejs24.x
 
-layer version 5
+layer version 6
 
 {
   "name": "nodejs",
