@@ -1,106 +1,127 @@
 # Lambda Functions
 
-비로그인 사용자를 위한 실시간 호가 스트리밍과 WebSocket 관리를 위한 Lambda 함수들입니다.
+Supernoba 거래 시스템용 AWS Lambda 함수들입니다.
 
-## 구조
+## 디렉토리 구조
 
 ```
 lambda/
-├── depthStreamHandler/    # MSK depth 토픽 → WebSocket 브로드캐스트
-├── wsConnect/             # WebSocket $connect 핸들러
-├── wsDisconnect/          # WebSocket $disconnect 핸들러
-└── wsMessage/             # WebSocket $default 핸들러 (구독 관리)
+├── AWSconnect-handler/        # WebSocket $connect
+├── AWSdisconnect-handler/     # WebSocket $disconnect
+├── AWSsubscribe-handler/      # 심볼 구독 요청 처리
+├── AWSdepth-stream-public/    # 비로그인 호가 스트림 (0.5초 간격)
+├── AWSuser-stream-handler/    # 로그인 사용자 스트림 (체결+호가)
+├── AWSSupernoba-order-router/ # 주문 라우터
+├── AWSSupernoba-admin/        # MSK 관리 API
+└── layer.txt                  # Lambda Layer 정보
 ```
 
-## 배포 방법
+## Lambda 별 역할
 
-### 1. 의존성 설치
-
-```bash
-cd lambda/depthStreamHandler
-npm install
-
-cd ../wsConnect
-npm install
-
-# 나머지도 동일
-```
-
-### 2. ZIP 패키징
-
-```bash
-cd lambda/depthStreamHandler
-zip -r function.zip index.js node_modules package.json
-```
-
-### 3. AWS Lambda 배포
-
-#### depthStreamHandler (MSK 트리거)
-```bash
-aws lambda create-function \
-  --function-name depthStreamHandler \
-  --runtime nodejs18.x \
-  --handler index.handler \
-  --zip-file fileb://function.zip \
-  --role arn:aws:iam::ACCOUNT_ID:role/lambda-msk-role \
-  --environment Variables="{CONNECTIONS_TABLE=websocket-connections,WEBSOCKET_ENDPOINT=xxx.execute-api.ap-northeast-2.amazonaws.com/prod}"
-```
-
-#### MSK 트리거 추가
-```bash
-aws lambda create-event-source-mapping \
-  --function-name depthStreamHandler \
-  --event-source-arn arn:aws:kafka:ap-northeast-2:ACCOUNT_ID:cluster/supernobamsk/xxx \
-  --topics depth \
-  --starting-position LATEST
-```
+| Lambda | 트리거 | 역할 |
+|--------|--------|------|
+| `connect-handler` | API Gateway $connect | 연결 정보 Valkey 저장 |
+| `disconnect-handler` | API Gateway $disconnect | 연결 정보 정리 |
+| `subscribe-handler` | API Gateway $default | 심볼 구독 관리 |
+| `depth-stream-public` | MSK (depth) | 비로그인 호가 0.5초 간격 |
+| `user-stream-handler` | MSK (fills, depth, order_status) | 로그인 사용자 체결/호가 |
+| `order-router` | API Gateway HTTP | 주문 → MSK 발행 |
+| `admin` | 직접 호출 | MSK 토픽 관리 |
 
 ## 환경변수
 
-| 변수 | 설명 | 예시 |
-|------|------|------|
-| `CONNECTIONS_TABLE` | DynamoDB 연결 테이블 | `websocket-connections` |
-| `WEBSOCKET_ENDPOINT` | API Gateway WebSocket 엔드포인트 | `xxx.execute-api.ap-northeast-2.amazonaws.com/prod` |
-| `AWS_REGION` | AWS 리전 | `ap-northeast-2` |
+### 공통
+| 변수 | 설명 |
+|------|------|
+| `VALKEY_HOST` | ElastiCache Valkey 호스트 |
+| `VALKEY_PORT` | Valkey 포트 (6379) |
+| `VALKEY_AUTH_TOKEN` | Valkey 인증 토큰 |
 
-## DynamoDB 테이블
+### WebSocket Push용
+| 변수 | 설명 |
+|------|------|
+| `WEBSOCKET_ENDPOINT` | API Gateway WebSocket 엔드포인트 |
 
-### websocket-connections
+### MSK용
+| 변수 | 설명 |
+|------|------|
+| `MSK_BOOTSTRAP_SERVERS` | MSK 브로커 주소 (IAM 9098) |
+| `ORDERS_TOPIC` | 주문 토픽명 (기본: orders) |
 
-| 속성 | 타입 | 설명 |
-|------|------|------|
-| `connectionId` | String (PK) | WebSocket 연결 ID |
-| `connectedAt` | Number | 연결 시간 (epoch ms) |
-| `subscribedSymbols` | String Set | 구독 중인 심볼 목록 |
+### Supabase용 (order-router)
+| 변수 | 설명 |
+|------|------|
+| `SUPABASE_URL` | Supabase 프로젝트 URL |
+| `SUPABASE_SERVICE_KEY` | Supabase 서비스 키 |
 
-### 테이블 생성
-```bash
-aws dynamodb create-table \
-  --table-name websocket-connections \
-  --attribute-definitions AttributeName=connectionId,AttributeType=S \
-  --key-schema AttributeName=connectionId,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
+## Layer 정보
+
+```
+nodejs24.x - layer version 5
+
+의존성:
+- @aws-sdk/client-apigatewaymanagementapi
+- @aws-sdk/client-kafka
+- @supabase/supabase-js
+- aws-msk-iam-sasl-signer-js
+- ioredis
+- kafkajs
 ```
 
-## API Gateway WebSocket 설정
+## 클라이언트 WebSocket 사용법
 
-### 라우트
-| 라우트 | Lambda |
-|--------|--------|
-| `$connect` | wsConnect |
-| `$disconnect` | wsDisconnect |
-| `$default` | wsMessage |
+```javascript
+// 연결 (userId 전달)
+const ws = new WebSocket('wss://xxx.execute-api.ap-northeast-2.amazonaws.com/prod?userId=user123');
 
-### 클라이언트 메시지 형식
-```json
 // 심볼 구독
-{ "action": "subscribe", "symbol": "AAPL" }
+ws.send(JSON.stringify({ action: 'subscribe', symbols: ['AAPL', 'GOOGL'] }));
 
-// 구독 해제
-{ "action": "unsubscribe", "symbol": "AAPL" }
+// 호가 수신
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.type === 'DEPTH') {
+    console.log(msg.symbol, msg.data.bids, msg.data.asks);
+  } else if (msg.type === 'FILL') {
+    console.log('체결:', msg.data);
+  } else if (msg.type === 'ORDER_STATUS') {
+    console.log('주문상태:', msg.data);
+  }
+};
 ```
 
-### 서버 푸시 형식
+## 주문 요청 형식
+
+```json
+POST /orders
+{
+  "user_id": "user123",
+  "symbol": "AAPL",
+  "side": "BUY",
+  "price": 15000,
+  "quantity": 10,
+  "order_type": "LIMIT"
+}
+```
+
+## 응답 형식
+
+### 체결 알림 (FILL)
+```json
+{
+  "type": "FILL",
+  "data": {
+    "trade_id": "trd_xxx",
+    "symbol": "AAPL",
+    "side": "BUY",
+    "order_id": "ord_xxx",
+    "filled_qty": 10,
+    "filled_price": 15000
+  }
+}
+```
+
+### 호가 업데이트 (DEPTH)
 ```json
 {
   "type": "DEPTH",
@@ -108,8 +129,7 @@ aws dynamodb create-table \
   "data": {
     "bids": [{ "price": 150, "quantity": 100, "count": 2 }],
     "asks": [{ "price": 151, "quantity": 50, "count": 1 }]
-  },
-  "timestamp": 1701936000000
+  }
 }
 ```
 
