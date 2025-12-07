@@ -185,9 +185,9 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
-    "AWS_CONSOLE_SETUP_GUIDE.md",
-    "AWS_ARCHITECTURE.md",
     "PERFORMANCE.md",
+    "AWS_ARCHITECTURE.md",
+    "AWS_CONSOLE_SETUP_GUIDE.md",
     "README_ORDER_ENTRY.md",
     "WINDOWS_BUILD_GUIDE.md",
     "wrapper/run_engine.sh",
