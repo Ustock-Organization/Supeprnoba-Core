@@ -5,7 +5,7 @@
   "dependencies": [
     {
       "name": "librdkafka",
-      "features": ["ssl", "sasl"]
+      "features": ["ssl"]
     },
     "grpc",
     "protobuf",
@@ -16,5 +16,6 @@
     "openssl"
   ]
 }
+
 
 
