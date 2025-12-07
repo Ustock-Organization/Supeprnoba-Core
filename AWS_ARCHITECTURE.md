@@ -747,6 +747,17 @@ flowchart TD
 | **자동 스냅샷** | ✅ | 10초마다 모든 오더북 → Redis 저장 |
 | **시작 시 복원** | ✅ | Redis에서 스냅샷 로드 → 오더북 복원 |
 | **종료 시 저장** | ✅ | Ctrl+C 시 최종 스냅샷 저장 후 종료 |
+| **비로그인 호가 스트림** | ✅ | `depthStreamHandler` Lambda 구현 *(2025-12-07)* |
+
+### 18.2 구현 필요 항목 (TODO)
+
+| 기능 | 위치 | 설명 |
+|------|------|------|
+| **Supabase 잔고 확인** | `orderHandler` Lambda | 주문 전 사용자 잔고 검증 |
+| **Order ID UUID 생성** | `orderHandler` Lambda | 중복 방지 해시 ID 생성 |
+| **로그인 사용자 체결 알림** | `userOrdersHandler` Lambda | fills, order_status 개인 푸시 |
+| **S3 오더북 백업** | C++ Engine | 장기 백업용 S3 저장 |
+| **관리자 API** | Lambda (Admin) | 종목 조회/추가, 오더북 상세 |
 
 ### 18.2 주문 JSON 포맷
 

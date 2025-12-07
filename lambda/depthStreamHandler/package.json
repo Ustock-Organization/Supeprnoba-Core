@@ -1,0 +1,16 @@
+{
+  "name": "depth-stream-handler",
+  "version": "1.0.0",
+  "description": "MSK depth topic consumer - broadcasts orderbook updates to WebSocket clients",
+  "main": "index.js",
+  "scripts": {
+    "zip": "zip -r function.zip index.js node_modules package.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0"
+  },
+  "keywords": ["aws", "lambda", "msk", "websocket", "orderbook"],
+  "author": "ustock",
+  "license": "MIT"
+}
