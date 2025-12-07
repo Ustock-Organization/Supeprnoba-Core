@@ -44,7 +44,7 @@
                 "autoReveal": false
               },
               "icon": "lucide-folder-closed",
-              "title": "Files"
+              "title": "파일 탐색기"
             }
           },
           {
@@ -174,17 +174,32 @@
   },
   "left-ribbon": {
     "hiddenItems": {
-      "switcher:Open quick switcher": false,
-      "graph:Open graph view": false,
-      "canvas:Create new canvas": false,
-      "daily-notes:Open today's daily note": false,
-      "templates:Insert template": false,
-      "command-palette:Open command palette": false,
-      "bases:Create new base": false
+      "switcher:빠른 전환기 열기": false,
+      "graph:그래프 뷰 열기": false,
+      "canvas:새 캔버스 만들기": false,
+      "daily-notes:오늘의 일일 노트 열기": false,
+      "templates:템플릿 삽입": false,
+      "command-palette:명령어 팔레트 열기": false,
+      "bases:새 베이스 생성하기": false
     }
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
-    "WINDOWS_BUILD_GUIDE.md"
+    "PERFORMANCE.md",
+    "AWS_ARCHITECTURE.md",
+    "AWS_CONSOLE_SETUP_GUIDE.md",
+    "README_ORDER_ENTRY.md",
+    "WINDOWS_BUILD_GUIDE.md",
+    "wrapper/run_engine.sh",
+    "wrapper/src/websocket_server.cpp",
+    "wrapper/include/websocket_server.h",
+    "wrapper/include/msk_iam_auth.h",
+    "wrapper/src/msk_iam_auth.cpp",
+    "generate_architecture.py",
+    "wrapper/README.md",
+    "wrapper/build_ec2.sh",
+    "wrapper/src/main.cpp",
+    "wrapper/src/metrics.cpp",
+    "wrapper/src/grpc_service.cpp"
   ]
 }

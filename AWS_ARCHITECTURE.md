@@ -4,28 +4,29 @@
 
 ## 전체 아키텍처 개요
 
-```
-[Client] -> [API Gateway] -> [Order Router] -> [Kafka] -> [Matching Engine Cluster]
-                                  |                              |
-                                  v                              v
-                              [Redis]                    [State Snapshot S3]
-                                  |
-                                  v
-                         [CloudWatch / Step Functions]
+```mermaid
+graph LR
+    Client[Client] --> APIG[API Gateway]
+    APIG --> Router[Order Router]
+    Router --> MSK[MSK]
+    Router --> Redis[(Redis)]
+    MSK --> Engine[Matching Engine Cluster]
+    Engine --> S3[(State Snapshot S3)]
+    Redis --> CW[CloudWatch / Step Functions]
 ```
 
 ---
 
 ## 1. 클라이언트 진입점 (Ingress Layer)
 
-| 컴포넌트 | AWS 서비스 / 기술 스택 | 역할 |
-|---|---|---|
-| **WebSocket Gateway** | Amazon API Gateway (WebSocket API) | 클라이언트 영구 연결 관리, 호가/체결 푸시 |
-| **REST API** | Amazon API Gateway (HTTP API) 또는 ALB | 주문 제출 REST 엔드포인트 |
-| **인증** | Amazon Cognito 또는 자체 JWT | 사용자 인증 및 토큰 검증 |
+| 컴포넌트                  | AWS 서비스 / 기술 스택                      | 역할                       |
+| --------------------- | ------------------------------------ | ------------------------ |
+| **WebSocket Gateway** | Amazon API Gateway (WebSocket API)   | 클라이언트 영구 연결 관리, 호가/체결 푸시 |
+| **REST API**          | Amazon API Gateway (HTTP API) 또는 ALB | 주문 제출 REST 엔드포인트         |
+| **인증**                | Amazon Cognito 또는 자체 JWT             | 사용자 인증 및 토큰 검증           |
 
 ### 구현 포인트
-- API Gateway는 직접 Kafka로 쏘지 못하므로, Lambda 또는 Fargate로 구현된 **Order Router**를 붙입니다.
+- API Gateway는 직접 MSK로 쏘지 못하므로, Lambda 또는 Fargate로 구현된 **Order Router**를 붙입니다.
 - WebSocket은 연결 ID를 DynamoDB/Redis에 저장하여 체결 시 푸시 대상을 식별합니다.
 
 ---
@@ -36,7 +37,7 @@
 |---|---|---|
 | **라우터 서비스** | Go 또는 Rust on ECS Fargate / EC2 | 종목코드 기반 라우팅 결정, 핫샤드 감지 시 주문 일시정지(Pause) |
 | **라우팅 테이블** | Amazon ElastiCache (Redis) | 종목 -> 인스턴스 매핑 정보 저장, 실시간 조회 |
-| **주문 큐** | Amazon MSK (Managed Kafka) 또는 Kinesis Data Streams | 종목별 파티셔닝, 주문 버퍼링 |
+| **주문 큐** | Amazon MSK | 종목별 파티셔닝, 주문 버퍼링 |
 
 ### 구현 포인트 (Order Router)
 ```go
@@ -45,14 +46,14 @@ func RouteOrder(order Order) {
     // 1. Redis에서 종목 라우팅 정보 조회
     routeInfo := redis.Get("route:" + order.Symbol)
 
-    // 2. 해당 종목이 마이그레이션 중(Paused)이면 Kafka에만 적재
+    // 2. 해당 종목이 마이그레이션 중(Paused)이면 MSK에만 적재
     if routeInfo.Status == "MIGRATING" {
-        kafka.Send("pending-orders", order.Symbol, order) // 파티션 키 = 종목
+        msk.Send("pending-orders", order.Symbol, order) // 파티션 키 = 종목
         return
     }
 
     // 3. 정상이면 해당 파티션(인스턴스)으로 라우팅
-    kafka.Send("orders", order.Symbol, order)
+    msk.Send("orders", order.Symbol, order)
 }
 ```
 
@@ -67,12 +68,12 @@ func RouteOrder(order Order) {
 | 컴포넌트 | 기술 스택 | 역할 |
 |---|---|---|
 | **매칭 엔진** | Liquibook (C++) + 커스텀 래퍼 on EC2 (c6i.xlarge 이상) | 주문 매칭 핵심 로직 |
-| **Kafka Consumer** | librdkafka (C++) 또는 Sarama (Go) | Kafka에서 주문 소비 |
+| **MSK Consumer** | librdkafka (C++) 또는 Sarama (Go) | MSK에서 주문 소비 |
 | **gRPC/TCP Server** | gRPC (C++) 또는 Boost.Asio | 오케스트레이터(Step Functions)와 통신, 스냅샷 요청/응답 |
 | **상태 스냅샷 저장소** | Amazon S3 (대용량) 또는 Redis (저지연) | 오더북 직렬화 데이터 저장 |
 
 ### Liquibook 추가 구현 필요 사항
-1. **Kafka Consumer Thread**: Kafka에서 주문을 읽어 `OrderBook::add()` 호출.
+1. **MSK Consumer Thread**: MSK에서 주문을 읽어 `OrderBook::add()` 호출.
 2. **gRPC Server**:
    - `SnapshotOrderBook(symbol)`: 해당 종목 오더북 직렬화 후 반환.
    - `RestoreOrderBook(symbol, data)`: 직렬화 데이터로 오더북 복원.
@@ -89,16 +90,24 @@ func RouteOrder(order Order) {
 | **부하 감지** | Amazon CloudWatch Alarms | CPU > 85% 시 Step Functions 트리거 |
 | **인스턴스 제어** | AWS Lambda + EC2 API / ASG | 새 인스턴스 프로비저닝, AMI 시작 |
 
-### Step Functions 상태 머신 플로우
-```
-1. DetectHotSymbol     -> 가장 부하가 높은 종목 식별
-2. ProvisionNewInstance -> Warm Pool에서 EC2 시작
-3. PauseRouting        -> Redis 라우팅 status = MIGRATING
-4. WaitForDrain        -> 기존 인스턴스 주문 처리 완료 대기
-5. TransferSnapshot    -> gRPC로 스냅샷 요청 -> S3 -> 신규 인스턴스 복원
-6. SwitchRouting       -> Redis 라우팅 target = 신규 인스턴스
-7. ReplayPendingOrders -> pending-orders 토픽 재전송
-8. Cleanup             -> 기존 인스턴스에서 오더북 제거
+```mermaid
+flowchart TD
+    A[1. DetectHotSymbol] --> B[2. ProvisionNewInstance]
+    B --> C[3. PauseRouting]
+    C --> D[4. WaitForDrain]
+    D --> E[5. TransferSnapshot]
+    E --> F[6. SwitchRouting]
+    F --> G[7. ReplayPendingOrders]
+    G --> H[8. Cleanup]
+    
+    A -.- A1[가장 부하가 높은 종목 식별]
+    B -.- B1[Warm Pool에서 EC2 시작]
+    C -.- C1[Redis 라우팅 status = MIGRATING]
+    D -.- D1[기존 인스턴스 주문 처리 완료 대기]
+    E -.- E1[gRPC 스냅샷 → S3 → 신규 인스턴스 복원]
+    F -.- F1[Redis 라우팅 target = 신규 인스턴스]
+    G -.- G1[pending-orders 토픽 재전송]
+    H -.- H1[기존 인스턴스에서 오더북 제거]
 ```
 
 ---
@@ -107,7 +116,7 @@ func RouteOrder(order Order) {
 
 | 컴포넌트 | 기술 스택 | 역할 |
 |---|---|---|
-| **체결 이벤트 발행** | Kafka (MSK) 또는 Kinesis | 체결 발생 시 `fills` 토픽으로 발행 |
+| **체결 이벤트 발행** | Amazon MSK | 체결 발생 시 `fills` 토픽으로 발행 |
 | **시장 데이터 처리** | Flink on Kinesis Data Analytics 또는 Lambda Consumer | `fills`, `depth` 토픽 소비 후 가공 |
 | **클라이언트 푸시** | API Gateway Management API (WebSocket) | 연결된 클라이언트에 JSON 푸시 |
 | **호가 캐싱** | ElastiCache (Redis) | 최신 호가창 저장, 클라이언트 폴링 대응 |
@@ -131,10 +140,10 @@ func RouteOrder(order Order) {
 | 클라이언트 진입 | API Gateway (HTTP/WebSocket), Cognito |
 | 라우팅 | Go/Rust on Fargate, ElastiCache Redis |
 | 메시지 큐 | Amazon MSK (Kafka) |
-| 매칭 엔진 | Liquibook C++ + gRPC + librdkafka on EC2 |
+| 매칭 엔진 | Liquibook C++ + gRPC + MSK Client (librdkafka) on EC2 |
 | 오케스트레이션 | Step Functions, Lambda, CloudWatch Alarms |
 | 스냅샷 저장 | S3 (또는 Redis for low latency) |
-| 시장 데이터 | Kinesis/Kafka, Lambda, API Gateway Push |
+| 시장 데이터 | MSK, Lambda, API Gateway Push |
 
 ---
 
@@ -238,7 +247,7 @@ func RouteOrder(order Order) {
 
 | 서비스 | 사양 | 월 비용 |
 |---|---|---|
-| **MSK (Kafka)** | kafka.t3.small × 2 | ~$100 |
+| **Amazon MSK** | kafka.t3.small × 2 | ~$100 |
 | **ElastiCache Redis** | cache.t3.micro | ~$15 |
 | **API Gateway** | 100만 요청 | ~$3.50 |
 | **S3** | 10GB 스냅샷 | ~$0.25 |
@@ -257,15 +266,19 @@ func RouteOrder(order Order) {
 
 ## 10. 핫 샤드 마이그레이션 트리거 기준
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│           CPU 사용률 기반 스케일링                           │
-├─────────────────────────────────────────────────────────────┤
-│  0-50%   │  정상 운영                                       │
-│  50-70%  │  경고 (모니터링 강화)                             │
-│  70-85%  │  Warm Pool 인스턴스 준비                          │
-│  85%+    │  마이그레이션 트리거 → 핫 종목 분리                │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph CPU["CPU 사용률 기반 스케일링"]
+        A["0-50%"] --> A1[정상 운영]
+        B["50-70%"] --> B1[경고 - 모니터링 강화]
+        C["70-85%"] --> C1[Warm Pool 인스턴스 준비]
+        D["85%+"] --> D1[마이그레이션 트리거 → 핫 종목 분리]
+    end
+    
+    style A fill:#4CAF50,color:white
+    style B fill:#FFC107,color:black
+    style C fill:#FF9800,color:white
+    style D fill:#F44336,color:white
 ```
 
 ---
@@ -278,8 +291,8 @@ Liquibook 핵심 엔진을 AWS 프로덕션에 배포하려면 다음 래퍼 코
 
 | 컴포넌트 | 역할 | 기술 스택 |
 |---|---|---|
-| **Kafka Consumer** | Kafka → Liquibook 연결 | C++: librdkafka / Go: sarama |
-| **TradeListener** | 체결 → Kafka 발행 | Liquibook 콜백 구현 |
+| **MSK Consumer** | MSK → Liquibook 연결 | C++: librdkafka / Go: sarama |
+| **TradeListener** | 체결 → MSK 발행 | Liquibook 콜백 구현 |
 | **잔고 확인** | 주문 전 잔고 검증 | Order Router에서 처리 |
 | **가격 검증** | 호가 제한 (상한가/하한가) | Order Router에서 처리 |
 
@@ -309,65 +322,528 @@ Liquibook은 인메모리 엔진이므로, 데이터 영속성을 별도로 구�
 |---|---|---|
 | **오더북 스냅샷** | S3 | 주기적 직렬화 (1분 간격) |
 | **체결 기록** | DynamoDB / RDS | TradeListener에서 기록 |
-| **주문 로그** | Kafka (보존) | 주문 토픽 retention 설정 |
+| **주문 로그** | Amazon MSK (보존) | 주문 토픽 retention 설정 |
 | **사용자 잔고** | DynamoDB | 체결 시 업데이트 |
 
 ### 장애 복구 시나리오
 
-```
-1. 인스턴스 다운 감지 (CloudWatch)
-2. Warm Pool에서 새 인스턴스 시작
-3. S3에서 최신 스냅샷 복원
-4. Kafka에서 스냅샷 이후 주문 리플레이
-5. 라우팅 테이블 업데이트
-6. 서비스 재개
+```mermaid
+flowchart TD
+    A[1. 인스턴스 다운 감지] --> B[2. Warm Pool에서 새 인스턴스 시작]
+    B --> C[3. S3에서 최신 스냅샷 복원]
+    C --> D[4. MSK에서 스냅샷 이후 주문 리플레이]
+    D --> E[5. 라우팅 테이블 업데이트]
+    E --> F[6. 서비스 재개]
+    
+    A -.- CW[CloudWatch]
+    B -.- WP[Warm Pool]
+    C -.- S3[(S3)]
+    D -.- MSK[MSK]
+    E -.- Redis[(Redis)]
 ```
 
 ---
 
 ## 13. 전체 아키텍처 상세 다이어그램
 
+```mermaid
+graph TD
+    %% Styles
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:white;
+    classDef cpp fill:#00599C,stroke:#004482,stroke-width:2px,color:white;
+    classDef client fill:#808080,stroke:#333,stroke-width:2px,color:white;
+
+    subgraph Clients ["Clients (Mobile/Web)"]
+        UserApp[User App]:::client
+    end
+
+    subgraph AWS_Cloud ["AWS Cloud"]
+        style AWS_Cloud fill:#f9f9f9,stroke:#232F3E,stroke-dasharray: 5 5
+
+        APIG[API Gateway]:::aws
+        
+        subgraph Serverless ["Serverless Layer"]
+            OrderRouter[Order Router Lambda]:::aws
+            StreamHandler[Stream Handler Lambda]:::aws
+        end
+
+        subgraph MSK_Cluster ["Amazon MSK (Kafka)"]
+            Topic_Orders[Topic: orders]:::aws
+            Topic_Fills[Topic: fills]:::aws
+        end
+
+        subgraph EC2_Layer ["Matching Engine (EC2)"]
+            style EC2_Layer fill:#e6f3ff,stroke:#00599C
+            
+            Wrapper[C++ AWS Wrapper]:::cpp
+            Liquibook[Liquibook Core]:::cpp
+            
+            Wrapper <-->|Matches| Liquibook
+        end
+
+        subgraph Persistence ["Persistence Layer"]
+            Redis[(ElastiCache Redis)]:::aws
+            S3[(S3 Snapshots)]:::aws
+            DB[(User DB)]:::aws
+        end
+    end
+
+    %% Connections
+    UserApp -->|REST/WS| APIG
+    APIG -->|Route| OrderRouter
+    APIG <-->|Push Updates| StreamHandler
+
+    OrderRouter -->|Check Balance| DB
+    OrderRouter -->|Publish| Topic_Orders
+    
+    Topic_Orders -->|Consume| Wrapper
+    Wrapper -->|Publish Fills| Topic_Fills
+    
+    Topic_Fills -->|Consume| StreamHandler
+    
+    Wrapper -.->|Snapshot| S3
+    Wrapper -.->|Cache State| Redis
 ```
-                          ┌────────────────────────────────┐
-                          │        사용자 잔고 DB           │
-                          │     (DynamoDB / RDS)           │
-                          └───────────────┬────────────────┘
-                                          │ 잔고 확인
-┌──────────┐    ┌──────────┐    ┌─────────▼─────────┐    ┌─────────────┐
-│  Client  │───▶│   API    │───▶│   Order Router    │───▶│    Kafka    │
-│  (App)   │    │ Gateway  │    │  (잔고/가격 검증)  │    │    (MSK)    │
-└──────────┘    └──────────┘    └───────────────────┘    └──────┬──────┘
-                                                                 │
-                          ┌──────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Matching Engine (EC2)                            │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────────────────┐   │
-│  │   Kafka     │──▶│  Liquibook  │──▶│   TradeListener         │   │
-│  │  Consumer   │   │   Engine    │   │  (체결→Kafka 발행)       │   │
-│  └─────────────┘   └─────────────┘   └─────────────────────────┘   │
-│                           │                                         │
-│                    ┌──────▼──────┐                                  │
-│                    │  Snapshot   │──▶ S3                            │
-│                    │  Manager    │                                  │
-│                    └─────────────┘                                  │
-└─────────────────────────────────────────────────────────────────────┘
-                          │
-                          ▼ 체결 이벤트
-                    ┌───────────┐
-                    │   Kafka   │
-                    │  (fills)  │
-                    └─────┬─────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-    ┌──────────┐   ┌──────────┐   ┌──────────────┐
-    │  잔고    │   │  체결    │   │  WebSocket   │
-    │  업데이트 │   │  기록    │   │  푸시        │
-    └──────────┘   └──────────┘   └──────────────┘
+
+## 14. 고화질 아키텍처 다이어그램 생성 (Official Icons)
+
+AWS 공식 아이콘을 사용한 고화질 다이어그램(PNG)을 생성하려면 다음 단계를 따르세요.
+
+1.  **Graphviz 설치**: [Graphviz 다운로드](https://graphviz.org/download/) 및 설치 (시스템 PATH에 추가 필수).
+2.  **Python 라이브러리 설치**:
+    ```bash
+    pip install diagrams
+    ```
+3.  **스크립트 실행**:
+    ```bash
+    python generate_architecture.py
+    ```
+4.  결과물 `liquibook_aws_architecture.png` 확인.
+
+---
+
+## 15. 전체 데이터 흐름도 (End-to-End Data Flow)
+
+아래는 사용자가 주문을 넣고 체결 결과를 받기까지의 **전체 데이터 흐름**입니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 👤 사용자 앱
+    participant APIG as API Gateway
+    participant Router as Order Router (Lambda)
+    participant DB as User DB (DynamoDB)
+    participant MSK_Orders as MSK (orders 토픽)
+    participant Engine as C++ Matching Engine (EC2)
+    participant MSK_Fills as MSK (fills 토픽)
+    participant Stream as Stream Handler (Lambda)
+    participant Redis as ElastiCache (Redis)
+
+    User->>APIG: 1. 주문 요청 (REST)
+    APIG->>Router: 2. 주문 라우팅
+    Router->>DB: 3. 잔고 확인
+    DB-->>Router: 4. 잔고 OK (₩1,000,000)
+    Router->>MSK_Orders: 5. 주문 발행
+
+    MSK_Orders->>Engine: 6. 주문 소비
+    Note over Engine: 7. Liquibook 매칭 처리
+    Engine->>MSK_Fills: 8. 체결 결과 발행
+    Engine->>Redis: 9. 호가창 캐시 업데이트
+
+    MSK_Fills->>Stream: 10. 체결 소비
+    Stream->>APIG: 11. WebSocket 푸시
+    APIG->>User: 12. 체결 알림 수신
+```
+
+### 15.1 단계별 데이터 예시
+
+#### 1️⃣ 사용자 → API Gateway: 주문 요청
+
+```json
+// POST /orders
+{
+  "user_id": "user_12345",
+  "symbol": "TSLA",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "price": 250.50,
+  "quantity": 10
+}
+```
+
+#### 2️⃣ Order Router → User DB: 잔고 확인
+
+```json
+// DynamoDB Query: Key = { "user_id": "user_12345" }
+// Response:
+{
+  "user_id": "user_12345",
+  "balance": 1000000,
+  "positions": { "TSLA": { "qty": 5, "avg_price": 245.00 } }
+}
+```
+
+**검증**: `250.50 × 10 = ₩2,505` ≤ `₩1,000,000` ✅
+
+#### 3️⃣ Order Router → MSK (orders 토픽): 주문 발행
+
+```json
+// Topic: orders, Partition Key: "TSLA"
+{
+  "order_id": "ord_abc123",
+  "user_id": "user_12345",
+  "symbol": "TSLA",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "price": 250.50,
+  "quantity": 10,
+  "timestamp": "2025-12-06T11:50:00.123Z"
+}
+```
+
+#### 4️⃣ C++ Engine: Liquibook 매칭 처리
+
+**매칭 전 오더북 상태 (TSLA)**:
+```
+        ASK (매도)             |         BID (매수)
+   수량    가격                |    가격      수량
+   ─────────────────────────────────────────────────
+    15    251.00              |    249.50     20
+     8    250.50  ← 매칭 대상  |    249.00     30
+    25    250.00              |    248.50     15
+```
+
+**매칭 결과**: 매수 `10주 @ 250.50` vs 매도 `8주 @ 250.50` → **8주 체결**, 잔량 **2주** 오더북 등록
+
+#### 5️⃣ C++ Engine → MSK (fills 토픽): 체결 결과 발행
+
+```json
+// Topic: fills
+{
+  "trade_id": "trd_xyz789",
+  "symbol": "TSLA",
+  "price": 250.50,
+  "quantity": 8,
+  "buyer": { "order_id": "ord_abc123", "user_id": "user_12345" },
+  "seller": { "order_id": "ord_def456", "user_id": "user_67890" },
+  "timestamp": "2025-12-06T11:50:00.456Z"
+}
+```
+
+#### 6️⃣ C++ Engine → Redis: 호가창 캐시 업데이트
+
+```json
+// Redis Key: orderbook:TSLA
+{
+  "symbol": "TSLA",
+  "asks": [
+    { "price": 250.00, "qty": 25 },
+    { "price": 251.00, "qty": 15 }
+  ],
+  "bids": [
+    { "price": 250.50, "qty": 2 },
+    { "price": 249.50, "qty": 20 },
+    { "price": 249.00, "qty": 30 }
+  ],
+  "last_price": 250.50,
+  "last_qty": 8
+}
+```
+
+#### 7️⃣ Stream Handler → 사용자 앱: WebSocket 푸시
+
+```json
+// WebSocket to user_12345
+{
+  "type": "FILL",
+  "data": {
+    "order_id": "ord_abc123",
+    "symbol": "TSLA",
+    "side": "BUY",
+    "filled_qty": 8,
+    "filled_price": 250.50,
+    "remaining_qty": 2,
+    "status": "PARTIALLY_FILLED"
+  }
+}
+```
+
+### 15.2 데이터 타입별 저장소 요약
+
+| 데이터 | 저장소 | 목적 |
+|---|---|---|
+| **주문 메시지** | MSK (orders) | 비동기 주문 큐 |
+| **체결 메시지** | MSK (fills) | 비동기 체결 알림 |
+| **사용자 잔고** | DynamoDB | 영구 저장 |
+| **실시간 호가창** | Redis | 저지연 캐시 |
+| **오더북 스냅샷** | S3 | 장애 복구용 백업 |
+
+---
+
+## 16. 현재 구현 상태 (Current Implementation)
+
+### 16.1 배포된 AWS 리소스
+
+| 서비스 | 리소스 이름 | 상태 |
+|---|---|---|
+| **Amazon MSK** | `supernobamsk` | ✅ 운영 중 |
+| **ElastiCache Redis** | `supernobaorderbookbackupcache` | ✅ 운영 중 |
+| **EC2 (매칭 엔진)** | `ip-172-31-47-97` | ✅ 빌드 완료 |
+
+### 16.2 MSK 브로커 엔드포인트
+
+```
+# IAM 인증 (포트 9098)
+b-1.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9098
+b-2.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9098
+b-3.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9098
+```
+
+### 16.3 ElastiCache Redis 엔드포인트
+
+```
+master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com:6379
+```
+
+### 16.4 C++ 매칭 엔진 구현 현황
+
+| 컴포넌트 | 파일 | 상태 |
+|---|---|---|
+| **KafkaConsumer** | `kafka_consumer.cpp` | ✅ 완료 (IAM 인증 포함) |
+| **KafkaProducer** | `kafka_producer.cpp` | ✅ 완료 (IAM 인증 포함) |
+| **EngineCore** | `engine_core.cpp` | ✅ 완료 |
+| **MarketDataHandler** | `market_data_handler.cpp` | ✅ 완료 |
+| **RedisClient** | `redis_client.cpp` | ✅ 완료 |
+| **gRPC Service** | `grpc_service.cpp` | ✅ 완료 |
+| **MSK IAM Auth** | `msk_iam_auth.cpp` | ✅ 완료 |
+| **Metrics** | `metrics.cpp` | ✅ 완료 |
+
+### 16.5 Kafka 토픽 구조
+
+```mermaid
+graph TD
+    subgraph MSK["Amazon MSK 토픽"]
+        orders[orders] --> |Lambda → Engine| desc1[주문 입력]
+        fills[fills] --> |Engine → Lambda| desc2[체결 결과]
+        trades[trades] --> desc3[거래 발생 이벤트]
+        depth[depth] --> desc4[호가창 변경 이벤트]
+        order_status[order_status] --> desc5[주문 상태 accept/reject/cancel]
+    end
+    
+    style orders fill:#FF9900,color:white
+    style fills fill:#FF9900,color:white
+    style trades fill:#FF9900,color:white
+    style depth fill:#FF9900,color:white
+    style order_status fill:#FF9900,color:white
+```
+
+### 16.6 EC2 실행 방법
+
+```bash
+# 1. EC2 접속 후 실행 스크립트 사용
+cd ~/liquibook/wrapper
+./run_engine.sh
+
+# 스크립트가 자동으로:
+# - 환경변수 설정
+# - git pull
+# - cmake 빌드
+# - 매칭 엔진 실행
+```
+
+### 16.7 환경변수 설정
+
+| 변수 | 값 | 설명 |
+|---|---|---|
+| `KAFKA_BROKERS` | MSK IAM 엔드포인트 (9098) | Kafka 브로커 주소 |
+| `REDIS_HOST` | ElastiCache 엔드포인트 | Redis 호스트 |
+| `REDIS_PORT` | `6379` | Redis 포트 |
+| `AWS_REGION` | `ap-northeast-2` | AWS 리전 |
+| `GRPC_PORT` | `50051` | gRPC 서버 포트 |
+| `LOG_LEVEL` | `DEBUG` / `INFO` | 로그 레벨 |
+
+---
+
+## 17. 현재 시스템 아키텍처
+
+```mermaid
+flowchart TD
+    subgraph Client["클라이언트 iOS/Web"]
+        App[클라이언트 앱]
+    end
+    
+    subgraph AWS["AWS Cloud"]
+        APIG[AWS API Gateway<br/>WebSocket]
+        
+        subgraph Lambda["람다"]
+            OrderHandler[orderHandler Lambda<br/>주문 접수 → MSK 발행]
+            StreamHandler[orderbookStreamHandler Lambda<br/>fills/depth 구독 → WS 푸시]
+        end
+        
+        subgraph MSK["AWS MSK supernobamsk"]
+            orders[orders]
+            fills[fills]
+            trades[trades]
+            depth[depth]
+            order_status[order_status]
+        end
+        
+        subgraph EC2["Liquibook Matching Engine EC2"]
+            Consumer[KafkaConsumer<br/>orders 구독]
+            Engine[EngineCore<br/>Liquibook]
+            Producer[KafkaProducer<br/>fills 발행]
+            MDH[MarketDataHandler<br/>→ depth, trades, order_status]
+            RedisC[RedisClient<br/>스냅샷 저장]
+        end
+        
+        Redis[(ElastiCache Redis<br/>supernobaorderbookbackupcache<br/>오더북 스냅샷 저장/복구)]
+    end
+    
+    App --> APIG
+    APIG --> OrderHandler
+    APIG <--> StreamHandler
+    
+    OrderHandler --> orders
+    orders --> Consumer
+    Consumer --> Engine
+    Engine --> Producer
+    Engine --> MDH
+    
+    Producer --> fills
+    MDH --> trades
+    MDH --> depth
+    MDH --> order_status
+    
+    fills --> StreamHandler
+    depth --> StreamHandler
+    
+    Engine --> RedisC
+    RedisC --> Redis
+    
+    style orders fill:#FF9900,color:white
+    style fills fill:#FF9900,color:white
+    style trades fill:#FF9900,color:white
+    style depth fill:#FF9900,color:white
+    style order_status fill:#FF9900,color:white
+    style Engine fill:#00599C,color:white
 ```
 
 ---
 
-*최종 업데이트: 2025-12-05*
+## 18. 구현 완료된 기능 (2025-12-07)
+
+### 18.1 핵심 기능
+
+| 기능 | 상태 | 설명 |
+|------|------|------|
+| **주문 수신** | ✅ | MSK orders 토픽에서 주문 소비 |
+| **매칭 처리** | ✅ | Liquibook 가격-시간 우선순위 알고리즘 |
+| **체결 발행** | ✅ | fills, trades, depth, order_status 토픽 발행 |
+| **자동 스냅샷** | ✅ | 10초마다 모든 오더북 → Redis 저장 |
+| **시작 시 복원** | ✅ | Redis에서 스냅샷 로드 → 오더북 복원 |
+| **종료 시 저장** | ✅ | Ctrl+C 시 최종 스냅샷 저장 후 종료 |
+
+### 18.2 주문 JSON 포맷
+
+```json
+{
+  "action": "ADD",
+  "symbol": "AAPL",
+  "order_id": "order-001",
+  "user_id": "user123",
+  "is_buy": true,
+  "price": 15000,
+  "quantity": 100
+}
+```
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `action` | string | `ADD`, `CANCEL`, `REPLACE` |
+| `symbol` | string | 종목 코드 |
+| `order_id` | string | 주문 고유 ID |
+| `user_id` | string | 사용자 ID |
+| `is_buy` | boolean | 매수=true, 매도=false |
+| `price` | integer | 주문 가격 (센트 단위) |
+| `quantity` | integer | 주문 수량 |
+
+### 18.3 현재 MSK 접근 방식
+
+```
+# Plaintext (포트 9092) - 현재 사용 중
+b-1.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
+b-2.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
+b-3.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
+```
+
+> ⚠️ IAM 인증(9098)은 librdkafka C++ 호환 이슈로 Plaintext 사용 중
+
+---
+
+## 19. c5.2xlarge 용량 분석
+
+### 19.1 Liquibook 벤치마크 (PERFORMANCE.md 기준)
+
+| 테스트 유형 | TPS (2.4 GHz i7) |
+|-------------|------------------|
+| **5 Level Depth** | 2,062,158 |
+| **BBO Only** | 2,139,950 |
+| **Order Book Only** | 2,494,532 |
+
+### 19.2 c5.2xlarge 사양
+
+| 항목 | 값 |
+|------|-----|
+| **vCPU** | 8 |
+| **RAM** | 16 GB |
+| **네트워크** | 최대 10 Gbps |
+| **클럭** | 3.0 GHz (Turbo 3.5 GHz) |
+
+### 19.3 예상 TPS 계산
+
+```
+벤치마크 기준: 2,062,158 TPS (2.4 GHz 단일 코어)
+c5.2xlarge 클럭: 3.0 GHz → 약 25% 성능 향상
+
+단일 코어 예상: 2,062,158 × 1.25 = ~2,577,000 TPS
+
+AWS/네트워크 오버헤드 고려 (50% 감소): ~1,300,000 TPS
+```
+
+### 19.4 동시 사용자 및 종목 수 계산
+
+| 사용자 유형 | 주문 빈도 | 초당 주문 |
+|-------------|-----------|-----------|
+| 일반 사용자 | 10초에 1회 | 0.1 TPS |
+| 활발한 트레이더 | 3초에 1회 | 0.33 TPS |
+| **평균** | 5초에 1회 | **0.2 TPS** |
+
+```
+c5.2xlarge 예상 TPS: 1,300,000
+사용자당 평균 TPS: 0.2
+
+최대 동시 사용자 = 1,300,000 ÷ 0.2 = 6,500,000명
+```
+
+### 19.5 권장 종목 수
+
+| 시나리오 | 동시 사용자 | 종목당 사용자 | 권장 종목 |
+|----------|-------------|---------------|-----------|
+| **보수적** | 100,000 | 1,000 | **100개** |
+| **일반** | 500,000 | 500 | **1,000개** |
+| **최대** | 1,000,000 | 200 | **5,000개** |
+
+> ⚠️ 실제 운영 시 Kafka/Redis 오버헤드, 메모리 사용량 등 고려 필요
+
+### 19.6 결론
+
+**c5.2xlarge 1대로 충분히 5,000+ 종목 처리 가능**
+
+- MVP (100개 종목): 여유 10배+
+- 성장기 (1,000개 종목): 여유 5배+
+- 대규모 (5,000개 종목): 여유 2배+
+
+---
+
+*최종 업데이트: 2025-12-07*
+
