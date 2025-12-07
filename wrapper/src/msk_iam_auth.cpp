@@ -300,15 +300,18 @@ void MskOauthCallback::oauthbearer_token_refresh_cb(RdKafka::Handle* handle,
         return;
     }
     
-    // 토큰 만료 시간 (현재 + 10분)
-    int64_t token_lifetime_ms = 600000;  // 10분
+    // 토큰 만료 시간 (현재 epoch ms + 10분)
+    auto now = std::chrono::system_clock::now();
+    auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    int64_t token_expiry_ms = epoch_ms + 600000;  // 현재 + 10분
     
     std::list<std::string> extensions;  // 빈 extensions
     std::string errstr;
     
     RdKafka::ErrorCode err = handle->oauthbearer_set_token(
         token,
-        token_lifetime_ms,
+        token_expiry_ms,
         "kafka-cluster",  // principal
         extensions,
         errstr);
