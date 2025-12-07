@@ -183,23 +183,24 @@
       "bases:새 베이스 생성하기": false
     }
   },
-  "active": "2df01f10dcd40573",
+  "active": "2416906dc85ef2ae",
   "lastOpenFiles": [
+    "wrapper/vcpkg.json",
+    "wrapper/src/websocket_server.cpp",
+    "wrapper/src/redis_client.cpp",
+    "wrapper/src/order.cpp",
+    "wrapper/src/msk_iam_auth.cpp",
+    "wrapper/src/metrics.cpp",
+    "wrapper/src/market_data_handler.cpp",
+    "wrapper/src/main.cpp",
+    "wrapper/src/logger.cpp",
+    "wrapper/src/kafka_producer.cpp",
+    "wrapper/src/kafka_consumer.cpp",
+    "wrapper/README.md",
+    "AWS_CONSOLE_SETUP_GUIDE.md",
     "PERFORMANCE.md",
     "AWS_ARCHITECTURE.md",
-    "AWS_CONSOLE_SETUP_GUIDE.md",
     "README_ORDER_ENTRY.md",
-    "WINDOWS_BUILD_GUIDE.md",
-    "wrapper/run_engine.sh",
-    "wrapper/src/websocket_server.cpp",
-    "wrapper/include/websocket_server.h",
-    "wrapper/include/msk_iam_auth.h",
-    "wrapper/src/msk_iam_auth.cpp",
-    "generate_architecture.py",
-    "wrapper/README.md",
-    "wrapper/build_ec2.sh",
-    "wrapper/src/main.cpp",
-    "wrapper/src/metrics.cpp",
-    "wrapper/src/grpc_service.cpp"
+    "WINDOWS_BUILD_GUIDE.md"
   ]
 }
