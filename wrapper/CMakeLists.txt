@@ -23,7 +23,12 @@ find_package(CURL REQUIRED)
 
 # 조건부 의존성: Kafka 또는 Kinesis
 if(USE_KINESIS)
-    find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis core)
+    # AWS SDK 경로 설정 (vcpkg 글로벌 설치 위치)
+    set(AWSSDK_ROOT_DIR "$ENV{HOME}/vcpkg/installed/x64-linux")
+    list(APPEND CMAKE_PREFIX_PATH "${AWSSDK_ROOT_DIR}")
+    
+    find_package(aws-cpp-sdk-core CONFIG REQUIRED)
+    find_package(aws-cpp-sdk-kinesis CONFIG REQUIRED)
     add_definitions(-DUSE_KINESIS)
     message(STATUS "Building with Kinesis support")
 else()
@@ -99,7 +104,8 @@ target_link_libraries(matching_engine PRIVATE
 
 if(USE_KINESIS)
     target_link_libraries(matching_engine PRIVATE
-        ${AWSSDK_LINK_LIBRARIES}
+        aws-cpp-sdk-core
+        aws-cpp-sdk-kinesis
     )
 else()
     target_link_libraries(matching_engine PRIVATE
