@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 
 namespace aws_wrapper {
 
@@ -33,7 +34,7 @@ private:
     MessageCallback callback_;
     std::thread worker_;
     std::atomic<bool> running_{false};
-    std::string shard_iterator_;
+    std::unordered_map<std::string, std::string> shard_iterators_;
 };
 
 } // namespace aws_wrapper

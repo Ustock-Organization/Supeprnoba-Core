@@ -16,6 +16,8 @@ KinesisConsumer::KinesisConsumer(const std::string& stream_name,
     
     Aws::Client::ClientConfiguration config;
     config.region = region_;
+    config.connectTimeoutMs = 5000;
+    config.requestTimeoutMs = 10000;
     
     client_ = std::make_unique<Aws::Kinesis::KinesisClient>(config);
     
@@ -30,14 +32,17 @@ std::string KinesisConsumer::getShardIterator(const std::string& shard_id) {
     Aws::Kinesis::Model::GetShardIteratorRequest request;
     request.SetStreamName(stream_name_);
     request.SetShardId(shard_id);
+    // LATEST: 새 레코드만 읽음 (운영용)
     request.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::LATEST);
     
     auto outcome = client_->GetShardIterator(request);
     if (!outcome.IsSuccess()) {
-        Logger::error("Failed to get shard iterator:", outcome.GetError().GetMessage());
+        Logger::error("Failed to get shard iterator for", shard_id, ":", 
+                      outcome.GetError().GetMessage());
         return "";
     }
     
+    Logger::debug("Got shard iterator for:", shard_id);
     return outcome.GetResult().GetShardIterator();
 }
 
@@ -54,15 +59,24 @@ void KinesisConsumer::start() {
         return;
     }
     
-    // 첫 번째 샤드의 iterator 가져오기
+    // 모든 샤드의 iterator 가져오기
     const auto& shards = desc_outcome.GetResult().GetStreamDescription().GetShards();
     if (shards.empty()) {
         Logger::error("No shards found in stream:", stream_name_);
         return;
     }
     
-    shard_iterator_ = getShardIterator(shards[0].GetShardId());
-    if (shard_iterator_.empty()) {
+    Logger::info("Found", shards.size(), "shard(s) in stream:", stream_name_);
+    
+    for (const auto& shard : shards) {
+        std::string it = getShardIterator(shard.GetShardId());
+        if (!it.empty()) {
+            shard_iterators_[shard.GetShardId()] = it;
+        }
+    }
+    
+    if (shard_iterators_.empty()) {
+        Logger::error("Failed to get any shard iterators");
         return;
     }
     
@@ -85,44 +99,48 @@ void KinesisConsumer::stop() {
 
 void KinesisConsumer::consumeLoop() {
     while (running_) {
-        if (shard_iterator_.empty()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
-        }
+        bool any_records = false;
         
-        Aws::Kinesis::Model::GetRecordsRequest request;
-        request.SetShardIterator(shard_iterator_);
-        request.SetLimit(100);
-        
-        auto outcome = client_->GetRecords(request);
-        if (!outcome.IsSuccess()) {
-            Logger::error("GetRecords failed:", outcome.GetError().GetMessage());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
-        }
-        
-        const auto& result = outcome.GetResult();
-        shard_iterator_ = result.GetNextShardIterator();
-        
-        for (const auto& record : result.GetRecords()) {
-            const auto& data = record.GetData();
-            std::string value(reinterpret_cast<const char*>(data.GetUnderlyingData()),
-                              data.GetLength());
-            std::string partition_key = record.GetPartitionKey();
+        for (auto& [shard_id, iterator] : shard_iterators_) {
+            if (iterator.empty()) continue;
             
-            Logger::debug("Received Kinesis record, key:", partition_key, "len:", data.GetLength());
+            Aws::Kinesis::Model::GetRecordsRequest request;
+            request.SetShardIterator(iterator);
+            request.SetLimit(100);
             
-            if (callback_) {
-                try {
-                    callback_(partition_key, value);
-                } catch (const std::exception& e) {
-                    Logger::error("Callback error:", e.what());
+            auto outcome = client_->GetRecords(request);
+            if (!outcome.IsSuccess()) {
+                Logger::error("GetRecords failed for", shard_id, ":", 
+                              outcome.GetError().GetMessage());
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            
+            const auto& result = outcome.GetResult();
+            iterator = result.GetNextShardIterator();
+            
+            for (const auto& record : result.GetRecords()) {
+                any_records = true;
+                const auto& data = record.GetData();
+                std::string value(reinterpret_cast<const char*>(data.GetUnderlyingData()),
+                                  data.GetLength());
+                std::string partition_key = record.GetPartitionKey();
+                
+                Logger::info(">>> Received Kinesis record, shard:", shard_id, 
+                             "key:", partition_key, "len:", data.GetLength());
+                
+                if (callback_) {
+                    try {
+                        callback_(partition_key, value);
+                    } catch (const std::exception& e) {
+                        Logger::error("Callback error:", e.what());
+                    }
                 }
             }
         }
         
         // Kinesis는 최소 200ms 간격 권장
-        if (result.GetRecords().empty()) {
+        if (!any_records) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
