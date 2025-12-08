@@ -7,10 +7,9 @@
 #include <book/bbo_listener.h>
 #include <book/depth_order_book.h>
 #include "order.h"
+#include "iproducer.h"
 
 namespace aws_wrapper {
-
-class KafkaProducer;
 
 using OrderBook = liquibook::book::DepthOrderBook<OrderPtr>;
 using BookDepth = liquibook::book::Depth<>;
@@ -22,7 +21,7 @@ class MarketDataHandler
     , public liquibook::book::BboListener<OrderBook>
 {
 public:
-    explicit MarketDataHandler(KafkaProducer* producer);
+    explicit MarketDataHandler(IProducer* producer);
     
     // === OrderListener ===
     void on_accept(const OrderPtr& order) override;
@@ -52,8 +51,7 @@ public:
                        const BookDepth* depth) override;
 
 private:
-    KafkaProducer* producer_;
+    IProducer* producer_;
 };
 
 } // namespace aws_wrapper
-

@@ -185,6 +185,7 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "wrapper/include/iproducer.h",
     "doc/api/README.md",
     "wrapper/src/kinesis_producer.cpp",
     "wrapper/src/kinesis_consumer.cpp",

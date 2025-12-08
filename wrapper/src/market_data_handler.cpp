@@ -1,5 +1,5 @@
 #include "market_data_handler.h"
-#include "kafka_producer.h"
+#include "iproducer.h"
 #include "logger.h"
 #include "metrics.h"
 #include <book/depth_level.h>
@@ -7,7 +7,7 @@
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(KafkaProducer* producer)
+MarketDataHandler::MarketDataHandler(IProducer* producer)
     : producer_(producer) {
     Logger::info("MarketDataHandler initialized");
 }
