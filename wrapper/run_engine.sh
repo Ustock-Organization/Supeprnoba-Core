@@ -18,7 +18,7 @@ export PATH=$VCPKG_ROOT/downloads/tools/cmake-3.31.10-linux/cmake-3.31.10-linux-
 export AWS_REGION="ap-northeast-2"
 
 # MSK 브로커 (Plaintext 포트 9092)
-export KAFKA_BROKERS="b-1.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092,b-2.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092,b-3.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092"
+export KAFKA_BROKERS="b-1.supernobamskpipe.qhwtla.c3.kafka.ap-northeast-2.amazonaws.com:9092,b-2.supernobamskpipe.qhwtla.c3.kafka.ap-northeast-2.amazonaws.com:9092,b-3.supernobamskpipe.qhwtla.c3.kafka.ap-northeast-2.amazonaws.com:9092"
 
 # ElastiCache Redis
 export REDIS_HOST="master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com"

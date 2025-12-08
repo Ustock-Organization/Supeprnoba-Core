@@ -185,6 +185,8 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "wrapper/vcpkg.json",
+    "wrapper/run_engine.sh",
     "test/web/index.html",
     "test/web/README.md",
     "lambda/AWSdisconnect-handler/index.mjs",
@@ -196,8 +198,6 @@
     "lambda/AWSconnect-handler/index.mjs",
     "lambda/README.md",
     "lambda/layer.txt",
-    "lambda/AWSuser-stream-handler",
-    "lambda/AWSSupernoba-order-router",
     "wrapper/README.md",
     "AWS_CONSOLE_SETUP_GUIDE.md",
     "AWS_ARCHITECTURE.md",
