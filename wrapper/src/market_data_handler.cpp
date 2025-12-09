@@ -39,6 +39,11 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     Logger::info("FILL:", order->order_id(), "matched:", matched_order->order_id(),
                  "qty:", fill_qty, "price:", fill_price);
     
+    // 양쪽 주문의 filled_qty 업데이트
+    liquibook::book::Cost fill_cost = fill_qty * fill_price;
+    order->fill(fill_qty, fill_cost, 0);
+    matched_order->fill(fill_qty, fill_cost, 0);
+    
     Metrics::instance().incrementFillsPublished();
     
     if (producer_) {
@@ -53,6 +58,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
                                 fill_qty, fill_price);
     }
 }
+
 
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
