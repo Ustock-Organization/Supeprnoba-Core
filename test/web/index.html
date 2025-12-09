@@ -60,10 +60,25 @@
             margin-top: 8px;
         }
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+        .main-layout {
+            display: flex;
             gap: 20px;
+        }
+
+        .left-panel {
+            width: 320px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .right-panel {
+            flex: 1;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            align-content: start;
         }
 
         .card {
@@ -244,41 +259,75 @@
         .log-type.ERROR { color: var(--danger); }
         .log-type.INFO { color: var(--text-muted); }
 
-        .orderbook {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-        }
-
-        .orderbook-side {
+        .orderbook-vertical {
+            display: flex;
+            flex-direction: column;
             background: var(--bg-input);
-            border-radius: 6px;
-            padding: 10px;
+            border-radius: 8px;
+            overflow: hidden;
         }
 
-        .orderbook-side h3 {
-            font-size: 0.85rem;
-            margin-bottom: 8px;
-            text-align: center;
+        .orderbook-header {
+            display: grid;
+            grid-template-columns: 1fr 80px 80px;
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
         }
-
-        .orderbook-side.asks h3 { color: var(--sell); }
-        .orderbook-side.bids h3 { color: var(--buy); }
 
         .orderbook-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 4px 8px;
+            display: grid;
+            grid-template-columns: 1fr 80px 80px;
+            padding: 3px 12px;
             font-size: 0.8rem;
-            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+            position: relative;
         }
 
-        .asks .orderbook-row {
-            background: rgba(248, 81, 73, 0.1);
+        .orderbook-row .bar {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            z-index: 0;
         }
 
-        .bids .orderbook-row {
-            background: rgba(63, 185, 80, 0.1);
+        .orderbook-row .bar.ask {
+            right: 0;
+            background: rgba(248, 81, 73, 0.25);
+        }
+
+        .orderbook-row .bar.bid {
+            left: 0;
+            background: rgba(63, 185, 80, 0.25);
+        }
+
+        .orderbook-row span {
+            position: relative;
+            z-index: 1;
+        }
+
+        .orderbook-row .price.ask { color: var(--danger); }
+        .orderbook-row .price.bid { color: var(--success); }
+        .orderbook-row .qty { text-align: right; }
+        .orderbook-row .total { text-align: right; color: var(--text-muted); }
+
+        .spread-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            background: var(--bg-card);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            font-size: 0.85rem;
+            gap: 15px;
+        }
+
+        .spread-row .current-price {
+            font-weight: bold;
+            font-size: 1.1rem;
         }
 
         .side-toggle {
@@ -364,116 +413,99 @@
             <p>매칭 엔진 및 WebSocket API 테스트 도구</p>
         </header>
 
-        <div class="grid">
-            <!-- WebSocket 연결 -->
-            <div class="card">
-                <h2>WebSocket 연결</h2>
-                <div class="form-group">
-                    <label>WebSocket Endpoint</label>
-                    <input type="text" id="wsEndpoint" value="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/">
+        <div class="main-layout">
+            <!-- 왼쪽 패널: 호가창 + 주문 제출 -->
+            <div class="left-panel">
+                <!-- 세로 호가창 -->
+                <div class="card" style="padding: 12px;">
+                    <h2 style="margin-bottom: 8px; font-size: 0.95rem;">호가창</h2>
+                    <div id="orderbookTabs" class="tabs" style="margin-bottom: 8px; gap: 2px;">
+                        <div class="tab" style="color: var(--text-muted); padding: 4px 10px; font-size: 0.75rem;">구독된 심볼 없음</div>
+                    </div>
+                    <div class="orderbook-vertical">
+                        <div class="orderbook-header">
+                            <span>가격</span>
+                            <span style="text-align: right;">수량</span>
+                            <span style="text-align: right;">총액</span>
+                        </div>
+                        <div id="asksList"></div>
+                        <div class="spread-row">
+                            <span class="current-price" id="currentPriceDisplay">-</span>
+                            <span style="color: var(--text-muted); font-size: 0.75rem;">Spread: <span id="spreadDisplay">-</span></span>
+                        </div>
+                        <div id="bidsList"></div>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label>User ID (로그인 시)</label>
-                    <input type="text" id="wsUserId" placeholder="anonymous" value="test-user-1">
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-success" onclick="connectWS()">연결</button>
-                    <button class="btn btn-danger" onclick="disconnectWS()">연결 해제</button>
-                    <span id="wsStatus" class="status status-disconnected">Disconnected</span>
-                </div>
-                <div id="connectionInfo" style="margin-top: 10px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.8rem; display: none;">
-                    <div><strong>연결 URL:</strong> <span id="connectedUrl">-</span></div>
-                    <div><strong>User ID:</strong> <span id="connectedUserId">-</span></div>
-                    <div><strong>연결 시간:</strong> <span id="connectedTime">-</span></div>
+
+                <!-- 주문 제출 (간소화) -->
+                <div class="card" style="padding: 12px;">
+                    <h2 style="margin-bottom: 8px; font-size: 0.95rem;">주문 제출</h2>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <label style="font-size: 0.75rem;">심볼</label>
+                        <input type="text" id="orderSymbol" value="TEST" style="padding: 6px 8px; font-size: 0.85rem;">
+                    </div>
+                    <div class="side-toggle" style="margin-bottom: 8px;">
+                        <button class="buy active" onclick="setSide('BUY', this)">매수</button>
+                        <button class="sell" onclick="setSide('SELL', this)">매도</button>
+                    </div>
+                    <input type="hidden" id="orderSide" value="BUY">
+                    <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">가격</label>
+                            <input type="number" id="orderPrice" value="150" style="padding: 6px 8px; font-size: 0.85rem;">
+                        </div>
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">수량</label>
+                            <input type="number" id="orderQuantity" value="10" style="padding: 6px 8px; font-size: 0.85rem;">
+                        </div>
+                    </div>
+                    <input type="hidden" id="orderUserId" value="test-user-1">
+                    <input type="hidden" id="orderEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/prod/orders">
+                    <input type="hidden" id="apiKey" value="S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf">
+                    <button class="btn btn-primary" style="width: 100%; padding: 8px;" onclick="submitOrder()">주문 제출</button>
+                    <div id="orderResponse" class="response-box" style="display: none; margin-top: 8px; font-size: 0.75rem;"></div>
                 </div>
             </div>
 
-            <!-- 심볼 구독 -->
-            <div class="card">
-                <h2>심볼 구독</h2>
-                <div class="inline-form">
+            <!-- 오른쪽 패널: 기타 카드들 -->
+            <div class="right-panel">
+                <!-- WebSocket 연결 -->
+                <div class="card">
+                    <h2>WebSocket 연결</h2>
                     <div class="form-group">
-                        <label>심볼 (콤마 구분)</label>
-                        <input type="text" id="subscribeSymbols" value="AAPL,GOOGL,TSLA">
+                        <label>WebSocket Endpoint</label>
+                        <input type="text" id="wsEndpoint" value="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/">
                     </div>
-                    <button class="btn btn-primary" onclick="subscribe()">구독</button>
+                    <div class="form-group">
+                        <label>User ID (로그인 시)</label>
+                        <input type="text" id="wsUserId" placeholder="anonymous" value="test-user-1">
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-success" onclick="connectWS()">연결</button>
+                        <button class="btn btn-danger" onclick="disconnectWS()">연결 해제</button>
+                        <span id="wsStatus" class="status status-disconnected">Disconnected</span>
+                    </div>
+                    <div id="connectionInfo" style="margin-top: 10px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.8rem; display: none;">
+                        <div><strong>연결 URL:</strong> <span id="connectedUrl">-</span></div>
+                        <div><strong>User ID:</strong> <span id="connectedUserId">-</span></div>
+                        <div><strong>연결 시간:</strong> <span id="connectedTime">-</span></div>
+                    </div>
                 </div>
-                <div id="subscribedList" style="margin-top: 10px; color: var(--text-muted); font-size: 0.85rem;">
-                    구독 중: 없음
-                </div>
-            </div>
 
-            <!-- 주문 넣기 -->
-            <div class="card">
-                <h2>주문 제출</h2>
-                <div class="form-group">
-                    <label>API Endpoint (order-router)</label>
-                    <input type="text" id="orderEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/prod/orders">
-                </div>
-                <div class="form-group">
-                    <label>API Key (x-api-key)</label>
-                    <input type="text" id="apiKey" value="S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf">
-                </div>
-                <div class="form-group">
-                    <label>심볼</label>
-                    <input type="text" id="orderSymbol" value="AAPL">
-                </div>
-                <div class="side-toggle">
-                    <button class="buy active" onclick="setSide('BUY', this)">매수 (BUY)</button>
-                    <button class="sell" onclick="setSide('SELL', this)">매도 (SELL)</button>
-                </div>
-                <input type="hidden" id="orderSide" value="BUY">
-                <div class="inline-form" style="margin-top: 12px;">
-                    <div class="form-group">
-                        <label>가격</label>
-                        <input type="number" id="orderPrice" value="150">
+                <!-- 심볼 구독 -->
+                <div class="card">
+                    <h2>심볼 구독</h2>
+                    <div class="inline-form">
+                        <div class="form-group">
+                            <label>심볼 (콤마 구분)</label>
+                            <input type="text" id="subscribeSymbols" value="TEST">
+                        </div>
+                        <button class="btn btn-primary" onclick="subscribe()">구독</button>
                     </div>
-                    <div class="form-group">
-                        <label>수량</label>
-                        <input type="number" id="orderQuantity" value="10">
+                    <div id="subscribedList" style="margin-top: 10px; color: var(--text-muted); font-size: 0.85rem;">
+                        구독 중: 없음
                     </div>
                 </div>
-                <div class="form-group">
-                    <label>User ID</label>
-                    <input type="text" id="orderUserId" value="test-user-1">
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-primary" onclick="submitOrder()">주문 제출</button>
-                </div>
-                <div id="orderResponse" class="response-box" style="display: none;"></div>
-            </div>
-
-            <!-- 41틱 호가창 (현재가 + 상위 20틱 + 하위 20틱) -->
-            <div class="card">
-                <h2>실시간 호가창 (41틱)</h2>
-                <div id="orderbookTabs" class="tabs" style="margin-bottom: 10px;">
-                    <div class="tab" style="color: var(--text-muted);">구독된 심볼 없음</div>
-                </div>
-                <div id="currentPriceDisplay" style="font-size: 1.2rem; font-weight: bold; text-align: center; padding: 10px; background: var(--surface); border-radius: 8px; margin-bottom: 10px;">
-                    현재가: -
-                </div>
-                <div class="orderbook" style="display: flex; gap: 20px;">
-                    <div class="orderbook-side asks" style="flex: 1;">
-                        <h3 style="color: var(--error);">매도 (ASK) +20틱</h3>
-                        <div class="orderbook-header" style="display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px solid var(--border); font-weight: bold; font-size: 0.8rem;">
-                            <span>가격</span><span>수량</span>
-                        </div>
-                        <div id="asksList" style="max-height: 500px; overflow-y: auto;">
-                        </div>
-                    </div>
-                    <div class="orderbook-side bids" style="flex: 1;">
-                        <h3 style="color: var(--success);">매수 (BID) -20틱</h3>
-                        <div class="orderbook-header" style="display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px solid var(--border); font-weight: bold; font-size: 0.8rem;">
-                            <span>가격</span><span>수량</span>
-                        </div>
-                        <div id="bidsList" style="max-height: 500px; overflow-y: auto;">
-                        </div>
-                    </div>
-                </div>
-                <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 8px; text-align: center;">
-                    총 41개: 현재가 1 + 매도 20틱 + 매수 20틱
-                </div>
-            </div>
 
             <!-- Kinesis Admin (미구현) -->
             <div class="card disabled-section">
@@ -630,89 +662,103 @@
             }
         }
 
-        // 20개 placeholder 생성 함수
-        function createPlaceholderRows(count, side) {
-            const rows = [];
-            for (let i = 0; i < count; i++) {
-                const tickLabel = side === 'ask' ? `+${count - i}` : `-${i + 1}`;
-                const color = side === 'ask' ? 'var(--danger)' : 'var(--success)';
-                rows.push(`<div class="orderbook-row">
-                    <span style="color: ${color}; min-width: 80px;">0.00</span>
-                    <span style="color: var(--text-muted);">0</span>
-                    <span style="font-size: 0.7rem; color: var(--text-muted);">${tickLabel}</span>
-                </div>`);
-            }
-            return rows.join('');
-        }
-
         // 초기 placeholder 표시
         function initOrderbookPlaceholder() {
-            document.getElementById('asksList').innerHTML = createPlaceholderRows(20, 'ask');
-            document.getElementById('bidsList').innerHTML = createPlaceholderRows(20, 'bid');
-            document.getElementById('currentPriceDisplay').innerHTML = '현재가: <strong style="color: var(--text-muted);">0.00</strong>';
+            const asksEl = document.getElementById('asksList');
+            const bidsEl = document.getElementById('bidsList');
+            const rows = [];
+            for (let i = 0; i < 10; i++) {
+                rows.push(`<div class="orderbook-row">
+                    <span class="price ask">-</span>
+                    <span class="qty">-</span>
+                    <span class="total">-</span>
+                </div>`);
+            }
+            asksEl.innerHTML = rows.join('');
+            bidsEl.innerHTML = rows.join('');
+            document.getElementById('currentPriceDisplay').textContent = '-';
+            document.getElementById('spreadDisplay').textContent = '-';
         }
 
         function renderOrderbook(symbol, data) {
             const asksEl = document.getElementById('asksList');
             const bidsEl = document.getElementById('bidsList');
             const currentPriceEl = document.getElementById('currentPriceDisplay');
+            const spreadEl = document.getElementById('spreadDisplay');
             
-            // 현재가 표시
-            if (data.currentPrice) {
-                currentPriceEl.innerHTML = `<span style="color: var(--accent);">${symbol}</span> 현재가: <strong>${data.currentPrice.toFixed(2)}</strong>`;
-            } else if (data.asks?.length > 0 && data.bids?.length > 0) {
-                const midPrice = (data.asks[0].price + data.bids[0].price) / 2;
-                currentPriceEl.innerHTML = `<span style="color: var(--accent);">${symbol}</span> 현재가: <strong>${midPrice.toFixed(2)}</strong> <span style="font-size: 0.8rem; color: var(--text-muted);">(추정)</span>`;
+            const asksData = data.asks || [];
+            const bidsData = data.bids || [];
+            
+            // 모든 수량 수집하여 최소/최대 구하기
+            const allQuantities = [...asksData.map(a => a.quantity), ...bidsData.map(b => b.quantity)].filter(q => q > 0);
+            const minQty = allQuantities.length > 0 ? Math.min(...allQuantities) : 0;
+            const maxQty = allQuantities.length > 0 ? Math.max(...allQuantities) : 1;
+            const qtyRange = maxQty - minQty || 1;
+            
+            // 상대적 바 너비 계산 함수 (0% ~ 100%)
+            const getBarWidth = (qty) => {
+                if (!qty || qty <= 0) return 0;
+                return Math.min(100, Math.max(5, ((qty - minQty) / qtyRange) * 100));
+            };
+            
+            // 현재가 및 스프레드 계산
+            if (asksData.length > 0 && bidsData.length > 0) {
+                const bestAsk = asksData[0].price;
+                const bestBid = bidsData[0].price;
+                const midPrice = (bestAsk + bestBid) / 2;
+                const spread = bestAsk - bestBid;
+                const spreadPct = ((spread / midPrice) * 100).toFixed(2);
+                
+                currentPriceEl.innerHTML = `<span style="color: var(--accent);">${symbol}</span> ${midPrice.toFixed(2)}`;
+                spreadEl.innerHTML = `${spread.toFixed(2)} (${spreadPct}%)`;
             } else {
-                currentPriceEl.innerHTML = `<span style="color: var(--accent);">${symbol}</span> 현재가: <strong style="color: var(--text-muted);">-</strong>`;
+                currentPriceEl.textContent = '-';
+                spreadEl.textContent = '-';
             }
 
-            // 매도호가 20틱 (높은 가격이 위, +20 → +1)
-            const asksData = data.asks || [];
+            // 매도호가 (낮은 가격이 아래, 높은 가격이 위 → 역순으로 표시)
             const asksRows = [];
-            for (let i = 0; i < 20; i++) {
-                const tickIdx = 19 - i; // 역순: +20이 맨 위
-                const a = asksData[tickIdx];
-                const tickLabel = `+${20 - i}`;
-                if (a) {
-                    const barWidth = Math.min(100, (a.quantity / 1000) * 100);
-                    asksRows.push(`<div class="orderbook-row" style="position: relative;">
-                        <div style="position: absolute; right: 0; top: 0; bottom: 0; width: ${barWidth}%; background: rgba(244, 67, 54, 0.2);"></div>
-                        <span style="position: relative; z-index: 1; color: var(--danger); min-width: 80px;">${(a.price || 0).toFixed(2)}</span>
-                        <span style="position: relative; z-index: 1;">${a.quantity || 0}</span>
-                        <span style="font-size: 0.7rem; color: var(--text-muted);">${tickLabel}</span>
-                    </div>`);
-                } else {
-                    asksRows.push(`<div class="orderbook-row">
-                        <span style="color: var(--danger); min-width: 80px;">0.00</span>
-                        <span style="color: var(--text-muted);">0</span>
-                        <span style="font-size: 0.7rem; color: var(--text-muted);">${tickLabel}</span>
-                    </div>`);
-                }
+            const displayAsks = asksData.slice(0, 10).reverse(); // 가장 가까운 10개, 역순
+            for (const a of displayAsks) {
+                const barWidth = getBarWidth(a.quantity);
+                const total = a.price * a.quantity;
+                asksRows.push(`<div class="orderbook-row">
+                    <div class="bar ask" style="width: ${barWidth}%;"></div>
+                    <span class="price ask">${a.price.toFixed(2)}</span>
+                    <span class="qty">${a.quantity}</span>
+                    <span class="total">${total.toLocaleString()}</span>
+                </div>`);
+            }
+            // 빈 행 채우기
+            while (asksRows.length < 10) {
+                asksRows.unshift(`<div class="orderbook-row">
+                    <span class="price ask" style="color: var(--text-muted);">-</span>
+                    <span class="qty" style="color: var(--text-muted);">-</span>
+                    <span class="total">-</span>
+                </div>`);
             }
             asksEl.innerHTML = asksRows.join('');
 
-            // 매수호가 20틱 (높은 가격이 위, -1 → -20)
-            const bidsData = data.bids || [];
+            // 매수호가 (높은 가격이 위)
             const bidsRows = [];
-            for (let i = 0; i < 20; i++) {
-                const b = bidsData[i];
-                const tickLabel = `-${i + 1}`;
-                if (b) {
-                    const barWidth = Math.min(100, (b.quantity / 1000) * 100);
-                    bidsRows.push(`<div class="orderbook-row" style="position: relative;">
-                        <div style="position: absolute; left: 0; top: 0; bottom: 0; width: ${barWidth}%; background: rgba(76, 175, 80, 0.2);"></div>
-                        <span style="position: relative; z-index: 1; color: var(--success); min-width: 80px;">${(b.price || 0).toFixed(2)}</span>
-                        <span style="position: relative; z-index: 1;">${b.quantity || 0}</span>
-                        <span style="font-size: 0.7rem; color: var(--text-muted);">${tickLabel}</span>
-                    </div>`);
-                } else {
-                    bidsRows.push(`<div class="orderbook-row">
-                        <span style="color: var(--success); min-width: 80px;">0.00</span>
-                        <span style="color: var(--text-muted);">0</span>
-                        <span style="font-size: 0.7rem; color: var(--text-muted);">${tickLabel}</span>
-                    </div>`);
-                }
+            const displayBids = bidsData.slice(0, 10);
+            for (const b of displayBids) {
+                const barWidth = getBarWidth(b.quantity);
+                const total = b.price * b.quantity;
+                bidsRows.push(`<div class="orderbook-row">
+                    <div class="bar bid" style="width: ${barWidth}%;"></div>
+                    <span class="price bid">${b.price.toFixed(2)}</span>
+                    <span class="qty">${b.quantity}</span>
+                    <span class="total">${total.toLocaleString()}</span>
+                </div>`);
+            }
+            // 빈 행 채우기
+            while (bidsRows.length < 10) {
+                bidsRows.push(`<div class="orderbook-row">
+                    <span class="price bid" style="color: var(--text-muted);">-</span>
+                    <span class="qty" style="color: var(--text-muted);">-</span>
+                    <span class="total">-</span>
+                </div>`);
             }
             bidsEl.innerHTML = bidsRows.join('');
         }
