@@ -38,7 +38,7 @@ sudo tee $STUNNEL_CONF > /dev/null << EOF
 
 pid = /var/run/stunnel-redis-depth.pid
 setuid = nobody
-setgid = nogroup
+setgid = nobody
 
 [redis-depth]
 client = yes
