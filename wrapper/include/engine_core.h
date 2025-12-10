@@ -12,7 +12,8 @@ namespace aws_wrapper {
 
 class EngineCore {
 public:
-    using OrderBook = liquibook::book::DepthOrderBook<OrderPtr>;
+    // Depth levels: 10 bid + 10 ask
+    using OrderBook = liquibook::book::DepthOrderBook<OrderPtr, 10>;
     using OrderBookPtr = std::shared_ptr<OrderBook>;
     
     explicit EngineCore(MarketDataHandler* handler);

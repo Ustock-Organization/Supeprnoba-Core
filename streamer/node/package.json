@@ -1,0 +1,15 @@
+{
+  "name": "liquibook-streamer",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Real-time depth streaming server for Liquibook",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "dev": "node --watch index.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.0.0",
+    "ioredis": "^5.0.0"
+  }
+}

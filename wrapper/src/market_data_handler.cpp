@@ -1,5 +1,6 @@
 #include "market_data_handler.h"
-#include "kafka_producer.h"
+#include "redis_client.h"
+#include "iproducer.h"
 #include "logger.h"
 #include "metrics.h"
 #include <book/depth_level.h>
@@ -7,9 +8,9 @@
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(KafkaProducer* producer)
-    : producer_(producer) {
-    Logger::info("MarketDataHandler initialized");
+MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* redis)
+    : producer_(producer), redis_(redis) {
+    Logger::info("MarketDataHandler initialized, Redis:", redis_ ? "connected" : "none");
 }
 
 void MarketDataHandler::on_accept(const OrderPtr& order) {
@@ -18,7 +19,7 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "ACCEPTED");
+                                       order->user_id(), "ACCEPTED");
     }
 }
 
@@ -28,7 +29,7 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REJECTED", reason);
+                                       order->user_id(), "REJECTED", reason);
     }
 }
 
@@ -38,6 +39,11 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
                                  liquibook::book::Price fill_price) {
     Logger::info("FILL:", order->order_id(), "matched:", matched_order->order_id(),
                  "qty:", fill_qty, "price:", fill_price);
+    
+    // 양쪽 주문의 filled_qty 업데이트
+    liquibook::book::Cost fill_cost = fill_qty * fill_price;
+    order->fill(fill_qty, fill_cost, 0);
+    matched_order->fill(fill_qty, fill_cost, 0);
     
     Metrics::instance().incrementFillsPublished();
     
@@ -54,12 +60,13 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     }
 }
 
+
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "CANCELLED");
+                                       order->user_id(), "CANCELLED");
     }
 }
 
@@ -68,7 +75,7 @@ void MarketDataHandler::on_cancel_reject(const OrderPtr& order, const char* reas
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "CANCEL_REJECTED", reason);
+                                       order->user_id(), "CANCEL_REJECTED", reason);
     }
 }
 
@@ -80,7 +87,7 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REPLACED");
+                                       order->user_id(), "REPLACED");
     }
 }
 
@@ -89,7 +96,7 @@ void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* rea
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REPLACE_REJECTED", reason);
+                                       order->user_id(), "REPLACE_REJECTED", reason);
     }
 }
 
@@ -109,53 +116,66 @@ void MarketDataHandler::on_trade(const OrderBook* book,
 void MarketDataHandler::on_depth_change(const OrderBook* book,
                                          const BookDepth* depth) {
     std::string symbol = book->symbol();
+    Logger::debug("on_depth_change called for:", symbol);
     
+    // 컴팩트 포맷: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
     nlohmann::json depth_json;
-    depth_json["event"] = "DEPTH";
-    depth_json["symbol"] = symbol;
+    depth_json["e"] = "d";  // event = depth
+    depth_json["s"] = symbol;
     
-    // Bids (포인터 이터레이션)
+    // Bids (최대 20개)
     nlohmann::json bids_arr = nlohmann::json::array();
     const liquibook::book::DepthLevel* bid = depth->bids();
     const liquibook::book::DepthLevel* bid_end = depth->last_bid_level() + 1;
-    for (; bid != bid_end; ++bid) {
+    int count = 0;
+    for (; bid != bid_end && count < 20; ++bid) {
         if (bid->order_count() > 0) {
-            nlohmann::json level;
-            level["price"] = bid->price();
-            level["quantity"] = bid->aggregate_qty();
-            level["count"] = bid->order_count();
-            bids_arr.push_back(level);
+            bids_arr.push_back({bid->price(), bid->aggregate_qty()});
+            count++;
         }
     }
-    depth_json["bids"] = bids_arr;
+    depth_json["b"] = bids_arr;
     
-    // Asks (포인터 이터레이션)
+    // Asks (최대 20개)
     nlohmann::json asks_arr = nlohmann::json::array();
     const liquibook::book::DepthLevel* ask = depth->asks();
     const liquibook::book::DepthLevel* ask_end = depth->last_ask_level() + 1;
-    for (; ask != ask_end; ++ask) {
+    count = 0;
+    for (; ask != ask_end && count < 20; ++ask) {
         if (ask->order_count() > 0) {
-            nlohmann::json level;
-            level["price"] = ask->price();
-            level["quantity"] = ask->aggregate_qty();
-            level["count"] = ask->order_count();
-            asks_arr.push_back(level);
+            asks_arr.push_back({ask->price(), ask->aggregate_qty()});
+            count++;
         }
     }
-    depth_json["asks"] = asks_arr;
+    depth_json["a"] = asks_arr;
     
-    depth_json["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+    depth_json["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
-    if (producer_) {
-        producer_->publishDepth(symbol, depth_json);
+    // Valkey에 depth 캐시 저장 (Streaming Server가 읽어감)
+    Logger::debug("Depth cache check - redis_:", redis_ ? "exists" : "null", 
+                  "connected:", (redis_ && redis_->isConnected()) ? "yes" : "no");
+    if (redis_ && redis_->isConnected()) {
+        std::string key = "depth:" + symbol;
+        bool saved = redis_->set(key, depth_json.dump());
+        if (saved) {
+            Logger::debug("Depth saved to Valkey:", key);
+        } else {
+            Logger::warn("Failed to save depth to Valkey:", key);
+        }
+    } else {
+        Logger::debug("Depth cache not connected, skipping save for:", symbol);
     }
+    
+    // 참고: Kinesis 발행 제거됨 - Streaming Server 방식으로 전환
+    // producer_->publishDepth(symbol, depth_json);  // DEPRECATED
 }
 
 void MarketDataHandler::on_bbo_change(const OrderBook* book,
                                        const BookDepth* depth) {
-    // BBO 변경은 depth_change로 처리됨
+    // BBO 변경 시 depth 업데이트도 발행
     Logger::debug("BBO change for:", book->symbol());
+    on_depth_change(book, depth);
 }
 
 } // namespace aws_wrapper

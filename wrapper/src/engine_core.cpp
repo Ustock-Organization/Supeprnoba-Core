@@ -143,18 +143,52 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
         books_.erase(symbol);
         order_maps_.erase(symbol);
         
-        // 새 오더북 생성
-        auto book = getOrCreateBook(symbol);
+        // 새 오더북 생성 (리스너 없이)
+        auto book = std::make_shared<OrderBook>();
+        book->set_symbol(symbol);
+        books_[symbol] = book;
+        order_maps_[symbol] = {};
         
-        // 주문 복원
-        for (const auto& j : snapshot["orders"]) {
+        const auto& orders = snapshot["orders"];
+        size_t total = orders.size();
+        size_t count = 0;
+        
+        // 프로그레스 바 표시
+        std::cout << "\r  Restoring " << symbol << ": [";
+        std::cout.flush();
+        
+        // 주문 복원 (리스너 없이 조용히)
+        for (const auto& j : orders) {
             auto order = Order::fromJson(j);
             order_maps_[symbol][order->order_id()] = order;
             book->add(order);
+            
+            // 프로그레스 업데이트 (10% 단위)
+            ++count;
+            int progress = (count * 50) / total;  // 50칸 기준
+            static int last_progress = -1;
+            if (progress != last_progress) {
+                std::cout << "\r  Restoring " << symbol << ": [";
+                for (int i = 0; i < 50; ++i) {
+                    if (i < progress) std::cout << "█";
+                    else std::cout << "░";
+                }
+                std::cout << "] " << count << "/" << total;
+                std::cout.flush();
+                last_progress = progress;
+            }
         }
-        book->perform_callbacks();
         
-        Logger::info("OrderBook restored for:", symbol);
+        std::cout << "\r  Restoring " << symbol << ": [";
+        for (int i = 0; i < 50; ++i) std::cout << "█";
+        std::cout << "] " << total << "/" << total << " ✓" << std::endl;
+        
+        // 리스너 등록 (복원 완료 후)
+        book->set_order_listener(handler_);
+        book->set_depth_listener(handler_);
+        book->set_bbo_listener(handler_);
+        
+        Logger::info("OrderBook restored:", symbol, "orders:", total);
         return true;
     } catch (const std::exception& e) {
         Logger::error("Failed to restore orderbook:", e.what());

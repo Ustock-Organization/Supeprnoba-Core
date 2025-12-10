@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supernoba API Test Console</title>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --bg-input: #21262d;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --success: #3fb950;
+            --warning: #d29922;
+            --danger: #f85149;
+            --buy: #3fb950;
+            --sell: #f85149;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #1a1f25 0%, #0d1117 100%);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        header h1 {
+            font-size: 2rem;
+            background: linear-gradient(135deg, var(--accent), #a371f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        header p {
+            color: var(--text-muted);
+            margin-top: 8px;
+        }
+
+        .main-layout {
+            display: flex;
+            gap: 20px;
+        }
+
+        .left-panel {
+            width: 320px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .right-panel {
+            flex: 1;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            align-content: start;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .card h2 {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card h2::before {
+            content: '';
+            width: 4px;
+            height: 20px;
+            background: var(--accent);
+            border-radius: 2px;
+        }
+
+        .form-group {
+            margin-bottom: 12px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        input, select, textarea {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 0.95rem;
+            transition: border-color 0.2s;
+        }
+
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        textarea {
+            min-height: 100px;
+            font-family: 'Consolas', monospace;
+            font-size: 0.85rem;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: #79c0ff;
+        }
+
+        .btn-success {
+            background: var(--success);
+            color: #000;
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: #fff;
+        }
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .status-connected {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--success);
+        }
+
+        .orderbook-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 8px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.85rem;
+            font-family: 'Consolas', monospace;
+        }
+
+        .orderbook-row:hover {
+            background: var(--bg-input);
+        }
+
+        .disabled-section {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+
+        .status-disconnected {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--danger);
+        }
+
+        .status::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .log-container {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            height: 200px;
+            overflow-y: auto;
+            padding: 10px;
+            font-family: 'Consolas', monospace;
+            font-size: 0.8rem;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: var(--text-muted);
+        }
+
+        .log-type {
+            font-weight: 600;
+            margin: 0 6px;
+        }
+
+        .log-type.DEPTH { color: var(--accent); }
+        .log-type.FILL { color: var(--success); }
+        .log-type.ORDER_STATUS { color: var(--warning); }
+        .log-type.ERROR { color: var(--danger); }
+        .log-type.INFO { color: var(--text-muted); }
+
+        .orderbook-vertical {
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-input);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .orderbook-header {
+            display: grid;
+            grid-template-columns: 1fr 80px 80px;
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+        }
+
+        .orderbook-row {
+            display: grid;
+            grid-template-columns: 1fr 80px 80px;
+            padding: 3px 12px;
+            font-size: 0.8rem;
+            font-family: 'Consolas', monospace;
+            position: relative;
+        }
+
+        .orderbook-row .bar {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            z-index: 0;
+        }
+
+        .orderbook-row .bar.ask {
+            right: 0;
+            background: rgba(248, 81, 73, 0.25);
+        }
+
+        .orderbook-row .bar.bid {
+            left: 0;
+            background: rgba(63, 185, 80, 0.25);
+        }
+
+        .orderbook-row span {
+            position: relative;
+            z-index: 1;
+        }
+
+        .orderbook-row .price.ask { color: var(--danger); }
+        .orderbook-row .price.bid { color: var(--success); }
+        .orderbook-row .qty { text-align: right; }
+        .orderbook-row .total { text-align: right; color: var(--text-muted); }
+
+        .spread-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            background: var(--bg-card);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            font-size: 0.85rem;
+            gap: 15px;
+        }
+
+        .spread-row .current-price {
+            font-weight: bold;
+            font-size: 1.1rem;
+        }
+
+        .side-toggle {
+            display: flex;
+            border-radius: 6px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+
+        .side-toggle button {
+            flex: 1;
+            padding: 10px;
+            border: none;
+            background: var(--bg-input);
+            color: var(--text);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .side-toggle button.active.buy {
+            background: var(--buy);
+            color: #000;
+        }
+
+        .side-toggle button.active.sell {
+            background: var(--sell);
+            color: #fff;
+        }
+
+        .inline-form {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+        }
+
+        .inline-form .form-group {
+            flex: 1;
+            margin-bottom: 0;
+        }
+
+        .response-box {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px;
+            margin-top: 10px;
+            font-family: 'Consolas', monospace;
+            font-size: 0.8rem;
+            white-space: pre-wrap;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 15px;
+        }
+
+        .tab {
+            padding: 8px 16px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px 6px 0 0;
+            cursor: pointer;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            border-bottom: none;
+        }
+
+        .tab.active {
+            background: var(--bg-card);
+            color: var(--accent);
+            border-color: var(--accent);
+            border-bottom: 1px solid var(--bg-card);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Supernoba API Test Console</h1>
+            <p>매칭 엔진 및 WebSocket API 테스트 도구</p>
+        </header>
+
+        <div class="main-layout">
+            <!-- 왼쪽 패널: 호가창 + 주문 제출 -->
+            <div class="left-panel">
+                <!-- 세로 호가창 -->
+                <div class="card" style="padding: 12px;">
+                    <h2 style="margin-bottom: 8px; font-size: 0.95rem;">호가창</h2>
+                    <div id="orderbookTabs" class="tabs" style="margin-bottom: 8px; gap: 2px;">
+                        <div class="tab" style="color: var(--text-muted); padding: 4px 10px; font-size: 0.75rem;">구독된 심볼 없음</div>
+                    </div>
+                    <div class="orderbook-vertical">
+                        <div class="orderbook-header">
+                            <span>가격</span>
+                            <span style="text-align: right;">수량</span>
+                            <span style="text-align: right;">총액</span>
+                        </div>
+                        <div id="asksList"></div>
+                        <div class="spread-row">
+                            <span class="current-price" id="currentPriceDisplay">-</span>
+                            <span style="color: var(--text-muted); font-size: 0.75rem;">Spread: <span id="spreadDisplay">-</span></span>
+                        </div>
+                        <div id="bidsList"></div>
+                    </div>
+                </div>
+
+                <!-- 주문 제출 (간소화) -->
+                <div class="card" style="padding: 12px;">
+                    <h2 style="margin-bottom: 8px; font-size: 0.95rem;">주문 제출</h2>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <label style="font-size: 0.75rem;">심볼</label>
+                        <input type="text" id="orderSymbol" value="TEST" style="padding: 6px 8px; font-size: 0.85rem;">
+                    </div>
+                    <div class="side-toggle" style="margin-bottom: 8px;">
+                        <button class="buy active" onclick="setSide('BUY', this)">매수</button>
+                        <button class="sell" onclick="setSide('SELL', this)">매도</button>
+                    </div>
+                    <input type="hidden" id="orderSide" value="BUY">
+                    <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">가격</label>
+                            <input type="number" id="orderPrice" value="150" style="padding: 6px 8px; font-size: 0.85rem;">
+                        </div>
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">수량</label>
+                            <input type="number" id="orderQuantity" value="10" style="padding: 6px 8px; font-size: 0.85rem;">
+                        </div>
+                    </div>
+                    <input type="hidden" id="orderUserId" value="test-user-1">
+                    <input type="hidden" id="orderEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/prod/orders">
+                    <input type="hidden" id="apiKey" value="S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf">
+                    <button class="btn btn-primary" style="width: 100%; padding: 8px;" onclick="submitOrder()">주문 제출</button>
+                    <div id="orderResponse" class="response-box" style="display: none; margin-top: 8px; font-size: 0.75rem;"></div>
+                </div>
+            </div>
+
+            <!-- 오른쪽 패널: 기타 카드들 -->
+            <div class="right-panel">
+                <!-- WebSocket 연결 -->
+                <div class="card">
+                    <h2>WebSocket 연결</h2>
+                    <div class="form-group">
+                        <label>WebSocket Endpoint</label>
+                        <input type="text" id="wsEndpoint" value="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/">
+                    </div>
+                    <div class="form-group">
+                        <label>User ID (로그인 시)</label>
+                        <input type="text" id="wsUserId" placeholder="anonymous" value="test-user-1">
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-success" onclick="connectWS()">연결</button>
+                        <button class="btn btn-danger" onclick="disconnectWS()">연결 해제</button>
+                        <span id="wsStatus" class="status status-disconnected">Disconnected</span>
+                    </div>
+                    <div id="connectionInfo" style="margin-top: 10px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.8rem; display: none;">
+                        <div><strong>연결 URL:</strong> <span id="connectedUrl">-</span></div>
+                        <div><strong>User ID:</strong> <span id="connectedUserId">-</span></div>
+                        <div><strong>연결 시간:</strong> <span id="connectedTime">-</span></div>
+                    </div>
+                </div>
+
+                <!-- 심볼 구독 -->
+                <div class="card">
+                    <h2>심볼 구독</h2>
+                    <div class="inline-form">
+                        <div class="form-group">
+                            <label>심볼 (콤마 구분)</label>
+                            <input type="text" id="subscribeSymbols" value="TEST">
+                        </div>
+                        <button class="btn btn-primary" onclick="subscribe()">구독</button>
+                    </div>
+                    <div id="subscribedList" style="margin-top: 10px; color: var(--text-muted); font-size: 0.85rem;">
+                        구독 중: 없음
+                    </div>
+                </div>
+
+            <!-- Kinesis Admin (미구현) -->
+            <div class="card disabled-section">
+                <h2>Kinesis 관리 (미구현)</h2>
+                <div class="form-group">
+                    <label>Admin Lambda Endpoint</label>
+                    <input type="text" id="adminEndpoint" value="" placeholder="미구현" disabled>
+                </div>
+                <div class="tabs">
+                    <div class="tab active">스트림 목록</div>
+                    <div class="tab">스트림 상세</div>
+                </div>
+                <button class="btn btn-secondary" style="margin-top: 10px;" disabled>미구현</button>
+            </div>
+
+            <!-- 메시지 로그 -->
+            <div class="card" style="grid-column: span 2;">
+                <h2>메시지 로그</h2>
+                <div class="btn-group" style="margin-bottom: 10px;">
+                    <button class="btn btn-secondary" onclick="clearLogs()">로그 지우기</button>
+                    <label style="display: flex; align-items: center; gap: 6px; margin-left: auto;">
+                        <input type="checkbox" id="autoScroll" checked> 자동 스크롤
+                    </label>
+                </div>
+                <div id="logContainer" class="log-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let orderbooks = {};
+        let subscribedSymbols = [];
+        let activeOrderbookSymbol = null;
+        let heartbeatInterval = null;
+
+        // WebSocket 연결
+        let connectedEndpoint = '';
+        let connectedUser = '';
+        
+        function connectWS() {
+            const endpoint = document.getElementById('wsEndpoint').value;
+            const userId = document.getElementById('wsUserId').value || 'anonymous';
+            
+            if (!endpoint) {
+                addLog('ERROR', 'WebSocket 엔드포인트를 입력하세요');
+                return;
+            }
+
+            const url = `${endpoint}?userId=${userId}`;
+            connectedEndpoint = endpoint;
+            connectedUser = userId;
+            addLog('INFO', `연결 시도: ${url}`);
+
+            try {
+                ws = new WebSocket(url);
+
+                ws.onopen = () => {
+                    updateStatus(true);
+                    showConnectionInfo(endpoint, userId);
+                    addLog('INFO', '✅ WebSocket 연결됨');
+                    
+                    // 30초 heartbeat 시작
+                    heartbeatInterval = setInterval(() => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ action: 'ping' }));
+                        }
+                    }, 30000);
+                };
+
+                ws.onclose = () => {
+                    updateStatus(false);
+                    hideConnectionInfo();
+                    addLog('INFO', '❌ WebSocket 연결 해제됨');
+                    
+                    // heartbeat 정지
+                    if (heartbeatInterval) {
+                        clearInterval(heartbeatInterval);
+                        heartbeatInterval = null;
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    addLog('ERROR', `WebSocket 에러: ${error.message || 'Unknown'}`);
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        handleMessage(msg);
+                    } catch (e) {
+                        addLog('INFO', `Raw: ${event.data}`);
+                    }
+                };
+            } catch (e) {
+                addLog('ERROR', `연결 실패: ${e.message}`);
+            }
+        }
+
+        function disconnectWS() {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            hideConnectionInfo();
+            subscribedSymbols = [];
+            activeOrderbookSymbol = null;
+            updateOrderbookTabs();
+        }
+
+        function updateStatus(connected) {
+            const status = document.getElementById('wsStatus');
+            status.className = connected ? 'status status-connected' : 'status status-disconnected';
+            status.textContent = connected ? 'Connected' : 'Disconnected';
+        }
+        
+        function showConnectionInfo(endpoint, userId) {
+            const info = document.getElementById('connectionInfo');
+            info.style.display = 'block';
+            document.getElementById('connectedUrl').textContent = endpoint;
+            document.getElementById('connectedUserId').textContent = userId;
+            document.getElementById('connectedTime').textContent = new Date().toLocaleString();
+        }
+        
+        function hideConnectionInfo() {
+            document.getElementById('connectionInfo').style.display = 'none';
+        }
+
+        // 메시지 처리
+        function handleMessage(msg) {
+            // 컴팩트 포맷 처리 (e=event, s=symbol)
+            if (msg.e === 'd') {
+                // DEPTH 업데이트: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
+                addLog('DEPTH', JSON.stringify(msg));
+                updateOrderbook(msg.s, { asks: msg.a, bids: msg.b });
+            } else if (msg.type === 'DEPTH') {
+                // 레거시 포맷 호환
+                addLog(msg.type, JSON.stringify(msg, null, 2));
+                updateOrderbook(msg.symbol, msg.data);
+            } else if (msg.subscribed) {
+                // 구독 완료 응답
+                addLog('SUCCESS', `✅ 구독 완료: ${msg.subscribed.join(', ')}`);
+            } else if (msg.message === 'Forbidden') {
+                // ping 응답 (무시)
+            } else {
+                addLog('INFO', JSON.stringify(msg, null, 2));
+            }
+        }
+
+        // 오더북 업데이트
+        function updateOrderbook(symbol, data) {
+            orderbooks[symbol] = data;
+
+            // 활성 심볼이면 렌더링
+            if (symbol === activeOrderbookSymbol) {
+                renderOrderbook(symbol, data);
+            }
+        }
+
+        // 초기 placeholder 표시
+        function initOrderbookPlaceholder() {
+            const asksEl = document.getElementById('asksList');
+            const bidsEl = document.getElementById('bidsList');
+            const rows = [];
+            for (let i = 0; i < 10; i++) {
+                rows.push(`<div class="orderbook-row">
+                    <span class="price ask">-</span>
+                    <span class="qty">-</span>
+                    <span class="total">-</span>
+                </div>`);
+            }
+            asksEl.innerHTML = rows.join('');
+            bidsEl.innerHTML = rows.join('');
+            document.getElementById('currentPriceDisplay').textContent = '-';
+            document.getElementById('spreadDisplay').textContent = '-';
+        }
+
+        function renderOrderbook(symbol, data) {
+            const asksEl = document.getElementById('asksList');
+            const bidsEl = document.getElementById('bidsList');
+            const currentPriceEl = document.getElementById('currentPriceDisplay');
+            const spreadEl = document.getElementById('spreadDisplay');
+            
+            // 컴팩트 포맷: [[price, qty], ...] 또는 레거시 [{price, quantity}, ...]
+            const asksData = (data.asks || []).map(a => Array.isArray(a) ? {price: a[0], qty: a[1]} : {price: a.price, qty: a.quantity});
+            const bidsData = (data.bids || []).map(b => Array.isArray(b) ? {price: b[0], qty: b[1]} : {price: b.price, qty: b.quantity});
+            
+            // 모든 수량 수집하여 최소/최대 구하기
+            const allQuantities = [...asksData.map(a => a.qty), ...bidsData.map(b => b.qty)].filter(q => q > 0);
+            const minQty = allQuantities.length > 0 ? Math.min(...allQuantities) : 0;
+            const maxQty = allQuantities.length > 0 ? Math.max(...allQuantities) : 1;
+            const qtyRange = maxQty - minQty || 1;
+            
+            // 상대적 바 너비 계산 함수 (0% ~ 100%)
+            const getBarWidth = (qty) => {
+                if (!qty || qty <= 0) return 0;
+                return Math.min(100, Math.max(5, ((qty - minQty) / qtyRange) * 100));
+            };
+            
+            // 현재가 및 스프레드 계산
+            if (asksData.length > 0 && bidsData.length > 0) {
+                const bestAsk = asksData[0].price;
+                const bestBid = bidsData[0].price;
+                const midPrice = (bestAsk + bestBid) / 2;
+                const spread = bestAsk - bestBid;
+                const spreadPct = ((spread / midPrice) * 100).toFixed(2);
+                
+                currentPriceEl.innerHTML = `<span style="color: var(--accent);">${symbol}</span> ${midPrice.toFixed(2)}`;
+                spreadEl.innerHTML = `${spread.toFixed(2)} (${spreadPct}%)`;
+            } else {
+                currentPriceEl.textContent = '-';
+                spreadEl.textContent = '-';
+            }
+
+            // 매도호가 (낮은 가격이 아래, 높은 가격이 위 → 역순으로 표시)
+            const asksRows = [];
+            const displayAsks = asksData.slice(0, 10).reverse();
+            for (const a of displayAsks) {
+                const barWidth = getBarWidth(a.qty);
+                const total = a.price * a.qty;
+                asksRows.push(`<div class="orderbook-row">
+                    <div class="bar ask" style="width: ${barWidth}%;"></div>
+                    <span class="price ask">${a.price.toFixed(2)}</span>
+                    <span class="qty">${a.qty}</span>
+                    <span class="total">${total.toLocaleString()}</span>
+                </div>`);
+            }
+            // 빈 행 채우기
+            while (asksRows.length < 10) {
+                asksRows.unshift(`<div class="orderbook-row">
+                    <span class="price ask" style="color: var(--text-muted);">-</span>
+                    <span class="qty" style="color: var(--text-muted);">-</span>
+                    <span class="total">-</span>
+                </div>`);
+            }
+            asksEl.innerHTML = asksRows.join('');
+
+            // 매수호가 (높은 가격이 위)
+            const bidsRows = [];
+            const displayBids = bidsData.slice(0, 10);
+            for (const b of displayBids) {
+                const barWidth = getBarWidth(b.qty);
+                const total = b.price * b.qty;
+                bidsRows.push(`<div class="orderbook-row">
+                    <div class="bar bid" style="width: ${barWidth}%;"></div>
+                    <span class="price bid">${b.price.toFixed(2)}</span>
+                    <span class="qty">${b.qty}</span>
+                    <span class="total">${total.toLocaleString()}</span>
+                </div>`);
+            }
+            // 빈 행 채우기
+            while (bidsRows.length < 10) {
+                bidsRows.push(`<div class="orderbook-row">
+                    <span class="price bid" style="color: var(--text-muted);">-</span>
+                    <span class="qty" style="color: var(--text-muted);">-</span>
+                    <span class="total">-</span>
+                </div>`);
+            }
+            bidsEl.innerHTML = bidsRows.join('');
+        }
+
+        function selectOrderbookSymbol(symbol) {
+            activeOrderbookSymbol = symbol;
+            updateOrderbookTabs();
+            if (orderbooks[symbol]) {
+                renderOrderbook(symbol, orderbooks[symbol]);
+            }
+        }
+        
+        function updateOrderbookTabs() {
+            const tabsEl = document.getElementById('orderbookTabs');
+            if (subscribedSymbols.length === 0) {
+                tabsEl.innerHTML = '<div class="tab" style="color: var(--text-muted);">구독된 심볼 없음</div>';
+                return;
+            }
+            
+            tabsEl.innerHTML = subscribedSymbols.map(sym => 
+                `<div class="tab ${sym === activeOrderbookSymbol ? 'active' : ''}" onclick="selectOrderbookSymbol('${sym}')">${sym}</div>`
+            ).join('');
+        }
+
+        // 심볼 구독
+        function subscribe() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog('ERROR', 'WebSocket이 연결되지 않음');
+                return;
+            }
+
+            const symbols = document.getElementById('subscribeSymbols').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
+            ws.send(JSON.stringify({ action: 'subscribe', symbols }));
+            addLog('INFO', `구독 요청: ${symbols.join(', ')}`);
+            
+            // 구독 목록에 추가
+            symbols.forEach(sym => {
+                if (!subscribedSymbols.includes(sym)) {
+                    subscribedSymbols.push(sym);
+                }
+            });
+            
+            // 첫 번째 심볼을 활성화
+            if (!activeOrderbookSymbol && subscribedSymbols.length > 0) {
+                activeOrderbookSymbol = subscribedSymbols[0];
+            }
+            
+            updateOrderbookTabs();
+            document.getElementById('subscribedList').textContent = `구독 중: ${subscribedSymbols.join(', ')}`;
+        }
+
+        // 주문 제출
+        async function submitOrder() {
+            const endpoint = document.getElementById('orderEndpoint').value;
+            if (!endpoint) {
+                addLog('ERROR', 'Order API 엔드포인트를 입력하세요');
+                return;
+            }
+
+            const order = {
+                user_id: document.getElementById('orderUserId').value,
+                symbol: document.getElementById('orderSymbol').value,
+                side: document.getElementById('orderSide').value,
+                price: parseFloat(document.getElementById('orderPrice').value),
+                quantity: parseInt(document.getElementById('orderQuantity').value),
+                order_type: 'LIMIT'
+            };
+
+            addLog('INFO', `주문 제출: ${JSON.stringify(order)}`);
+
+            try {
+                const apiKey = document.getElementById('apiKey').value;
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'x-api-key': apiKey
+                    },
+                    body: JSON.stringify(order)
+                });
+
+                const result = await response.json();
+                document.getElementById('orderResponse').style.display = 'block';
+                document.getElementById('orderResponse').textContent = JSON.stringify(result, null, 2);
+                addLog('INFO', `주문 응답: ${JSON.stringify(result)}`);
+            } catch (e) {
+                addLog('ERROR', `주문 실패: ${e.message}`);
+            }
+        }
+
+        function setSide(side, btn) {
+            document.getElementById('orderSide').value = side;
+            document.querySelectorAll('.side-toggle button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        }
+
+        // Admin API
+        let currentAdminAction = 'listTopics';
+
+        function setAdminAction(action, tab) {
+            currentAdminAction = action;
+            document.getElementById('adminAction').value = action;
+            document.querySelectorAll('.tabs .tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+
+            document.getElementById('adminCreateFields').style.display = 
+                (action === 'createTopic' || action === 'describeTopic') ? 'block' : 'none';
+        }
+
+        async function callAdmin() {
+            const endpoint = document.getElementById('adminEndpoint').value;
+            if (!endpoint) {
+                addLog('ERROR', 'Admin API 엔드포인트를 입력하세요');
+                return;
+            }
+
+            const payload = {
+                action: currentAdminAction,
+                topic: document.getElementById('adminTopic').value,
+                partitions: parseInt(document.getElementById('adminPartitions').value)
+            };
+
+            addLog('INFO', `Admin 호출: ${JSON.stringify(payload)}`);
+
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                document.getElementById('adminResponse').style.display = 'block';
+                document.getElementById('adminResponse').textContent = JSON.stringify(result, null, 2);
+                addLog('INFO', `Admin 응답: ${JSON.stringify(result)}`);
+            } catch (e) {
+                addLog('ERROR', `Admin 호출 실패: ${e.message}`);
+            }
+        }
+
+        // 로그
+        function addLog(type, message) {
+            const container = document.getElementById('logContainer');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type ${type}">[${type}]</span><span>${message}</span>`;
+            container.appendChild(entry);
+
+            if (document.getElementById('autoScroll').checked) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function clearLogs() {
+            document.getElementById('logContainer').innerHTML = '';
+        }
+
+        // 초기화
+        addLog('INFO', 'Supernoba API Test Console 시작');
+        initOrderbookPlaceholder();
+    </script>
+</body>
+</html>

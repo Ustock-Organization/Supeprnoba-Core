@@ -107,16 +107,19 @@ void KafkaProducer::publishTrade(const std::string& symbol,
 void KafkaProducer::publishDepth(const std::string& symbol,
                                   const nlohmann::json& depth) {
     produce(depth_topic_, symbol, depth.dump());
+    Logger::debug("Published depth:", symbol);
 }
 
 void KafkaProducer::publishOrderStatus(const std::string& symbol,
                                         const std::string& order_id,
+                                        const std::string& user_id,
                                         const std::string& status,
                                         const std::string& reason) {
     nlohmann::json j;
     j["event"] = "ORDER_STATUS";
     j["symbol"] = symbol;
     j["order_id"] = order_id;
+    j["user_id"] = user_id;
     j["status"] = status;
     if (!reason.empty()) {
         j["reason"] = reason;

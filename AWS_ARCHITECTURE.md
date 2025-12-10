@@ -1,19 +1,180 @@
-# AWS 핫 샤드 마이그레이션 아키텍처
+# AWS Supernoba 아키텍처
 
-핫 샤드 마이그레이션을 지원하는 AWS 기반 매칭 엔진 인프라의 기술 스택과 구현 방안입니다.
+Amazon Kinesis 기반 실시간 매칭 엔진 인프라 (2025-12-09 현재 운영 중)
 
 ## 전체 아키텍처 개요
 
 ```mermaid
 graph LR
-    Client[Client] --> APIG[API Gateway]
-    APIG --> Router[Order Router]
-    Router --> MSK[MSK]
-    Router --> Redis[(Redis)]
-    MSK --> Engine[Matching Engine Cluster]
-    Engine --> S3[(State Snapshot S3)]
-    Redis --> CW[CloudWatch / Step Functions]
+    subgraph Client["클라이언트"]
+        Web[Web Browser]
+    end
+    
+    subgraph AWS["AWS Cloud (ap-northeast-2)"]
+        subgraph Public["Public Internet"]
+            APIG[API Gateway<br/>WebSocket + REST]
+        end
+        
+        subgraph VPC["VPC (172.31.0.0/16)"]
+            subgraph Kinesis["Amazon Kinesis"]
+                K1[supernoba-orders]
+                K2[supernoba-fills]
+                K3[supernoba-depth]
+                K4[supernoba-order-status]
+            end
+            
+            subgraph Lambda["Lambda Functions"]
+                Router[Order Router]
+                Depth[depth-stream-public]
+                User[user-stream-handler]
+                Connect[connect-handler]
+            end
+            
+            subgraph EC2["EC2"]
+                Engine[Matching Engine<br/>Liquibook C++]
+            end
+            
+            subgraph ElastiCache["ElastiCache Valkey"]
+                DepthCache[(supernoba-depth-cache<br/>호가 스트리밍)]
+                BackupCache[(Orderbook-backup-cache<br/>오더북 백업)]
+            end
+            
+            NAT[NAT Gateway<br/>13.125.71.17]
+        end
+    end
+    
+    Web <-->|WSS| APIG
+    APIG --> Router
+    APIG --> Connect
+    Router --> K1
+    K1 --> Engine
+    Engine --> K2
+    Engine --> K3
+    Engine --> K4
+    Engine --> BackupCache
+    K3 --> Depth
+    K2 --> User
+    K4 --> User
+    Depth --> DepthCache
+    Depth --> NAT
+    NAT -->|PostToConnection| APIG
+    APIG -->|Push| Web
 ```
+
+---
+
+## VPC 네트워크 구성
+
+```mermaid
+graph TB
+    subgraph VPC["VPC: Supernoba_back (172.31.0.0/16)"]
+        subgraph AZa["ap-northeast-2a"]
+            Sub1[subnet-911ebefa<br/>172.31.0.0/20]
+        end
+        subgraph AZb["ap-northeast-2b"]
+            Sub2[subnet-9e23bee5<br/>172.31.16.0/20]
+        end
+        subgraph AZc["ap-northeast-2c"]
+            Sub3[subnet-4d786f01<br/>172.31.32.0/20]
+        end
+        
+        NAT[NAT Gateway<br/>nat-17d68eebde280f74f<br/>IP: 13.125.71.17]
+        
+        subgraph VPCE["VPC Endpoints"]
+            KinesisVPCE[Kinesis Streams]
+            LambdaVPCE[Lambda]
+            STSVPCE[STS]
+            ElastiCacheVPCE[ElastiCache]
+        end
+    end
+    
+    subgraph External["External"]
+        IGW[Internet Gateway<br/>igw-cfc6a3a7]
+        APIG[API Gateway<br/>WebSocket]
+    end
+    
+    Sub1 --> NAT
+    Sub2 --> NAT
+    Sub3 --> NAT
+    NAT --> IGW
+    IGW --> APIG
+    
+    style NAT fill:#f96,stroke:#333
+    style APIG fill:#9cf,stroke:#333
+```
+
+### NAT Gateway 설정
+
+| 구성 요소 | 값 |
+|---------|-----|
+| **NAT Gateway ID** | `nat-17d68eebde280f74f` |
+| **Elastic IP** | `13.125.71.17` |
+| **VPC** | `vpc-314afc5a (Supernoba_back)` |
+| **라우팅 테이블** | `0.0.0.0/0 → nat-17d68eebde280f74f` |
+
+---
+
+## 실시간 스트리밍 데이터 흐름
+
+```mermaid
+sequenceDiagram
+    participant Client as Web Client
+    participant APIG as API Gateway WebSocket
+    participant Subscribe as subscribe-handler
+    participant Valkey as ElastiCache Valkey
+    participant Kinesis as Kinesis supernoba-depth
+    participant Depth as depth-stream-public
+    participant NAT as NAT Gateway
+
+    Client->>APIG: WebSocket 연결
+    Client->>APIG: {"action":"subscribe","symbols":["TEST"]}
+    APIG->>Subscribe: subscribe route
+    Subscribe->>Valkey: SADD symbol:TEST:subscribers {connectionId}
+    Subscribe-->>Client: {"subscribed":["TEST"]}
+
+    Note over Kinesis: C++ Engine이 호가 변동 발행
+    Kinesis->>Depth: Kinesis 트리거
+    Depth->>Valkey: SMEMBERS symbol:TEST:subscribers
+    Depth->>NAT: PostToConnection (VPC 내부)
+    NAT->>APIG: HTTPS (공개 인터넷)
+    APIG->>Client: {"type":"DEPTH","data":{...}}
+```
+
+---
+
+## 현재 구현 상태 (2025-12-09)
+
+### 배포된 AWS 리소스
+
+| 서비스 | 리소스 이름 | 상태 |
+|---|---|---|
+| **Amazon Kinesis** | `supernoba-orders`, `supernoba-fills`, `supernoba-depth`, `supernoba-order-status` | ✅ 운영 중 |
+| **ElastiCache Valkey** | `supernoba-depth-cache`, `Orderbook-backup-cache` | ✅ 운영 중 |
+| **API Gateway WebSocket** | `Supernoba-ws` (l2ptm85wub) | ✅ 운영 중 |
+| **NAT Gateway** | `nat-17d68eebde280f74f` (13.125.71.17) | ✅ 운영 중 |
+
+### Lambda 함수
+
+| 함수명 | 트리거 | 역할 |
+|--------|--------|------|
+| `Supernoba-order-router` | API Gateway REST | 주문 접수 → Kinesis 발행 |
+| `depth-stream-public` | Kinesis `supernoba-depth` | 호가 → NAT Gateway → WebSocket 푸시 |
+| `user-stream-handler` | Kinesis `fills`, `order-status` | 체결/상태 → 개인 WebSocket |
+| `connect-handler` | API Gateway `$connect` | WebSocket 연결 관리 |
+| `subscribe-handler` | API Gateway `subscribe` | 심볼 구독 처리 |
+| `disconnect-handler` | API Gateway `$disconnect` | 연결 해제 정리 |
+
+### 요약 기술 스택
+
+| 레이어 | 주요 기술 |
+|---|---|
+| 클라이언트 진입 | API Gateway (HTTP/WebSocket) |
+| 라우팅 | Lambda (Order Router), ElastiCache Valkey |
+| 메시지 큐 | **Amazon Kinesis Data Streams** (4개 스트림) |
+| 매칭 엔진 | Liquibook C++ + AWS SDK on EC2 |
+| 실시간 스트리밍 | Kinesis → Lambda → **NAT Gateway** → API Gateway → Client |
+
+---
 
 ---
 
@@ -370,6 +531,7 @@ graph TD
         subgraph MSK_Cluster ["Amazon MSK (Kafka)"]
             Topic_Orders[Topic: orders]:::aws
             Topic_Fills[Topic: fills]:::aws
+            Topic_Depth[Topic: depth]:::aws
         end
 
         subgraph EC2_Layer ["Matching Engine (EC2)"]
@@ -384,7 +546,7 @@ graph TD
         subgraph Persistence ["Persistence Layer"]
             Redis[(ElastiCache Redis)]:::aws
             S3[(S3 Snapshots)]:::aws
-            DB[(User DB)]:::aws
+            DB[(User DB - Supabase)]:::aws
         end
     end
 
@@ -398,8 +560,12 @@ graph TD
     
     Topic_Orders -->|Consume| Wrapper
     Wrapper -->|Publish Fills| Topic_Fills
+    Wrapper -->|Publish Depth| Topic_Depth
     
     Topic_Fills -->|Consume| StreamHandler
+    Topic_Depth -->|Consume| StreamHandler
+    StreamHandler -->|Real-time Push| APIG
+    APIG -->|WebSocket| UserApp
     
     Wrapper -.->|Snapshot| S3
     Wrapper -.->|Cache State| Redis
@@ -742,6 +908,17 @@ flowchart TD
 | **자동 스냅샷** | ✅ | 10초마다 모든 오더북 → Redis 저장 |
 | **시작 시 복원** | ✅ | Redis에서 스냅샷 로드 → 오더북 복원 |
 | **종료 시 저장** | ✅ | Ctrl+C 시 최종 스냅샷 저장 후 종료 |
+| **비로그인 호가 스트림** | ✅ | `depthStreamHandler` Lambda 구현 *(2025-12-07)* |
+
+### 18.2 구현 필요 항목 (TODO)
+
+| 기능 | 위치 | 설명 |
+|------|------|------|
+| **Supabase 잔고 확인** | `orderHandler` Lambda | 주문 전 사용자 잔고 검증 |
+| **Order ID UUID 생성** | `orderHandler` Lambda | 중복 방지 해시 ID 생성 |
+| **로그인 사용자 체결 알림** | `userOrdersHandler` Lambda | fills, order_status 개인 푸시 |
+| **S3 오더북 백업** | C++ Engine | 장기 백업용 S3 저장 |
+| **관리자 API** | Lambda (Admin) | 종목 조회/추가, 오더북 상세 |
 
 ### 18.2 주문 JSON 포맷
 
@@ -780,70 +957,4 @@ b-3.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
 
 ---
 
-## 19. c5.2xlarge 용량 분석
-
-### 19.1 Liquibook 벤치마크 (PERFORMANCE.md 기준)
-
-| 테스트 유형 | TPS (2.4 GHz i7) |
-|-------------|------------------|
-| **5 Level Depth** | 2,062,158 |
-| **BBO Only** | 2,139,950 |
-| **Order Book Only** | 2,494,532 |
-
-### 19.2 c5.2xlarge 사양
-
-| 항목 | 값 |
-|------|-----|
-| **vCPU** | 8 |
-| **RAM** | 16 GB |
-| **네트워크** | 최대 10 Gbps |
-| **클럭** | 3.0 GHz (Turbo 3.5 GHz) |
-
-### 19.3 예상 TPS 계산
-
-```
-벤치마크 기준: 2,062,158 TPS (2.4 GHz 단일 코어)
-c5.2xlarge 클럭: 3.0 GHz → 약 25% 성능 향상
-
-단일 코어 예상: 2,062,158 × 1.25 = ~2,577,000 TPS
-
-AWS/네트워크 오버헤드 고려 (50% 감소): ~1,300,000 TPS
-```
-
-### 19.4 동시 사용자 및 종목 수 계산
-
-| 사용자 유형 | 주문 빈도 | 초당 주문 |
-|-------------|-----------|-----------|
-| 일반 사용자 | 10초에 1회 | 0.1 TPS |
-| 활발한 트레이더 | 3초에 1회 | 0.33 TPS |
-| **평균** | 5초에 1회 | **0.2 TPS** |
-
-```
-c5.2xlarge 예상 TPS: 1,300,000
-사용자당 평균 TPS: 0.2
-
-최대 동시 사용자 = 1,300,000 ÷ 0.2 = 6,500,000명
-```
-
-### 19.5 권장 종목 수
-
-| 시나리오 | 동시 사용자 | 종목당 사용자 | 권장 종목 |
-|----------|-------------|---------------|-----------|
-| **보수적** | 100,000 | 1,000 | **100개** |
-| **일반** | 500,000 | 500 | **1,000개** |
-| **최대** | 1,000,000 | 200 | **5,000개** |
-
-> ⚠️ 실제 운영 시 Kafka/Redis 오버헤드, 메모리 사용량 등 고려 필요
-
-### 19.6 결론
-
-**c5.2xlarge 1대로 충분히 5,000+ 종목 처리 가능**
-
-- MVP (100개 종목): 여유 10배+
-- 성장기 (1,000개 종목): 여유 5배+
-- 대규모 (5,000개 종목): 여유 2배+
-
----
-
 *최종 업데이트: 2025-12-07*
-

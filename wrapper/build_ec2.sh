@@ -14,6 +14,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# 스크립트 디렉토리 먼저 저장
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VCPKG_ROOT="${HOME}/vcpkg"
+
 # 1. 시스템 의존성 확인/설치
 echo -e "${YELLOW}[1/5] Checking system dependencies...${NC}"
 
@@ -21,11 +25,16 @@ if command -v apt-get &> /dev/null; then
     # Ubuntu/Debian
     sudo apt-get update
     sudo apt-get install -y build-essential cmake git pkg-config curl zip unzip tar
+elif command -v dnf &> /dev/null; then
+    # Amazon Linux 2023
+    sudo dnf groupinstall -y "Development Tools" || true
+    sudo dnf install -y cmake git pkgconf-pkg-config zip unzip tar
+    # curl 패키지 충돌 해결
+    sudo dnf swap curl-minimal curl --allowerasing -y 2>/dev/null || true
 elif command -v yum &> /dev/null; then
-    # Amazon Linux/CentOS
+    # Amazon Linux 2 / CentOS
     sudo yum groupinstall -y "Development Tools"
     sudo yum install -y cmake3 git pkgconfig curl zip unzip tar
-    # cmake3를 cmake로 링크
     if ! command -v cmake &> /dev/null; then
         sudo ln -sf /usr/bin/cmake3 /usr/bin/cmake
     fi
@@ -35,8 +44,6 @@ echo -e "${GREEN}✓ System dependencies installed${NC}"
 
 # 2. vcpkg 설치/업데이트
 echo -e "${YELLOW}[2/5] Setting up vcpkg...${NC}"
-
-VCPKG_ROOT="${HOME}/vcpkg"
 
 if [ ! -d "$VCPKG_ROOT" ]; then
     git clone https://github.com/Microsoft/vcpkg.git "$VCPKG_ROOT"
@@ -58,19 +65,25 @@ echo -e "${GREEN}✓ vcpkg ready at ${VCPKG_ROOT}${NC}"
 echo -e "${YELLOW}[3/5] Installing wrapper dependencies (this may take 10-15 minutes)...${NC}"
 
 cd "$VCPKG_ROOT"
-./vcpkg install librdkafka grpc protobuf nlohmann-json hiredis
+./vcpkg install hiredis nlohmann-json
 
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 
 # 4. 빌드
 echo -e "${YELLOW}[4/5] Building matching engine...${NC}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 중요: wrapper 디렉토리로 이동
 cd "$SCRIPT_DIR"
+echo "Building in: $(pwd)"
+
+# 기존 빌드 폴더 정리
+rm -rf build
+mkdir -p build
 
 cmake -B build -S . \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+    -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+    -DUSE_KINESIS=ON
 
 cmake --build build --config Release -j$(nproc)
 
@@ -93,7 +106,11 @@ echo "║                    Build Complete!                         ║"
 echo "╠═══════════════════════════════════════════════════════════╣"
 echo "║ To run the matching engine:                                ║"
 echo "║                                                            ║"
-echo "║   export KAFKA_BROKERS=\"your-msk-broker:9092\"              ║"
+echo "║   ./run_engine.sh                                          ║"
+echo "║                                                            ║"
+echo "║ Or manually:                                               ║"
+echo "║   export AWS_REGION=\"ap-northeast-2\"                       ║"
+echo "║   export KINESIS_STREAM_ORDERS=\"supernoba-orders\"          ║"
 echo "║   export REDIS_HOST=\"your-redis-host\"                      ║"
 echo "║   ./build/matching_engine                                  ║"
 echo "╚═══════════════════════════════════════════════════════════╝"

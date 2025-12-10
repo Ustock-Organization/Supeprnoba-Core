@@ -1,0 +1,25 @@
+nodejs24.x
+
+layer version 6
+
+{
+  "name": "nodejs",
+  "version": "1.0.0",
+  "description": "Supernoba Lambda Layer",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.946.0",
+    "@aws-sdk/client-kafka": "^3.946.0",
+    "@aws-sdk/credential-providers": "^3.946.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "aws-msk-iam-sasl-signer-js": "^1.0.1",
+    "ioredis": "^5.8.2",
+    "kafkajs": "^2.2.4"
+  }
+}
