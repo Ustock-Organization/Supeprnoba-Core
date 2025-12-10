@@ -22,7 +22,10 @@ export const handler = async (event) => {
   
   try {
     for (const symbol of symbols || []) {
+      // 심볼 구독자 추가
       const result = await valkey.sadd(`symbol:${symbol}:subscribers`, connectionId);
+      // 활성 심볼 목록에 추가 (Streamer가 조회)
+      await valkey.sadd('active:symbols', symbol);
       console.log(`Added ${connectionId} to symbol:${symbol}:subscribers, result: ${result}`);
     }
     

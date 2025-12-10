@@ -79,12 +79,11 @@ async function broadcastDepth(symbol, subscribers) {
 async function publicPushLoop() {
   while (true) {
     try {
-      // 모든 구독된 심볼 조회
-      const symbolKeys = await valkey.keys('symbol:*:subscribers');
+      // 활성 심볼 목록 조회 (KEYS 대신 SET 사용 - Serverless 호환)
+      const activeSymbols = await valkey.smembers('active:symbols');
       
-      for (const key of symbolKeys) {
-        const symbol = key.split(':')[1];
-        const subscribers = await valkey.smembers(key);
+      for (const symbol of activeSymbols) {
+        const subscribers = await valkey.smembers(`symbol:${symbol}:subscribers`);
         
         if (subscribers.length > 0) {
           const sent = await broadcastDepth(symbol, subscribers);
