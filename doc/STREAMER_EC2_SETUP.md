@@ -117,16 +117,20 @@ echo $WEBSOCKET_ENDPOINT
 ### 5. 스트리머 실행
 
 ```bash
-# 테스트 실행 (포그라운드)
 cd ~/liquibook/streamer/node
-node index.mjs
 
-# 백그라운드 실행 (nohup)
-nohup node index.mjs > streamer.log 2>&1 &
+# 환경변수 수정 (필요시)
+vi run_streamer.sh
 
-# 또는 PM2 사용 (권장)
+# 실행 권한 부여
+chmod +x run_streamer.sh
+
+# 테스트 실행 (포그라운드)
+./run_streamer.sh
+
+# PM2로 백그라운드 실행 (권장)
 sudo npm install -g pm2
-pm2 start index.mjs --name streamer
+pm2 start run_streamer.sh --name streamer
 pm2 save
 pm2 startup  # 시스템 시작 시 자동 실행
 ```

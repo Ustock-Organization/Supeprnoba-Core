@@ -1,17 +1,17 @@
 #!/bin/bash
 # Liquibook Matching Engine - EC2 실행 스크립트
 # 사용법: 
-#   ./run_engine.sh           # Kafka 모드 (기본)
-#   ./run_engine.sh --kinesis # Kinesis 모드
+#   ./run_engine.sh           # Kinesis 모드 (기본)
+#   ./run_engine.sh --kafka   # Kafka 모드
 
 set -e
 
 # ========================================
-# 모드 선택
+# 모드 선택 (기본값: Kinesis)
 # ========================================
-USE_KINESIS=false
-if [ "$1" == "--kinesis" ]; then
-    USE_KINESIS=true
+USE_KINESIS=true
+if [ "$1" == "--kafka" ]; then
+    USE_KINESIS=false
 fi
 
 if [ "$USE_KINESIS" == "true" ]; then
