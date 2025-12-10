@@ -48,6 +48,9 @@ async function sendToConnection(connectionId, data) {
     }));
     return true;
   } catch (error) {
+    // 모든 에러 로깅
+    console.error(`[ERROR] sendToConnection(${connectionId}):`, error.name, error.message);
+    
     if (error.$metadata?.httpStatusCode === 410) {
       // 연결 끊김 - 정리
       const connInfo = await valkey.get(`ws:${connectionId}`);

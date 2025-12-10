@@ -185,6 +185,8 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "streamer/node/node_modules/@smithy/abort-controller/dist-cjs/index.js",
+    "streamer/node/node_modules/@smithy/abort-controller/dist-cjs",
     "streamer/node/node_modules/@aws-sdk/client-apigatewaymanagementapi/package.json",
     "streamer/node/node_modules/@smithy/service-error-classification/dist-cjs/index.js",
     "streamer/node/node_modules/@smithy/service-error-classification/dist-cjs",
@@ -194,8 +196,6 @@
     "streamer/node/node_modules/@smithy/util-middleware/dist-es",
     "wrapper/stunnel_setup.sh",
     "cache_depth.json",
-    "cache_backup.json",
-    "streamer/node/node_modules/@smithy/util-endpoints/dist-cjs/index.js",
     "streamer/node/node_modules/@smithy/config-resolver/README.md",
     "streamer/node/node_modules/@aws-crypto/sha256-js/README.md",
     "streamer/node/node_modules/@smithy/credential-provider-imds/README.md",
