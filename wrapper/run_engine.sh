@@ -33,9 +33,13 @@ export PATH=$VCPKG_ROOT/downloads/tools/cmake-3.31.10-linux/cmake-3.31.10-linux-
 # AWS 설정
 export AWS_REGION="ap-northeast-2"
 
-# ElastiCache Redis/Valkey
+# ElastiCache Redis/Valkey (스냅샷 백업용)
 export REDIS_HOST="master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com"
 export REDIS_PORT="6379"
+
+# Depth 캐시 (실시간 호가용 - Streamer가 읽어감)
+export DEPTH_CACHE_HOST="supernoba-depth-cache-5vrxzz.serverless.apn2.cache.amazonaws.com"
+export DEPTH_CACHE_PORT="6379"
 
 # 기타 설정
 export GRPC_PORT="50051"

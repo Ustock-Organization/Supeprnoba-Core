@@ -70,6 +70,9 @@ int main(int argc, char* argv[]) {
     const auto grpc_port = Config::getInt(Config::GRPC_PORT, 50051);
     const auto redis_host = Config::get(Config::REDIS_HOST, "localhost");
     const auto redis_port = Config::getInt(Config::REDIS_PORT, 6379);
+    // Depth 캐시 (실시간 호가용 - 별도 인스턴스)
+    const auto depth_cache_host = Config::get("DEPTH_CACHE_HOST", redis_host);
+    const auto depth_cache_port = Config::getInt("DEPTH_CACHE_PORT", redis_port);
     
     Logger::info("=== Configuration ===");
 #ifdef USE_KINESIS
@@ -81,15 +84,23 @@ int main(int argc, char* argv[]) {
     Logger::info("Group ID:", kafka_group);
 #endif
     Logger::info("gRPC Port:", grpc_port);
-    Logger::info("Redis:", redis_host, ":", redis_port);
+    Logger::info("Redis (snapshot):", redis_host, ":", redis_port);
+    Logger::info("Redis (depth):", depth_cache_host, ":", depth_cache_port);
     Logger::info("=====================");
     
     try {
-        // Redis 연결
+        // Redis 연결 (스냅샷 백업용)
         RedisClient redis(redis_host, redis_port);
         bool redis_connected = redis.connect();
         if (!redis_connected) {
-            Logger::warn("Redis connection failed - continuing without cache");
+            Logger::warn("Redis (snapshot) connection failed - continuing without cache");
+        }
+        
+        // Depth 캐시 연결 (실시간 호가용)
+        RedisClient depth_cache(depth_cache_host, depth_cache_port);
+        bool depth_connected = depth_cache.connect();
+        if (!depth_connected) {
+            Logger::warn("Redis (depth) connection failed - continuing without depth cache");
         }
         
 #ifdef USE_KINESIS
@@ -100,8 +111,8 @@ int main(int argc, char* argv[]) {
         KafkaProducer producer(kafka_brokers);
 #endif
         
-        // 핸들러 및 엔진 생성 (Valkey depth 캐싱 활성화)
-        MarketDataHandler handler(&producer, &redis);
+        // 핸들러 및 엔진 생성 (depth_cache를 전달)
+        MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr);
         EngineCore engine(&handler);
         
         // === 시작 시 Redis에서 스냅샷 복원 ===
