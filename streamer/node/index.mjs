@@ -1,6 +1,6 @@
 // Streaming Server - API Gateway WebSocket 푸시
 // Valkey에서 depth 캐시를 읽어 구독자에게 브로드캐스트
-// 변경이 있을 때만 푸시 (폴링 대신 변경 감지)
+// 0.5초마다 계속 푸시, 구독자/종목 변경 시에만 로그
 
 import Redis from 'ioredis';
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
@@ -13,7 +13,7 @@ const WEBSOCKET_ENDPOINT = process.env.WEBSOCKET_ENDPOINT;
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
-// 폴링 간격 (폴백용)
+// 폴링 간격
 const POLL_INTERVAL_MS = 500;
 
 // 디버그 로그 함수
@@ -28,7 +28,7 @@ console.log(`Valkey: ${VALKEY_HOST}:${VALKEY_PORT} (TLS: ${VALKEY_TLS})`);
 console.log(`WebSocket Endpoint: ${WEBSOCKET_ENDPOINT}`);
 console.log(`Debug Mode: ${DEBUG_MODE}`);
 
-// Valkey 연결 (데이터 조회용)
+// Valkey 연결
 const valkey = new Redis({
   host: VALKEY_HOST,
   port: VALKEY_PORT,
@@ -46,8 +46,9 @@ const apiClient = new ApiGatewayManagementApiClient({
   region: AWS_REGION,
 });
 
-// 마지막 전송한 depth 데이터 캐시 (변경 감지용)
-const lastDepthCache = new Map();
+// 이전 상태 추적 (변경 로그용)
+let prevSymbolCount = 0;
+let prevSubscriberCounts = new Map();
 
 // 연결 ID로 메시지 전송
 async function sendToConnection(connectionId, data) {
@@ -66,68 +67,70 @@ async function sendToConnection(connectionId, data) {
       // 연결 끊김 - 정리
       const connInfo = await valkey.get(`ws:${connectionId}`);
       if (connInfo) {
-        const { userId } = JSON.parse(connInfo);
-        if (userId) {
-          await valkey.srem(`user:${userId}:connections`, connectionId);
-        }
+        try {
+          const { userId } = JSON.parse(connInfo);
+          if (userId) {
+            await valkey.srem(`user:${userId}:connections`, connectionId);
+          }
+        } catch (e) {}
       }
       await valkey.del(`ws:${connectionId}`);
-      console.log(`Removed stale connection: ${connectionId}`);
+      debug(`Removed stale connection: ${connectionId}`);
     }
     return false;
   }
 }
 
-// 심볼별 depth 브로드캐스트 (변경된 경우에만)
-async function broadcastDepthIfChanged(symbol, subscribers) {
+// 심볼별 depth 브로드캐스트
+async function broadcastDepth(symbol, subscribers) {
   const depthJson = await valkey.get(`depth:${symbol}`);
-  if (!depthJson) return { sent: 0, changed: false };
-
-  // 변경 감지: 마지막으로 보낸 데이터와 비교
-  const lastDepth = lastDepthCache.get(symbol);
-  if (lastDepth === depthJson) {
-    debug(`${symbol}: No change, skipping broadcast`);
-    return { sent: 0, changed: false };
-  }
-
-  // 변경됨 - 캐시 업데이트
-  lastDepthCache.set(symbol, depthJson);
+  if (!depthJson) return 0;
 
   const results = await Promise.allSettled(
     subscribers.map(connId => sendToConnection(connId, depthJson))
   );
   
-  const sent = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
-  return { sent, changed: true };
+  return results.filter(r => r.status === 'fulfilled' && r.value === true).length;
 }
 
-// 메인 푸시 루프 (폴링, 변경 감지 포함)
+// 메인 푸시 루프
 async function pushLoop() {
-  let loopCount = 0;
-  
   while (true) {
     try {
-      loopCount++;
-      
       // 활성 심볼 목록 조회
       const activeSymbols = await valkey.smembers('active:symbols');
       
-      // 디버그: 루프 상태 출력 (20회마다)
-      if (loopCount % 20 === 1) {
-        debug(`Loop #${loopCount}, activeSymbols: ${JSON.stringify(activeSymbols)}`);
+      // 종목 수 변경 감지
+      if (activeSymbols.length !== prevSymbolCount) {
+        console.log(`[INFO] Active symbols changed: ${prevSymbolCount} -> ${activeSymbols.length} (${activeSymbols.join(', ')})`);
+        prevSymbolCount = activeSymbols.length;
       }
       
       for (const symbol of activeSymbols) {
         const subscribers = await valkey.smembers(`symbol:${symbol}:subscribers`);
         
+        // 구독자 수 변경 감지
+        const prevCount = prevSubscriberCounts.get(symbol) || 0;
+        if (subscribers.length !== prevCount) {
+          console.log(`[INFO] ${symbol} subscribers changed: ${prevCount} -> ${subscribers.length}`);
+          prevSubscriberCounts.set(symbol, subscribers.length);
+        }
+        
+        // 구독자가 있으면 항상 브로드캐스트 (0.5초마다)
         if (subscribers.length > 0) {
-          const { sent, changed } = await broadcastDepthIfChanged(symbol, subscribers);
-          
-          if (changed) {
-            console.log(`[BROADCAST] ${symbol}: ${sent}/${subscribers.length} sent`);
-          }
+          const sent = await broadcastDepth(symbol, subscribers);
+          debug(`${symbol}: ${sent}/${subscribers.length} sent`);
         }
       }
+      
+      // 제거된 종목 정리
+      for (const [symbol] of prevSubscriberCounts) {
+        if (!activeSymbols.includes(symbol)) {
+          console.log(`[INFO] Symbol removed: ${symbol}`);
+          prevSubscriberCounts.delete(symbol);
+        }
+      }
+      
     } catch (error) {
       console.error('Push loop error:', error.message);
       if (DEBUG_MODE) {
