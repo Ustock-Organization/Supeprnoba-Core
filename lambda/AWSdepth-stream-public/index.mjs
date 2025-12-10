@@ -68,7 +68,9 @@ export const handler = async (event) => {
     try {
       const value = Buffer.from(record.kinesis.data, 'base64').toString('utf8');
       const depthData = JSON.parse(value);
-      const symbol = depthData.symbol;
+      
+      // 컴팩트 포맷: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
+      const symbol = depthData.s;
       
       if (!symbol) continue;
       
@@ -83,19 +85,11 @@ export const handler = async (event) => {
       // 해당 심볼 구독자 조회
       const subscribers = await valkey.smembers(`symbol:${symbol}:subscribers`);
       
-      console.log(`Broadcasting depth for ${symbol} to ${subscribers.length} subscribers: [${subscribers.slice(0, 3).join(', ')}${subscribers.length > 3 ? '...' : ''}]`);
+      console.log(`Broadcasting depth for ${symbol} to ${subscribers.length} subscribers`);
       
-      // 모든 구독자에게 전송
+      // 모든 구독자에게 컴팩트 포맷 그대로 전송
       const results = await Promise.allSettled(subscribers.map(connectionId => 
-        sendToConnection(client, connectionId, {
-          type: 'DEPTH',
-          symbol,
-          data: {
-            bids: depthData.bids || [],
-            asks: depthData.asks || [],
-          },
-          timestamp: now,
-        })
+        sendToConnection(client, connectionId, depthData)
       ));
       
       const succeeded = results.filter(r => r.status === 'fulfilled' && r.value === true).length;

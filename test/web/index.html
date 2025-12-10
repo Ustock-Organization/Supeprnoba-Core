@@ -640,15 +640,22 @@
 
         // 메시지 처리
         function handleMessage(msg) {
-            addLog(msg.type || 'INFO', JSON.stringify(msg, null, 2));
-
-            if (msg.type === 'DEPTH') {
+            // 컴팩트 포맷 처리 (e=event, s=symbol)
+            if (msg.e === 'd') {
+                // DEPTH 업데이트: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
+                addLog('DEPTH', JSON.stringify(msg));
+                updateOrderbook(msg.s, { asks: msg.a, bids: msg.b });
+            } else if (msg.type === 'DEPTH') {
+                // 레거시 포맷 호환
+                addLog(msg.type, JSON.stringify(msg, null, 2));
                 updateOrderbook(msg.symbol, msg.data);
             } else if (msg.subscribed) {
                 // 구독 완료 응답
                 addLog('SUCCESS', `✅ 구독 완료: ${msg.subscribed.join(', ')}`);
             } else if (msg.message === 'Forbidden') {
                 // ping 응답 (무시)
+            } else {
+                addLog('INFO', JSON.stringify(msg, null, 2));
             }
         }
 
@@ -686,11 +693,12 @@
             const currentPriceEl = document.getElementById('currentPriceDisplay');
             const spreadEl = document.getElementById('spreadDisplay');
             
-            const asksData = data.asks || [];
-            const bidsData = data.bids || [];
+            // 컴팩트 포맷: [[price, qty], ...] 또는 레거시 [{price, quantity}, ...]
+            const asksData = (data.asks || []).map(a => Array.isArray(a) ? {price: a[0], qty: a[1]} : {price: a.price, qty: a.quantity});
+            const bidsData = (data.bids || []).map(b => Array.isArray(b) ? {price: b[0], qty: b[1]} : {price: b.price, qty: b.quantity});
             
             // 모든 수량 수집하여 최소/최대 구하기
-            const allQuantities = [...asksData.map(a => a.quantity), ...bidsData.map(b => b.quantity)].filter(q => q > 0);
+            const allQuantities = [...asksData.map(a => a.qty), ...bidsData.map(b => b.qty)].filter(q => q > 0);
             const minQty = allQuantities.length > 0 ? Math.min(...allQuantities) : 0;
             const maxQty = allQuantities.length > 0 ? Math.max(...allQuantities) : 1;
             const qtyRange = maxQty - minQty || 1;
@@ -718,14 +726,14 @@
 
             // 매도호가 (낮은 가격이 아래, 높은 가격이 위 → 역순으로 표시)
             const asksRows = [];
-            const displayAsks = asksData.slice(0, 10).reverse(); // 가장 가까운 10개, 역순
+            const displayAsks = asksData.slice(0, 10).reverse();
             for (const a of displayAsks) {
-                const barWidth = getBarWidth(a.quantity);
-                const total = a.price * a.quantity;
+                const barWidth = getBarWidth(a.qty);
+                const total = a.price * a.qty;
                 asksRows.push(`<div class="orderbook-row">
                     <div class="bar ask" style="width: ${barWidth}%;"></div>
                     <span class="price ask">${a.price.toFixed(2)}</span>
-                    <span class="qty">${a.quantity}</span>
+                    <span class="qty">${a.qty}</span>
                     <span class="total">${total.toLocaleString()}</span>
                 </div>`);
             }
@@ -743,12 +751,12 @@
             const bidsRows = [];
             const displayBids = bidsData.slice(0, 10);
             for (const b of displayBids) {
-                const barWidth = getBarWidth(b.quantity);
-                const total = b.price * b.quantity;
+                const barWidth = getBarWidth(b.qty);
+                const total = b.price * b.qty;
                 bidsRows.push(`<div class="orderbook-row">
                     <div class="bar bid" style="width: ${barWidth}%;"></div>
                     <span class="price bid">${b.price.toFixed(2)}</span>
-                    <span class="qty">${b.quantity}</span>
+                    <span class="qty">${b.qty}</span>
                     <span class="total">${total.toLocaleString()}</span>
                 </div>`);
             }

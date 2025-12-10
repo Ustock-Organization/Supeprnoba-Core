@@ -31,6 +31,7 @@ public:
     // 주문 상태 변경 발행
     virtual void publishOrderStatus(const std::string& symbol,
                                     const std::string& order_id,
+                                    const std::string& user_id,
                                     const std::string& status,
                                     const std::string& reason = "") = 0;
     

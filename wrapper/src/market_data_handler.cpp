@@ -18,7 +18,7 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "ACCEPTED");
+                                       order->user_id(), "ACCEPTED");
     }
 }
 
@@ -28,7 +28,7 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REJECTED", reason);
+                                       order->user_id(), "REJECTED", reason);
     }
 }
 
@@ -65,7 +65,7 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "CANCELLED");
+                                       order->user_id(), "CANCELLED");
     }
 }
 
@@ -74,7 +74,7 @@ void MarketDataHandler::on_cancel_reject(const OrderPtr& order, const char* reas
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "CANCEL_REJECTED", reason);
+                                       order->user_id(), "CANCEL_REJECTED", reason);
     }
 }
 
@@ -86,7 +86,7 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REPLACED");
+                                       order->user_id(), "REPLACED");
     }
 }
 
@@ -95,7 +95,7 @@ void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* rea
     
     if (producer_) {
         producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                       "REPLACE_REJECTED", reason);
+                                       order->user_id(), "REPLACE_REJECTED", reason);
     }
 }
 
@@ -116,41 +116,38 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
                                          const BookDepth* depth) {
     std::string symbol = book->symbol();
     
+    // 컴팩트 포맷: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
     nlohmann::json depth_json;
-    depth_json["event"] = "DEPTH";
-    depth_json["symbol"] = symbol;
+    depth_json["e"] = "d";  // event = depth
+    depth_json["s"] = symbol;
     
-    // Bids (포인터 이터레이션)
+    // Bids (최대 20개)
     nlohmann::json bids_arr = nlohmann::json::array();
     const liquibook::book::DepthLevel* bid = depth->bids();
     const liquibook::book::DepthLevel* bid_end = depth->last_bid_level() + 1;
-    for (; bid != bid_end; ++bid) {
+    int count = 0;
+    for (; bid != bid_end && count < 20; ++bid) {
         if (bid->order_count() > 0) {
-            nlohmann::json level;
-            level["price"] = bid->price();
-            level["quantity"] = bid->aggregate_qty();
-            level["count"] = bid->order_count();
-            bids_arr.push_back(level);
+            bids_arr.push_back({bid->price(), bid->aggregate_qty()});
+            count++;
         }
     }
-    depth_json["bids"] = bids_arr;
+    depth_json["b"] = bids_arr;
     
-    // Asks (포인터 이터레이션)
+    // Asks (최대 20개)
     nlohmann::json asks_arr = nlohmann::json::array();
     const liquibook::book::DepthLevel* ask = depth->asks();
     const liquibook::book::DepthLevel* ask_end = depth->last_ask_level() + 1;
-    for (; ask != ask_end; ++ask) {
+    count = 0;
+    for (; ask != ask_end && count < 20; ++ask) {
         if (ask->order_count() > 0) {
-            nlohmann::json level;
-            level["price"] = ask->price();
-            level["quantity"] = ask->aggregate_qty();
-            level["count"] = ask->order_count();
-            asks_arr.push_back(level);
+            asks_arr.push_back({ask->price(), ask->aggregate_qty()});
+            count++;
         }
     }
-    depth_json["asks"] = asks_arr;
+    depth_json["a"] = asks_arr;
     
-    depth_json["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+    depth_json["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
     if (producer_) {
