@@ -177,13 +177,11 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     depth_json["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
-    // 변동률 추가 (Main 데이터에도 포함)
-    auto it = symbol_day_data_.find(symbol);
-    if (it != symbol_day_data_.end()) {
-        depth_json["c"] = std::round(it->second.change_rate * 100) / 100.0;
-        depth_json["yc"] = std::round(it->second.prev_change_rate * 100) / 100.0;
-        depth_json["p"] = it->second.last_price;  // 현재가도 추가
-    }
+    // 변동률 추가 (Main 데이터에도 포함) - 항상 포함
+    DayData& day = getDayData(symbol);
+    depth_json["c"] = std::round(day.change_rate * 100) / 100.0;
+    depth_json["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
+    depth_json["p"] = day.last_price;  // 현재가도 추가
     
     // Valkey에 depth 캐시 저장 (Streaming Server가 읽어감)
     Logger::debug("Depth cache check - redis_:", redis_ ? "exists" : "null", 

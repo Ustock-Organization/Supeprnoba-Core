@@ -18,6 +18,7 @@
             --danger: #f85149;
             --buy: #3fb950;
             --sell: #f85149;
+            --purple: #a371f7;
         }
 
         * {
@@ -492,19 +493,32 @@
                     </div>
                 </div>
 
-                <!-- 심볼 구독 -->
+                <!-- Main 구독 (호가창 - 1개만) -->
                 <div class="card">
-                    <h2>심볼 구독</h2>
+                    <h2 style="display: flex; justify-content: space-between; align-items: center;">Main 구독 <span style="background: var(--accent); color: #000; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem;">1개</span></h2>
                     <div class="inline-form">
                         <div class="form-group">
-                            <label>심볼 (콤마 구분)</label>
-                            <input type="text" id="subscribeSymbols" value="TEST">
+                            <label>심볼 (호가창 표시)</label>
+                            <input type="text" id="mainSymbol" placeholder="TEST">
                         </div>
-                        <button class="btn btn-primary" onclick="subscribe()">구독</button>
+                        <button class="btn btn-primary" onclick="subscribeMain()">구독</button>
                     </div>
-                    <div id="subscribedList" style="margin-top: 10px; color: var(--text-muted); font-size: 0.85rem;">
-                        구독 중: 없음
+                    <div id="mainSubscribedInfo" style="margin-top: 10px; color: var(--accent); font-size: 0.85rem;">
+                        호가창: 없음
                     </div>
+                </div>
+
+                <!-- Sub 구독 (전광판 - 무제한) -->
+                <div class="card">
+                    <h2 style="display: flex; justify-content: space-between; align-items: center;">Sub 구독 <span style="background: var(--purple); color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem;">무제한</span></h2>
+                    <div class="inline-form">
+                        <div class="form-group">
+                            <label>심볼 (전광판 추가)</label>
+                            <input type="text" id="subSymbol" placeholder="AAPL">
+                        </div>
+                        <button class="btn" style="background: var(--purple); color: #fff;" onclick="subscribeSub()">+ 추가</button>
+                    </div>
+                    <div id="tickerGrid" style="margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;"></div>
                 </div>
 
             <!-- Kinesis Admin (미구현) -->
@@ -642,9 +656,33 @@
         function handleMessage(msg) {
             // 컴팩트 포맷 처리 (e=event, s=symbol)
             if (msg.e === 'd') {
-                // DEPTH 업데이트: {"e":"d","s":"SYM","t":123,"b":[[p,q],...],"a":[[p,q],...]}
+                // DEPTH 업데이트: {"e":"d","s":"SYM","t":123,"b":[[p,q],...], "a":[[p,q],...]}
                 addLog('DEPTH', JSON.stringify(msg));
                 updateOrderbook(msg.s, { asks: msg.a, bids: msg.b });
+                
+                // Sub 전광판 업데이트 (depth에서 가격 추출)
+                if (subSymbols.has(msg.s)) {
+                    const bestBid = msg.b?.[0]?.[0] || 0;
+                    const bestAsk = msg.a?.[0]?.[0] || 0;
+                    const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : bestBid || bestAsk;
+                    subSymbols.set(msg.s, {
+                        price: midPrice,
+                        change: msg.c || 0,
+                        yc: msg.yc || 0
+                    });
+                    renderTickerGrid();
+                }
+            } else if (msg.e === 't') {
+                // TICKER 업데이트: {"e":"t","s":"SYM","p":150,"c":2.5}
+                addLog('TICKER', JSON.stringify(msg));
+                if (subSymbols.has(msg.s)) {
+                    subSymbols.set(msg.s, {
+                        price: msg.p,
+                        change: msg.c || 0,
+                        yc: msg.yc || 0
+                    });
+                    renderTickerGrid();
+                }
             } else if (msg.type === 'DEPTH') {
                 // 레거시 포맷 호환
                 addLog(msg.type, JSON.stringify(msg, null, 2));
@@ -654,6 +692,9 @@
                 addLog('SUCCESS', `✅ 구독 완료: ${msg.subscribed.join(', ')}`);
             } else if (msg.message === 'Forbidden') {
                 // ping 응답 (무시)
+            } else if (msg.main || msg.sub) {
+                // 신버전 구독 응답
+                addLog('SUCCESS', `✅ main=${msg.main || '-'}, sub=${JSON.stringify(msg.sub || [])}`);
             } else {
                 addLog('INFO', JSON.stringify(msg, null, 2));
             }
@@ -798,24 +839,109 @@
                 return;
             }
 
-            const symbols = document.getElementById('subscribeSymbols').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
+            // 기존 symbols 형식으로 호환성 유지
+            const symbols = document.getElementById('mainSymbol').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
+            if (symbols.length === 0) return;
+            
             ws.send(JSON.stringify({ action: 'subscribe', symbols }));
             addLog('INFO', `구독 요청: ${symbols.join(', ')}`);
             
-            // 구독 목록에 추가
             symbols.forEach(sym => {
                 if (!subscribedSymbols.includes(sym)) {
                     subscribedSymbols.push(sym);
                 }
             });
             
-            // 첫 번째 심볼을 활성화
             if (!activeOrderbookSymbol && subscribedSymbols.length > 0) {
                 activeOrderbookSymbol = subscribedSymbols[0];
             }
             
             updateOrderbookTabs();
-            document.getElementById('subscribedList').textContent = `구독 중: ${subscribedSymbols.join(', ')}`;
+        }
+        
+        // Main 구독 (호가창 - 1개만)
+        let currentMainSymbol = null;
+        let subSymbols = new Map(); // symbol -> {price, change}
+        
+        function subscribeMain() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog('ERROR', 'WebSocket이 연결되지 않음');
+                return;
+            }
+            
+            const symbol = document.getElementById('mainSymbol').value.toUpperCase().trim();
+            if (!symbol) {
+                addLog('ERROR', '심볼을 입력하세요');
+                return;
+            }
+            
+            // 신버전 형식으로 Main 구독
+            ws.send(JSON.stringify({ action: 'subscribe', main: symbol }));
+            currentMainSymbol = symbol;
+            
+            // 기존 호가창 초기화 - Main은 1개만!
+            subscribedSymbols = [symbol];
+            orderbooks = {};
+            activeOrderbookSymbol = symbol;
+            updateOrderbookTabs();
+            
+            document.getElementById('mainSubscribedInfo').innerHTML = `호가창: <strong style="color: var(--accent);">${symbol}</strong>`;
+            document.getElementById('mainSymbol').value = '';
+            addLog('INFO', `[MAIN] 구독: ${symbol}`);
+        }
+        
+        // Sub 구독 (전광판 - 무제한)
+        function subscribeSub() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog('ERROR', 'WebSocket이 연결되지 않음');
+                return;
+            }
+            
+            const symbol = document.getElementById('subSymbol').value.toUpperCase().trim();
+            if (!symbol) {
+                addLog('ERROR', '심볼을 입력하세요');
+                return;
+            }
+            if (subSymbols.has(symbol)) {
+                addLog('ERROR', '이미 추가된 심볼입니다');
+                return;
+            }
+            
+            // 신버전 형식으로 Sub 구독
+            ws.send(JSON.stringify({ action: 'subscribe', sub: [symbol] }));
+            subSymbols.set(symbol, { price: 0, change: 0 });
+            
+            document.getElementById('subSymbol').value = '';
+            renderTickerGrid();
+            addLog('INFO', `[SUB] 추가: ${symbol}`);
+        }
+        
+        function removeSub(symbol) {
+            subSymbols.delete(symbol);
+            renderTickerGrid();
+            addLog('INFO', `[SUB] 제거: ${symbol}`);
+        }
+        
+        function renderTickerGrid() {
+            const grid = document.getElementById('tickerGrid');
+            if (subSymbols.size === 0) {
+                grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; text-align: center; padding: 20px;">심볼을 추가하세요</div>';
+                return;
+            }
+            
+            grid.innerHTML = Array.from(subSymbols.entries()).map(([symbol, data]) => {
+                const isUp = (data.change || 0) >= 0;
+                const sign = isUp ? '+' : '';
+                const changeColor = isUp ? 'var(--success)' : 'var(--danger)';
+                return `
+                    <div style="background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 12px; position: relative;">
+                        <button onclick="removeSub('${symbol}')" style="position: absolute; top: 4px; right: 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.1rem;">&times;</button>
+                        <div style="font-weight: bold; color: var(--purple); margin-bottom: 6px;">${symbol}</div>
+                        <div style="font-size: 1.1rem; font-weight: bold;">${data.price ? data.price.toLocaleString() : '-'}</div>
+                        <div style="font-size: 0.8rem; color: ${changeColor};">${sign}${(data.change || 0).toFixed(2)}%</div>
+                    </div>
+                `;
+            }).join('');
         }
 
         // 주문 제출
