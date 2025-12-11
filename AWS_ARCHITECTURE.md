@@ -1,144 +1,174 @@
 # AWS Supernoba 아키텍처
 
-Amazon Kinesis 기반 실시간 매칭 엔진 인프라 (2025-12-09 현재 운영 중)
+Amazon Kinesis + Valkey 기반 실시간 매칭 엔진 인프라 (2025-12-11 운영 중)
 
-## 전체 아키텍처 개요
+> **Depth 데이터는 Kinesis를 거치지 않고 Valkey에 직접 저장** → Streamer가 읽어서 WebSocket으로 푸시
+
+---
+
+## 현재 운영 아키텍처
 
 ```mermaid
-graph LR
+flowchart TD
     subgraph Client["클라이언트"]
-        Web[Web Browser]
+        App[Web/iOS App]
     end
     
     subgraph AWS["AWS Cloud (ap-northeast-2)"]
-        subgraph Public["Public Internet"]
-            APIG[API Gateway<br/>WebSocket + REST]
+        APIG[API Gateway WebSocket<br/>l2ptm85wub]
+        
+        subgraph Lambda["Lambda Functions"]
+            Router[order-router]
+            Connect[connect-handler]
+            Subscribe[subscribe-handler]
+            Disconnect[disconnect-handler]
         end
         
-        subgraph VPC["VPC (172.31.0.0/16)"]
-            subgraph Kinesis["Amazon Kinesis"]
-                K1[supernoba-orders]
-                K2[supernoba-fills]
-                K3[supernoba-depth]
-                K4[supernoba-order-status]
-            end
-            
-            subgraph Lambda["Lambda Functions"]
-                Router[Order Router]
-                Depth[depth-stream-public]
-                User[user-stream-handler]
-                Connect[connect-handler]
-            end
-            
-            subgraph EC2["EC2"]
-                Engine[Matching Engine<br/>Liquibook C++]
-            end
-            
-            subgraph ElastiCache["ElastiCache Valkey"]
-                DepthCache[(supernoba-depth-cache<br/>호가 스트리밍)]
-                BackupCache[(Orderbook-backup-cache<br/>오더북 백업)]
-            end
-            
-            NAT[NAT Gateway<br/>13.125.71.17]
+        subgraph Kinesis["Amazon Kinesis (주문/체결만)"]
+            K1[supernoba-orders<br/>4 shards]
+            K2[supernoba-order-status]
+            K3[supernoba-fills]
+        end
+        
+        subgraph EC2_Engine["EC2: Matching Engine<br/>ip-172-31-47-97"]
+            Engine[Liquibook C++]
+        end
+        
+        subgraph EC2_Streamer["EC2: Streaming Server<br/>ip-172-31-57-219"]
+            Streamer[Node.js Streamer]
+        end
+        
+        subgraph ElastiCache["ElastiCache Valkey"]
+            BackupCache[(Backup Cache<br/>snapshot:SYMBOL)]
+            DepthCache[(Depth Cache<br/>depth:SYMBOL)]
         end
     end
     
-    Web <-->|WSS| APIG
+    App <-->|WSS| APIG
     APIG --> Router
     APIG --> Connect
-    Router --> K1
+    APIG --> Subscribe
+    APIG --> Disconnect
+    
+    Router -->|주문| K1
     K1 --> Engine
-    Engine --> K2
-    Engine --> K3
-    Engine --> K4
-    Engine --> BackupCache
-    K3 --> Depth
-    K2 --> User
-    K4 --> User
-    Depth --> DepthCache
-    Depth --> NAT
-    NAT -->|PostToConnection| APIG
-    APIG -->|Push| Web
+    Engine -->|상태| K2
+    Engine -->|체결| K3
+    Engine -->|스냅샷| BackupCache
+    Engine ==>|"depth 직접 저장<br/>(Kinesis X)"| DepthCache
+    
+    Subscribe -->|구독자 등록| DepthCache
+    DepthCache ==>|"500ms 폴링"| Streamer
+    Streamer -->|PostToConnection| APIG
+    APIG -->|depth 푸시| App
+    
+    style DepthCache fill:#4CAF50,color:white
+    style Streamer fill:#2196F3,color:white
+    style Engine fill:#00599C,color:white
 ```
+
+> **핵심**: `depth` 데이터는 **Kinesis를 거치지 않고** C++ 엔진이 Valkey에 직접 저장.  
+> Node.js Streamer가 Depth Cache를 폴링하여 WebSocket 클라이언트에 푸시.
 
 ---
 
-## VPC 네트워크 구성
-
-```mermaid
-graph TB
-    subgraph VPC["VPC: Supernoba_back (172.31.0.0/16)"]
-        subgraph AZa["ap-northeast-2a"]
-            Sub1[subnet-911ebefa<br/>172.31.0.0/20]
-        end
-        subgraph AZb["ap-northeast-2b"]
-            Sub2[subnet-9e23bee5<br/>172.31.16.0/20]
-        end
-        subgraph AZc["ap-northeast-2c"]
-            Sub3[subnet-4d786f01<br/>172.31.32.0/20]
-        end
-        
-        NAT[NAT Gateway<br/>nat-17d68eebde280f74f<br/>IP: 13.125.71.17]
-        
-        subgraph VPCE["VPC Endpoints"]
-            KinesisVPCE[Kinesis Streams]
-            LambdaVPCE[Lambda]
-            STSVPCE[STS]
-            ElastiCacheVPCE[ElastiCache]
-        end
-    end
-    
-    subgraph External["External"]
-        IGW[Internet Gateway<br/>igw-cfc6a3a7]
-        APIG[API Gateway<br/>WebSocket]
-    end
-    
-    Sub1 --> NAT
-    Sub2 --> NAT
-    Sub3 --> NAT
-    NAT --> IGW
-    IGW --> APIG
-    
-    style NAT fill:#f96,stroke:#333
-    style APIG fill:#9cf,stroke:#333
-```
-
-### NAT Gateway 설정
-
-| 구성 요소 | 값 |
-|---------|-----|
-| **NAT Gateway ID** | `nat-17d68eebde280f74f` |
-| **Elastic IP** | `13.125.71.17` |
-| **VPC** | `vpc-314afc5a (Supernoba_back)` |
-| **라우팅 테이블** | `0.0.0.0/0 → nat-17d68eebde280f74f` |
-
----
-
-## 실시간 스트리밍 데이터 흐름
+## 실시간 스트리밍 흐름
 
 ```mermaid
 sequenceDiagram
     participant Client as Web Client
-    participant APIG as API Gateway WebSocket
+    participant APIG as API Gateway WS
     participant Subscribe as subscribe-handler
-    participant Valkey as ElastiCache Valkey
-    participant Kinesis as Kinesis supernoba-depth
-    participant Depth as depth-stream-public
-    participant NAT as NAT Gateway
+    participant Valkey as Depth Cache
+    participant Engine as C++ Engine
+    participant Streamer as Node.js Streamer
 
     Client->>APIG: WebSocket 연결
     Client->>APIG: {"action":"subscribe","symbols":["TEST"]}
     APIG->>Subscribe: subscribe route
-    Subscribe->>Valkey: SADD symbol:TEST:subscribers {connectionId}
-    Subscribe-->>Client: {"subscribed":["TEST"]}
-
-    Note over Kinesis: C++ Engine이 호가 변동 발행
-    Kinesis->>Depth: Kinesis 트리거
-    Depth->>Valkey: SMEMBERS symbol:TEST:subscribers
-    Depth->>NAT: PostToConnection (VPC 내부)
-    NAT->>APIG: HTTPS (공개 인터넷)
-    APIG->>Client: {"type":"DEPTH","data":{...}}
+    Subscribe->>Valkey: SADD active:symbols TEST
+    Subscribe->>Valkey: SADD symbol:TEST:subscribers {connId}
+    
+    Note over Engine: 주문 처리 → 호가 변경
+    Engine->>Valkey: SET depth:TEST {json}
+    
+    loop 매 500ms
+        Streamer->>Valkey: SMEMBERS active:symbols
+        Streamer->>Valkey: GET depth:TEST
+        Streamer->>APIG: PostToConnection
+        APIG->>Client: depth 데이터 푸시
+    end
 ```
+
+---
+
+## ElastiCache 구성 (Dual Redis)
+
+| 캐시 | 엔드포인트 | 용도 | TLS |
+|------|-----------|------|-----|
+| **Backup Cache** | `master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com:6379` | 오더북 스냅샷 | Optional |
+| **Depth Cache** | `supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com:6379` | 실시간 호가 | ❌ Disabled |
+
+---
+
+## Depth 데이터 포맷
+
+```json
+{"e":"d","s":"TEST","t":1733896438267,"b":[[150,30],[149,20]],"a":[[151,30],[152,25]]}
+```
+
+| 필드 | 설명 |
+|------|------|
+| `e` | 이벤트 타입 ("d" = depth) |
+| `s` | 심볼 |
+| `t` | 타임스탬프 (epoch ms) |
+| `b` | Bids `[[price, qty], ...]` (최대 10개) |
+| `a` | Asks `[[price, qty], ...]` (최대 10개) |
+
+---
+
+## Lambda 함수
+
+| 함수명 | 트리거 | 역할 |
+|--------|--------|------|
+| `Supernoba-order-router` | API Gateway REST | 주문 → Kinesis |
+| `connect-handler` | `$connect` | 연결 정보 저장 |
+| `subscribe-handler` | `subscribe` | 심볼 구독 등록 |
+| `disconnect-handler` | `$disconnect` | 구독 정리 |
+
+---
+
+## EC2 인스턴스
+
+| 역할 | Private IP | 상태 |
+|------|------------|------|
+| **Matching Engine** | 172.31.47.97 | ✅ 운영 중 |
+| **Streaming Server** | 172.31.57.219 | ✅ 운영 중 |
+
+---
+
+## 실행 스크립트
+
+```bash
+# 매칭 엔진
+./wrapper/run_engine.sh           # 기본 (INFO)
+./wrapper/run_engine.sh --debug   # 디버그 (DEBUG)
+
+# 스트리밍 서버
+./streamer/node/run_streamer.sh           # 기본
+./streamer/node/run_streamer.sh --debug   # 디버그
+```
+
+---
+
+## Redis 키 구조
+
+| 키 패턴 | 타입 | 용도 |
+|---------|------|------|
+| `snapshot:SYMBOL` | String | 오더북 스냅샷 (Backup Cache) |
+| `depth:SYMBOL` | String | 실시간 호가 (Depth Cache) |
+| `active:symbols` | Set | 활성 심볼 목록 |
+| `symbol:SYMBOL:subscribers` | Set | 심볼별 WebSocket 구독자 |
 
 ---
 
@@ -953,8 +983,8 @@ b-2.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
 b-3.supernobamsk.c1dtdv.c3.kafka.ap-northeast-2.amazonaws.com:9092
 ```
 
-> ⚠️ IAM 인증(9098)은 librdkafka C++ 호환 이슈로 Plaintext 사용 중
+> ⚠️ IAM 인증(9098)은 librdkafka C++ 호환 이슈로 Plaintext 사용 중 (MSK 레거시)
 
 ---
 
-*최종 업데이트: 2025-12-07*
+*최종 업데이트: 2025-12-11*

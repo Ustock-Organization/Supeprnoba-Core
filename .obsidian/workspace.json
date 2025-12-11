@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "doc/STREAMER_EC2_SETUP.md",
+                "file": "doc/AWS-MSK-DOC/계정 간 이벤트 소스 매핑 생성.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "STREAMER_EC2_SETUP"
+              "title": "계정 간 이벤트 소스 매핑 생성"
             }
           }
         ]
@@ -185,6 +185,28 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "AWS_CONSOLE_SETUP_GUIDE.md",
+    "doc/OHLCV_dataformat.md",
+    "AWS_ARCHITECTURE.md",
+    "PERFORMANCE.md",
+    "WINDOWS_BUILD_GUIDE.md",
+    "README_ORDER_ENTRY.md",
+    "test/web/ticker-board.html",
+    "lambda/AWSdaily-backup-handler/index.mjs",
+    "lambda/AWSdaily-backup-handler",
+    "doc/api/README.md",
+    "doc/AWS-MSK-DOC/계정 간 이벤트 소스 매핑 생성.md",
+    "doc/Images/MarketApplication.svg",
+    "doc/Images/MarketApplication.png",
+    "doc/settAug2013/settAug2013_files/ExchangeUML.png",
+    "doc/settAug2013/settAug2013_files/Exchange.png",
+    "doc/settAug2013/settAug2013_files/ExampleExchange.png",
+    "doc/settAug2013/images/SETT.png",
+    "doc/settAug2013/images/Right.png",
+    "doc/settAug2013/images/Middle.png",
+    "doc/settAug2013/images/Left.png",
+    "doc/KINESIS_ARCHITECTURE.md",
+    "doc/STREAMER_EC2_SETUP.md",
     "streamer/node/node_modules/@smithy/abort-controller/dist-cjs/index.js",
     "streamer/node/node_modules/@smithy/abort-controller/dist-cjs",
     "streamer/node/node_modules/@aws-sdk/client-apigatewaymanagementapi/package.json",
@@ -192,10 +214,6 @@
     "streamer/node/node_modules/@smithy/service-error-classification/dist-cjs",
     "streamer/node/node_modules/@smithy/util-middleware/dist-es/index.js",
     "streamer/node/node_modules/@smithy/util-middleware/dist-es/normalizeProvider.js",
-    "streamer/node/node_modules/@smithy/util-middleware/dist-es/getSmithyContext.js",
-    "streamer/node/node_modules/@smithy/util-middleware/dist-es",
-    "wrapper/stunnel_setup.sh",
-    "cache_depth.json",
     "streamer/node/node_modules/@smithy/config-resolver/README.md",
     "streamer/node/node_modules/@aws-crypto/sha256-js/README.md",
     "streamer/node/node_modules/@smithy/credential-provider-imds/README.md",
@@ -212,24 +230,6 @@
     "streamer/node/node_modules/@smithy/util-body-length-node/README.md",
     "streamer/node/node_modules/bowser/README.md",
     "streamer/node/node_modules/bowser/CHANGELOG.md",
-    "streamer/node/node_modules/@smithy/middleware-stack/README.md",
-    "streamer/node/node_modules/@smithy/hash-node/README.md",
-    "streamer/node/node_modules/@smithy/util-base64/README.md",
-    "streamer/node/node_modules/@smithy/url-parser/README.md",
-    "streamer/node/node_modules/@smithy/node-http-handler/README.md",
-    "streamer/node/node_modules/@smithy/middleware-content-length/README.md",
-    "streamer/node/node_modules/@smithy/fetch-http-handler/README.md",
-    "streamer/node/node_modules/@smithy/protocol-http/README.md",
-    "streamer/node/node_modules/@smithy/invalid-dependency/README.md",
-    "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/msk_tut_log.png",
-    "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/deploy-console.png",
-    "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/msk_tut_network.png",
-    "doc/AWS-MSK-DOC/Lambda에서의 모든 Amazon MSK 이벤트 소스 구성 파라미터 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/Lambda에서 교차 계정 이벤트 소스 매핑 생성 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/Amazon MSK 이벤트 소스에 대한 Lambda 이벤트 소스 매핑 생성 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/Lambda에서 Amazon MSK 클러스터 인증 방법 구성 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/Lambda용 Amazon MSK 이벤트 소스 구성 - AWS Lambda_files/aws_logo_dark.svg",
-    "doc/AWS-MSK-DOC/Lambda 실행 역할 권한 구성 - AWS Lambda_files/aws_logo_dark.svg"
+    "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/aws_logo_dark.svg"
   ]
 }

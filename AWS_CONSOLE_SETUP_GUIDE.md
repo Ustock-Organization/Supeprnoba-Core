@@ -807,4 +807,284 @@ ws.onmessage = (event) => {
 
 ---
 
+## 9. 일일 백업 인프라 세팅 (차트 데이터용)
+
+### 9.1 S3 버킷 생성
+
+**S3** → **Create bucket**
+
+| 설정 | 값 |
+|---|---|
+| Bucket name | `supernoba-market-data` |
+| Region | ap-northeast-2 |
+| Object Ownership | ACLs disabled |
+| Block Public Access | 모두 활성화 ✅ |
+| Versioning | Disabled (비용 절감) |
+
+**폴더 구조:**
+```
+supernoba-market-data/
+├── daydata/
+│   └── {SYMBOL}/
+│       └── {YYYYMMDD}.json
+└── trades/
+    └── {SYMBOL}/
+        └── {YYYYMMDD}.json
+```
+
+### 9.2 DynamoDB 테이블 생성
+
+**DynamoDB** → **Create table**
+
+#### 테이블 1: symbol_history (OHLC 데이터)
+
+| 설정 | 값 |
+|---|---|
+| Table name | `symbol_history` |
+| Partition key | `symbol` (String) |
+| Sort key | `date` (String) |
+| Table class | Standard |
+| Capacity mode | On-demand |
+
+**항목 예시:**
+```json
+{
+  "symbol": "TEST",
+  "date": "20251210",
+  "open": 100,
+  "high": 108,
+  "low": 99,
+  "close": 105,
+  "change_rate": 5.0,
+  "timestamp": 1733900000000
+}
+```
+
+#### 테이블 2: trade_history (체결 내역)
+
+| 설정 | 값 |
+|---|---|
+| Table name | `trade_history` |
+| Partition key | `symbol` (String) |
+| Sort key | `tradeId` (String) |
+| Table class | Standard |
+| Capacity mode | On-demand |
+
+**GSI 추가 (날짜별 조회용):**
+- Index name: `date-index`
+- Partition key: `symbol`
+- Sort key: `date` (String)
+
+### 9.3 EventBridge 규칙 생성
+
+**EventBridge** → **Rules** → **Create rule**
+
+| 설정 | 값 |
+|---|---|
+| Name | `daily-backup-trigger` |
+| Event bus | default |
+| Rule type | Schedule |
+
+**Schedule:**
+- Schedule type: Cron expression
+- Cron: `0 15 * * ? *` (UTC 15:00 = KST 00:00)
+
+**Target:**
+- Target type: AWS Lambda function
+- Function: `daily-backup-handler`
+
+### 9.4 daily-backup-handler Lambda 생성
+
+**Lambda** → **Functions** → **Create function**
+
+| 설정 | 값 |
+|---|---|
+| Function name | `daily-backup-handler` |
+| Runtime | Node.js 20.x |
+| Architecture | arm64 |
+| Execution role | 새 역할 생성 |
+
+**IAM 역할 추가 권한:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::supernoba-market-data/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-northeast-2:*:table/symbol_history",
+        "arn:aws:dynamodb:ap-northeast-2:*:table/trade_history"
+      ]
+    }
+  ]
+}
+```
+
+**환경 변수:**
+
+| Key | Value |
+|---|---|
+| `VALKEY_HOST` | Depth Cache 엔드포인트 |
+| `VALKEY_PORT` | 6379 |
+| `S3_BUCKET` | supernoba-market-data |
+| `DYNAMODB_TABLE_OHLC` | symbol_history |
+
+**VPC 설정:** Valkey 접근을 위해 VPC 설정 필요 + `AWSLambdaVPCAccessExecutionRole` 정책 필요
+
+**Lambda 코드:**
+
+```javascript
+// daily-backup-handler Lambda
+// 매일 00:00 KST에 EventBridge 트리거로 실행
+// 전일 데이터를 S3와 DynamoDB에 저장
+
+import Redis from 'ioredis';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+
+// 환경변수
+const VALKEY_HOST = process.env.VALKEY_HOST;
+const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
+const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
+const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE_OHLC || 'symbol_history';
+
+// Valkey 연결
+const valkey = new Redis({
+  host: VALKEY_HOST,
+  port: VALKEY_PORT,
+  connectTimeout: 5000,
+});
+
+// AWS 클라이언트
+const s3Client = new S3Client({ region: 'ap-northeast-2' });
+const dynamoClient = new DynamoDBClient({ region: 'ap-northeast-2' });
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+
+export const handler = async (event) => {
+  console.log('Daily backup started:', new Date().toISOString());
+  
+  try {
+    // 모든 prev:* 키 조회
+    let cursor = '0';
+    const prevKeys = [];
+    do {
+      const [newCursor, keys] = await valkey.scan(cursor, 'MATCH', 'prev:*', 'COUNT', 100);
+      cursor = newCursor;
+      prevKeys.push(...keys);
+    } while (cursor !== '0');
+    
+    console.log(`Found ${prevKeys.length} symbols`);
+    
+    for (const key of prevKeys) {
+      const symbol = key.replace('prev:', '');
+      const dataJson = await valkey.get(key);
+      
+      if (dataJson) {
+        const prevData = JSON.parse(dataJson);
+        const date = prevData.date?.toString();
+        
+        // S3 저장
+        await s3Client.send(new PutObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: `daydata/${symbol}/${date}.json`,
+          Body: JSON.stringify(prevData, null, 2),
+          ContentType: 'application/json',
+        }));
+        
+        // DynamoDB 저장
+        await docClient.send(new PutCommand({
+          TableName: DYNAMODB_TABLE,
+          Item: { symbol, date, ...prevData, timestamp: Date.now() },
+        }));
+        
+        console.log(`Saved: ${symbol}/${date}`);
+      }
+    }
+    
+    return { statusCode: 200, body: `Backed up ${prevKeys.length} symbols` };
+  } catch (error) {
+    console.error('Backup error:', error);
+    return { statusCode: 500, body: error.message };
+  } finally {
+    await valkey.quit();
+  }
+};
+```
+
+### 9.5 Lambda Layer (의존성)
+
+```bash
+mkdir nodejs && cd nodejs
+npm init -y
+npm install ioredis @aws-sdk/client-s3 @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+cd ..
+zip -r daily-backup-layer.zip nodejs
+```
+
+**Lambda** → **Layers** → **Create layer** → ZIP 업로드
+
+---
+
+## 10. 차트 데이터 API
+
+클라이언트에서 차트 데이터 요청 시 DynamoDB에서 조회:
+
+### 10.1 차트 데이터 Lambda
+
+```javascript
+// chart-data-handler Lambda
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
+
+const dynamoClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+
+export const handler = async (event) => {
+  const { symbol, startDate, endDate } = event.queryStringParameters;
+  
+  const result = await docClient.send(new QueryCommand({
+    TableName: 'symbol_history',
+    KeyConditionExpression: 'symbol = :sym AND #d BETWEEN :start AND :end',
+    ExpressionAttributeNames: { '#d': 'date' },
+    ExpressionAttributeValues: {
+      ':sym': symbol,
+      ':start': startDate,
+      ':end': endDate,
+    },
+  }));
+  
+  return {
+    statusCode: 200,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(result.Items),
+  };
+};
+```
+
+### 10.2 API Gateway 연결
+
+**/chart** → **GET** → Lambda 통합
+
+**쿼리 예시:**
+```
+GET /chart?symbol=TEST&startDate=20251201&endDate=20251210
+```
+
+---
+
 *작성일: 2025-12-05*
+*업데이트: 2025-12-11 - 일일 백업 및 차트 데이터 섹션 추가*
+

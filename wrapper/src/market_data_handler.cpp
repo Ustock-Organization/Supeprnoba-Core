@@ -5,6 +5,7 @@
 #include "metrics.h"
 #include <book/depth_level.h>
 #include <nlohmann/json.hpp>
+#include <cmath>
 
 namespace aws_wrapper {
 
@@ -108,6 +109,30 @@ void MarketDataHandler::on_trade(const OrderBook* book,
     
     Metrics::instance().incrementTradesExecuted();
     
+    // 00:00 리셋 확인 및 OHLC 업데이트
+    checkDayReset(symbol);
+    DayData& day = getDayData(symbol);
+    
+    // 시가 설정 (당일 첫 체결)
+    if (day.open_price == 0) {
+        day.open_price = price;
+        day.high_price = price;
+        day.low_price = price;
+    }
+    
+    // 고가/저가 업데이트
+    if (price > day.high_price) day.high_price = price;
+    if (price < day.low_price) day.low_price = price;
+    
+    // 현재가 및 변동률 계산
+    day.last_price = price;
+    if (day.open_price > 0) {
+        day.change_rate = ((double)price - (double)day.open_price) / (double)day.open_price * 100.0;
+    }
+    
+    // Ticker 캐시 업데이트 (Sub 데이터용)
+    updateTickerCache(symbol, price);
+    
     if (producer_) {
         producer_->publishTrade(symbol, qty, price);
     }
@@ -152,6 +177,14 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     depth_json["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
+    // 변동률 추가 (Main 데이터에도 포함)
+    auto it = symbol_day_data_.find(symbol);
+    if (it != symbol_day_data_.end()) {
+        depth_json["c"] = std::round(it->second.change_rate * 100) / 100.0;
+        depth_json["yc"] = std::round(it->second.prev_change_rate * 100) / 100.0;
+        depth_json["p"] = it->second.last_price;  // 현재가도 추가
+    }
+    
     // Valkey에 depth 캐시 저장 (Streaming Server가 읽어감)
     Logger::debug("Depth cache check - redis_:", redis_ ? "exists" : "null", 
                   "connected:", (redis_ && redis_->isConnected()) ? "yes" : "no");
@@ -178,4 +211,74 @@ void MarketDataHandler::on_bbo_change(const OrderBook* book,
     on_depth_change(book, depth);
 }
 
+// === Day Data 관리 ===
+
+DayData& MarketDataHandler::getDayData(const std::string& symbol) {
+    return symbol_day_data_[symbol];
+}
+
+int MarketDataHandler::getCurrentTradingDay() const {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&t);
+    return (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
+}
+
+void MarketDataHandler::checkDayReset(const std::string& symbol) {
+    int today = getCurrentTradingDay();
+    DayData& day = symbol_day_data_[symbol];
+    
+    if (day.trading_day != today) {
+        // 전일 데이터 저장 (Valkey에 백업)
+        if (day.trading_day > 0 && day.open_price > 0) {
+            savePrevDayData(symbol, day);
+        }
+        
+        // 전일 변동률 보존 후 리셋
+        double prev_change = day.change_rate;
+        day = DayData{};
+        day.trading_day = today;
+        day.prev_change_rate = prev_change;
+        
+        Logger::info("Day reset for", symbol, "new trading day:", today);
+    }
+}
+
+void MarketDataHandler::savePrevDayData(const std::string& symbol, const DayData& data) {
+    if (!redis_ || !redis_->isConnected()) return;
+    
+    nlohmann::json prev;
+    prev["symbol"] = symbol;
+    prev["date"] = data.trading_day;
+    prev["open"] = data.open_price;
+    prev["high"] = data.high_price;
+    prev["low"] = data.low_price;
+    prev["close"] = data.last_price;
+    prev["change_rate"] = data.change_rate;
+    
+    // Valkey에 전일 데이터 저장
+    redis_->set("prev:" + symbol, prev.dump());
+    Logger::info("Saved prev day data:", symbol, "change:", data.change_rate, "%");
+}
+
+void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t price) {
+    if (!redis_ || !redis_->isConnected()) return;
+    
+    const DayData& day = symbol_day_data_[symbol];
+    
+    // Ticker JSON (Sub 데이터용)
+    nlohmann::json ticker;
+    ticker["e"] = "t";  // event = ticker
+    ticker["s"] = symbol;
+    ticker["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    ticker["p"] = price;
+    ticker["c"] = std::round(day.change_rate * 100) / 100.0;  // 소수점 2자리
+    ticker["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
+    
+    redis_->set("ticker:" + symbol, ticker.dump());
+    Logger::debug("Ticker saved:", symbol, "price:", price, "change:", day.change_rate, "%");
+}
+
 } // namespace aws_wrapper
+

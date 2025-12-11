@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
 
-// 새 ElastiCache (Non-TLS)
-const VALKEY_TLS = process.env.VALKEY_TLS === 'true'; // 기본값 false
+// Valkey 연결 설정
+const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
 
 const valkey = new Redis({
   host: process.env.VALKEY_HOST || 'supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com',
@@ -15,24 +15,56 @@ valkey.on('error', (err) => {
   console.error('Redis connection error:', err.message);
 });
 
-// subscribe-handler Lambda
+/**
+ * subscribe-handler Lambda
+ * 
+ * 요청 형식:
+ * - Main 구독: {"action":"subscribe","main":"TEST"}
+ * - Sub 구독: {"action":"subscribe","sub":["AAPL","GOOGL"]}
+ * - 복합: {"action":"subscribe","main":"TEST","sub":["AAPL","GOOGL"]}
+ * 
+ * 한 클라이언트(connectionId)는:
+ * - Main: 1개만 (변경 시 이전 main 자동 해제)
+ * - Sub: 무제한
+ */
 export const handler = async (event) => {
   const connectionId = event.requestContext.connectionId;
   const body = JSON.parse(event.body);
-  const { symbols } = body; // ["AAPL", "GOOGL"]
+  const { main, sub } = body;
   
-  console.log(`Subscribe request from ${connectionId}: ${symbols?.join(', ')}`);
+  console.log(`Subscribe request from ${connectionId}: main=${main}, sub=${JSON.stringify(sub)}`);
   
   try {
-    for (const symbol of symbols || []) {
-      // 심볼 구독자 추가
-      const result = await valkey.sadd(`symbol:${symbol}:subscribers`, connectionId);
-      // 활성 심볼 목록에 추가 (Streamer가 조회)
-      await valkey.sadd('active:symbols', symbol);
-      console.log(`Added ${connectionId} to symbol:${symbol}:subscribers, result: ${result}`);
+    // === Main 구독 처리 (1개만) ===
+    if (main) {
+      // 기존 main 구독 해제
+      const prevMain = await valkey.get(`conn:${connectionId}:main`);
+      if (prevMain && prevMain !== main) {
+        await valkey.srem(`symbol:${prevMain}:main`, connectionId);
+        console.log(`Released prev main subscription: ${prevMain}`);
+      }
+      
+      // 새 main 등록
+      await valkey.set(`conn:${connectionId}:main`, main);
+      await valkey.sadd(`symbol:${main}:main`, connectionId);
+      await valkey.sadd('active:symbols', main);
+      console.log(`Main subscribed: ${main}`);
     }
     
-    return { statusCode: 200, body: JSON.stringify({ subscribed: symbols }) };
+    // === Sub 구독 처리 (무제한) ===
+    for (const symbol of sub || []) {
+      await valkey.sadd(`symbol:${symbol}:sub`, connectionId);
+      await valkey.sadd('active:symbols', symbol);
+      console.log(`Sub subscribed: ${symbol}`);
+    }
+    
+    return { 
+      statusCode: 200, 
+      body: JSON.stringify({ 
+        main: main || null, 
+        sub: sub || [] 
+      }) 
+    };
   } catch (error) {
     console.error('Redis error:', error.message);
     return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
