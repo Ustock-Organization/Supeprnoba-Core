@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/FRONTEND_INTEGRATION_GUIDE.md",
+                "file": "AWS_ARCHITECTURE.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "FRONTEND_INTEGRATION_GUIDE"
+              "title": "AWS_ARCHITECTURE"
             }
           }
         ]
@@ -185,11 +185,17 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "WINDOWS_BUILD_GUIDE.md",
+    "README.md",
+    "PERFORMANCE.md",
+    "AWS_CONSOLE_SETUP_GUIDE.md",
+    "AWS_ARCHITECTURE.md",
+    "docs/FRONTEND_INTEGRATION_GUIDE.md",
+    "docs/Frontend_websocket.js",
+    "docs/Frontend_websocket",
     "wrapper/src/dynamodb_client.cpp",
     "wrapper/include/dynamodb_client.h",
     "doc/OHLCV_dataformat.md",
-    "AWS_ARCHITECTURE.md",
-    "docs/FRONTEND_INTEGRATION_GUIDE.md",
     "docs",
     "lambda/AWScandle-aggregator/index.mjs",
     "lambda/AWScandle-aggregator",
@@ -197,13 +203,7 @@
     "lambda/AWSchart-data-handler/index.mjs",
     "lambda/AWSchart-data-handler",
     "lambda/AWStrades-backup-handler/index.mjs",
-    "lambda/AWStrades-backup-handler",
-    "AWS_CONSOLE_SETUP_GUIDE.md",
-    "PERFORMANCE.md",
-    "WINDOWS_BUILD_GUIDE.md",
     "README_ORDER_ENTRY.md",
-    "test/web/ticker-board.html",
-    "lambda/AWSdaily-backup-handler/index.mjs",
     "doc/api/README.md",
     "doc/Images/MarketApplication.svg",
     "doc/Images/MarketApplication.png",

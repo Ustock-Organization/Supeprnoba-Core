@@ -5,19 +5,13 @@
 #include "grpc_service.h"
 #include "redis_client.h"
 #include "metrics.h"
-#include <iostream>
-#include <csignal>
-#include <nlohmann/json.hpp>
-
-#ifdef USE_KINESIS
 #include "kinesis_consumer.h"
 #include "kinesis_producer.h"
 #include "dynamodb_client.h"
+#include <iostream>
+#include <csignal>
+#include <nlohmann/json.hpp>
 #include <aws/core/Aws.h>
-#else
-#include "kafka_consumer.h"
-#include "kafka_producer.h"
-#endif
 
 using namespace aws_wrapper;
 
@@ -32,7 +26,7 @@ void printBanner() {
     std::cout << R"(
 ╔═══════════════════════════════════════════════════════════╗
 ║           Liquibook AWS Matching Engine                   ║
-║                    C++ Native Wrapper                     ║
+║                 Kinesis + DynamoDB                        ║
 ╚═══════════════════════════════════════════════════════════╝
 )" << std::endl;
 }
@@ -40,14 +34,10 @@ void printBanner() {
 int main(int argc, char* argv[]) {
     printBanner();
     
-#ifdef USE_KINESIS
     // AWS SDK 초기화
     Aws::SDKOptions options;
     Aws::InitAPI(options);
-    Logger::info("Using Kinesis for streaming");
-#else
-    Logger::info("Using Kafka for streaming");
-#endif
+    Logger::info("AWS SDK initialized - Using Kinesis");
     
     // 시그널 핸들러 설정
     std::signal(SIGINT, signalHandler);
@@ -60,30 +50,19 @@ int main(int argc, char* argv[]) {
     else if (log_level == "ERROR") Logger::setLevel(LogLevel::ERROR);
     
     // 환경변수에서 설정 로드
-#ifdef USE_KINESIS
     const auto stream_name = Config::get("KINESIS_ORDERS_STREAM", "supernoba-orders");
     const auto aws_region = Config::get("AWS_REGION", "ap-northeast-2");
-#else
-    const auto kafka_brokers = Config::get(Config::KAFKA_BROKERS, "localhost:9092");
-    const auto kafka_topic = Config::get(Config::KAFKA_ORDER_TOPIC, "orders");
-    const auto kafka_group = Config::get(Config::KAFKA_GROUP_ID, "matching-engine");
-#endif
     const auto grpc_port = Config::getInt(Config::GRPC_PORT, 50051);
     const auto redis_host = Config::get(Config::REDIS_HOST, "localhost");
     const auto redis_port = Config::getInt(Config::REDIS_PORT, 6379);
-    // Depth 캐시 (실시간 호가용 - 별도 인스턴스)
     const auto depth_cache_host = Config::get("DEPTH_CACHE_HOST", redis_host);
     const auto depth_cache_port = Config::getInt("DEPTH_CACHE_PORT", redis_port);
+    const auto dynamodb_table = Config::get("DYNAMODB_TRADE_TABLE", "trade_history");
     
     Logger::info("=== Configuration ===");
-#ifdef USE_KINESIS
     Logger::info("Kinesis Stream:", stream_name);
     Logger::info("AWS Region:", aws_region);
-#else
-    Logger::info("Kafka Brokers:", kafka_brokers);
-    Logger::info("Order Topic:", kafka_topic);
-    Logger::info("Group ID:", kafka_group);
-#endif
+    Logger::info("DynamoDB Table:", dynamodb_table);
     Logger::info("gRPC Port:", grpc_port);
     Logger::info("Redis (snapshot):", redis_host, ":", redis_port);
     Logger::info("Redis (depth):", depth_cache_host, ":", depth_cache_port);
@@ -104,12 +83,10 @@ int main(int argc, char* argv[]) {
             Logger::warn("Redis (depth) connection failed - continuing without depth cache");
         }
         
-#ifdef USE_KINESIS
         // Kinesis Producer 생성
         KinesisProducer producer(aws_region);
         
         // DynamoDB Client 생성 (체결 내역 저장용)
-        const auto dynamodb_table = Config::get("DYNAMODB_TRADE_TABLE", "trade_history");
         DynamoDBClient dynamodb(aws_region, dynamodb_table);
         bool dynamodb_connected = dynamodb.connect();
         if (!dynamodb_connected) {
@@ -117,18 +94,10 @@ int main(int argc, char* argv[]) {
         } else {
             Logger::info("DynamoDB connected:", dynamodb_table);
         }
-#else
-        // Kafka Producer 생성
-        KafkaProducer producer(kafka_brokers);
-#endif
         
         // 핸들러 및 엔진 생성
-#ifdef USE_KINESIS
         MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr, 
                                   dynamodb_connected ? &dynamodb : nullptr);
-#else
-        MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr);
-#endif
         EngineCore engine(&handler);
         
         // === 시작 시 Redis에서 스냅샷 복원 ===
@@ -146,13 +115,8 @@ int main(int argc, char* argv[]) {
             Logger::info("Restored", snapshot_keys.size(), "orderbooks from Redis");
         }
         
-#ifdef USE_KINESIS
         // Kinesis Consumer 시작
         KinesisConsumer consumer(stream_name, aws_region);
-#else
-        // Kafka Consumer 시작
-        KafkaConsumer consumer(kafka_brokers, kafka_topic, kafka_group);
-#endif
         consumer.setCallback([&engine](const std::string& key,
                                         const std::string& value) {
             Metrics::instance().incrementOrdersReceived();
@@ -174,68 +138,58 @@ int main(int argc, char* argv[]) {
                                         qty_delta, new_price);
                 }
             } catch (const std::exception& e) {
-                Logger::error("Error processing message:", e.what());
+                Logger::error("Failed to process order:", e.what());
+                Metrics::instance().incrementOrdersFailed();
             }
         });
+        
+        // gRPC 서비스 시작
+        GrpcService grpc_service(&engine, redis_connected ? &redis : nullptr, grpc_port);
+        grpc_service.start();
+        
+        // Consumer 시작
         consumer.start();
         
-        // gRPC 서버 시작
-        GrpcService grpc_service(&engine, &redis);
-        grpc_service.start(grpc_port);
-        
         Logger::info("=== Engine Running ===");
-        Logger::info("Press Ctrl+C to stop");
+        Logger::info("Listening for orders on:", stream_name);
+        Logger::info("gRPC server on port:", grpc_port);
         
-        // 타이머 변수
-        auto last_report = std::chrono::steady_clock::now();
+        // 메인 루프: 스냅샷 저장
         auto last_snapshot = std::chrono::steady_clock::now();
-        const int SNAPSHOT_INTERVAL_SECONDS = 10;
-        const int METRICS_INTERVAL_SECONDS = 30;
+        auto last_metrics = std::chrono::steady_clock::now();
         
-        // 메인 루프
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             
             auto now = std::chrono::steady_clock::now();
             
-            // 10초마다 자동 스냅샷 저장
+            // 10초마다 스냅샷 저장
             if (redis_connected && 
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    now - last_snapshot).count() >= SNAPSHOT_INTERVAL_SECONDS) {
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_snapshot).count() >= 10) {
                 
-                auto symbols = engine.getAllSymbols();
+                auto symbols = engine.getSymbols();
                 for (const auto& symbol : symbols) {
-                    auto snapshot = engine.snapshotOrderBook(symbol);
+                    auto snapshot = engine.getOrderBookSnapshot(symbol);
                     if (!snapshot.empty()) {
-                        redis.set("snapshot:" + symbol, snapshot);
+                        redis.saveSnapshot(symbol, snapshot);
                     }
                 }
-                if (!symbols.empty()) {
-                    Logger::debug("Auto-saved", symbols.size(), "orderbook snapshots to Redis");
-                }
                 last_snapshot = now;
+                Logger::debug("Snapshots saved for", symbols.size(), "symbols");
             }
             
-            // 30초마다 메트릭 리포트
-            if (std::chrono::duration_cast<std::chrono::seconds>(
-                    now - last_report).count() >= METRICS_INTERVAL_SECONDS) {
-                Metrics::instance().setSymbolCount(engine.getSymbolCount());
-                Logger::info("Metrics:", Metrics::instance().toJson());
-                last_report = now;
+            // 30초마다 메트릭 로깅
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_metrics).count() >= 30) {
+                auto& m = Metrics::instance();
+                Logger::info("=== Metrics ===");
+                Logger::info("Orders received:", m.getOrdersReceived());
+                Logger::info("Orders accepted:", m.getOrdersAccepted());
+                Logger::info("Orders rejected:", m.getOrdersRejected());
+                Logger::info("Orders failed:", m.getOrdersFailed());
+                Logger::info("Fills published:", m.getFillsPublished());
+                Logger::info("===============");
+                last_metrics = now;
             }
-        }
-        
-        // === 종료 전 최종 스냅샷 저장 ===
-        if (redis_connected) {
-            Logger::info("Saving final snapshots before shutdown...");
-            auto symbols = engine.getAllSymbols();
-            for (const auto& symbol : symbols) {
-                auto snapshot = engine.snapshotOrderBook(symbol);
-                if (!snapshot.empty()) {
-                    redis.set("snapshot:" + symbol, snapshot);
-                }
-            }
-            Logger::info("Saved", symbols.size(), "snapshots");
         }
         
         // 정리
@@ -248,14 +202,10 @@ int main(int argc, char* argv[]) {
         
     } catch (const std::exception& e) {
         Logger::error("Fatal error:", e.what());
-#ifdef USE_KINESIS
         Aws::ShutdownAPI(options);
-#endif
         return 1;
     }
     
-#ifdef USE_KINESIS
     Aws::ShutdownAPI(options);
-#endif
     return 0;
 }
