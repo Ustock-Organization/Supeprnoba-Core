@@ -139,13 +139,13 @@ int main(int argc, char* argv[]) {
                 }
             } catch (const std::exception& e) {
                 Logger::error("Failed to process order:", e.what());
-                Metrics::instance().incrementOrdersFailed();
+                Metrics::instance().incrementOrdersRejected();
             }
         });
         
         // gRPC 서비스 시작
-        GrpcService grpc_service(&engine, redis_connected ? &redis : nullptr, grpc_port);
-        grpc_service.start();
+        GrpcService grpc_service(&engine, redis_connected ? &redis : nullptr);
+        grpc_service.start(grpc_port);
         
         // Consumer 시작
         consumer.start();
@@ -167,9 +167,9 @@ int main(int argc, char* argv[]) {
             if (redis_connected && 
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_snapshot).count() >= 10) {
                 
-                auto symbols = engine.getSymbols();
+                auto symbols = engine.getAllSymbols();
                 for (const auto& symbol : symbols) {
-                    auto snapshot = engine.getOrderBookSnapshot(symbol);
+                    auto snapshot = engine.snapshotOrderBook(symbol);
                     if (!snapshot.empty()) {
                         redis.saveSnapshot(symbol, snapshot);
                     }
@@ -184,9 +184,7 @@ int main(int argc, char* argv[]) {
                 Logger::info("=== Metrics ===");
                 Logger::info("Orders received:", m.getOrdersReceived());
                 Logger::info("Orders accepted:", m.getOrdersAccepted());
-                Logger::info("Orders rejected:", m.getOrdersRejected());
-                Logger::info("Orders failed:", m.getOrdersFailed());
-                Logger::info("Fills published:", m.getFillsPublished());
+                Logger::info("Trades executed:", m.getTradesExecuted());
                 Logger::info("===============");
                 last_metrics = now;
             }
