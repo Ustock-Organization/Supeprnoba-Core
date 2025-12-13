@@ -1,4 +1,4 @@
-# Liquibook AWS Wrapper - Kinesis Only
+# Liquibook AWS Wrapper - Kinesis + DynamoDB
 cmake_minimum_required(VERSION 3.20)
 project(liquibook_aws_wrapper VERSION 1.0.0 LANGUAGES CXX)
 
@@ -14,20 +14,15 @@ set(LIQUIBOOK_ROOT "${CMAKE_SOURCE_DIR}/..")
 include_directories(${LIQUIBOOK_ROOT}/src)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# 공통 의존성
+# 공통 의존성 (vcpkg 통해 자동 제공)
 find_package(gRPC CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
-# AWS SDK
-set(AWSSDK_ROOT_DIR "$ENV{HOME}/vcpkg/installed/x64-linux")
-list(APPEND CMAKE_PREFIX_PATH "${AWSSDK_ROOT_DIR}")
-
-find_package(aws-cpp-sdk-core CONFIG REQUIRED)
-find_package(aws-cpp-sdk-kinesis CONFIG REQUIRED)
-find_package(aws-cpp-sdk-dynamodb CONFIG REQUIRED)
+# AWS SDK (vcpkg 통해 설치)
+find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis dynamodb)
 message(STATUS "Building with Kinesis + DynamoDB support")
 
 # Proto 파일 컴파일
@@ -81,7 +76,5 @@ target_link_libraries(matching_engine PRIVATE
     OpenSSL::SSL
     OpenSSL::Crypto
     CURL::libcurl
-    aws-cpp-sdk-core
-    aws-cpp-sdk-kinesis
-    aws-cpp-sdk-dynamodb
+    ${AWSSDK_LINK_LIBRARIES}
 )
