@@ -1,6 +1,6 @@
-// Streaming Server v2 - 50ms/500ms 이중 폴링 + 캔들 데이터 지원
-// 50ms: 실시간 사용자 (depth, candle)
-// 500ms: 익명 사용자 (캐시 사용)
+// Streaming Server v3 - 로그인/익명 사용자 분류 지원
+// 50ms: 로그인 사용자 (realtime:connections 기반)
+// 500ms: 익명 사용자
 
 import Redis from 'ioredis';
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
@@ -13,16 +13,16 @@ const WEBSOCKET_ENDPOINT = process.env.WEBSOCKET_ENDPOINT;
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
-const FAST_POLL_MS = 50;   // 실시간 사용자
+const FAST_POLL_MS = 50;   // 로그인 사용자
 const SLOW_POLL_MS = 500;  // 익명 사용자
 
 function debug(...args) {
   if (DEBUG_MODE) console.log('[DEBUG]', ...args);
 }
 
-console.log('=== Streaming Server v2 ===');
+console.log('=== Streaming Server v3 ===');
 console.log(`Valkey: ${VALKEY_HOST}:${VALKEY_PORT}`);
-console.log(`Polling: ${FAST_POLL_MS}ms (realtime) / ${SLOW_POLL_MS}ms (anonymous)`);
+console.log(`Polling: ${FAST_POLL_MS}ms (logged-in) / ${SLOW_POLL_MS}ms (anonymous)`);
 
 // Valkey 연결
 const valkey = new Redis({
@@ -49,6 +49,7 @@ let candleCache = {};   // symbol -> candleData
 
 // 상태 추적
 let prevSymbolCount = 0;
+let prevRealtimeCount = 0;
 
 // === 유틸리티 ===
 async function sendToConnection(connectionId, data) {
@@ -73,8 +74,14 @@ async function cleanupConnection(connectionId) {
     await valkey.srem(`symbol:${mainSymbol}:subscribers`, connectionId);
     await valkey.del(`conn:${connectionId}:main`);
   }
+  await valkey.srem('realtime:connections', connectionId);
   await valkey.del(`ws:${connectionId}`);
   debug(`Cleaned stale connection: ${connectionId}`);
+}
+
+// === 연결 유형 확인 ===
+async function isRealtimeConnection(connectionId) {
+  return await valkey.sismember('realtime:connections', connectionId);
 }
 
 // === 데이터 조회 ===
@@ -103,50 +110,74 @@ async function checkCandleClose(symbol) {
   return null;
 }
 
-// === 브로드캐스트 ===
-async function broadcastToSubscribers(symbol, mainSubs, subSubs, data) {
-  const { depthJson, tickerJson, candle, closedCandle } = data;
+// === 브로드캐스트 (연결 유형별 필터링) ===
+async function broadcastToSubscribers(symbol, mainSubs, subSubs, data, realtimeOnly = false) {
+  const { depthJson, tickerJson, candle, closedCandle, fromCache } = data;
+  
+  // 로그인/익명 필터링
+  let filteredMainSubs = mainSubs;
+  let filteredSubSubs = subSubs;
+  
+  if (realtimeOnly) {
+    // 50ms 폴링: 로그인 사용자만
+    const realtimeSet = await valkey.smembers('realtime:connections');
+    const realtimeCheck = new Set(realtimeSet);
+    filteredMainSubs = mainSubs.filter(id => realtimeCheck.has(id));
+    filteredSubSubs = subSubs.filter(id => realtimeCheck.has(id));
+  } else {
+    // 500ms 폴링: 익명 사용자만
+    const realtimeSet = await valkey.smembers('realtime:connections');
+    const realtimeCheck = new Set(realtimeSet);
+    filteredMainSubs = mainSubs.filter(id => !realtimeCheck.has(id));
+    filteredSubSubs = subSubs.filter(id => !realtimeCheck.has(id));
+  }
   
   // Main 구독자 → depth + candle
-  if (mainSubs.length > 0) {
+  if (filteredMainSubs.length > 0) {
     const tasks = [];
     
     if (depthJson) {
-      tasks.push(...mainSubs.map(id => sendToConnection(id, depthJson)));
+      tasks.push(...filteredMainSubs.map(id => sendToConnection(id, depthJson)));
     }
     
     if (candle && candle.t) {
       const candleMsg = JSON.stringify({ e: 'candle', tf: '1m', s: symbol, ...candle });
-      tasks.push(...mainSubs.map(id => sendToConnection(id, candleMsg)));
+      tasks.push(...filteredMainSubs.map(id => sendToConnection(id, candleMsg)));
     }
     
     if (closedCandle) {
       const closeMsg = JSON.stringify({ e: 'candle_close', tf: '1m', s: symbol, ...closedCandle });
-      tasks.push(...mainSubs.map(id => sendToConnection(id, closeMsg)));
+      tasks.push(...filteredMainSubs.map(id => sendToConnection(id, closeMsg)));
     }
     
     await Promise.allSettled(tasks);
-    debug(`${symbol} sent to ${mainSubs.length} main subs`);
+    debug(`${symbol} sent to ${filteredMainSubs.length} ${realtimeOnly ? 'realtime' : 'anonymous'} main subs`);
   }
   
   // Sub 구독자 → ticker only
-  if (subSubs.length > 0 && tickerJson) {
+  if (filteredSubSubs.length > 0 && tickerJson) {
     await Promise.allSettled(
-      subSubs.map(id => sendToConnection(id, tickerJson))
+      filteredSubSubs.map(id => sendToConnection(id, tickerJson))
     );
-    debug(`${symbol} ticker sent to ${subSubs.length} subs`);
+    debug(`${symbol} ticker sent to ${filteredSubSubs.length} ${realtimeOnly ? 'realtime' : 'anonymous'} subs`);
   }
 }
 
-// === 50ms 폴링 (실시간 사용자) ===
+// === 50ms 폴링 (로그인 사용자) ===
 async function fastPollLoop() {
   while (true) {
     try {
       const activeSymbols = await valkey.smembers('subscribed:symbols');
+      const realtimeConns = await valkey.scard('realtime:connections');
       
       if (activeSymbols.length !== prevSymbolCount) {
         console.log(`[INFO] Active symbols: ${prevSymbolCount} → ${activeSymbols.length}`);
         prevSymbolCount = activeSymbols.length;
+      }
+      
+      if (realtimeConns !== prevRealtimeCount) {
+        console.log(`[INFO] Realtime connections: ${prevRealtimeCount} → ${realtimeConns}`);
+        prevRealtimeCount = realtimeConns;
       }
       
       for (const symbol of activeSymbols) {
@@ -166,10 +197,10 @@ async function fastPollLoop() {
         // 봉 마감 체크
         const closedCandle = await checkCandleClose(symbol);
         
-        // 브로드캐스트
+        // 로그인 사용자에게만 브로드캐스트
         await broadcastToSubscribers(symbol, allMain, subSubs, {
           depthJson, tickerJson, candle, closedCandle
-        });
+        }, true);  // realtimeOnly = true
       }
     } catch (error) {
       console.error('Fast poll error:', error.message);
@@ -179,16 +210,34 @@ async function fastPollLoop() {
   }
 }
 
-// === 500ms 폴링 (익명 사용자) - 캐시 사용 ===
+// === 500ms 폴링 (익명 사용자 - 캐시 사용) ===
 async function slowPollLoop() {
   while (true) {
     try {
       const activeSymbols = await valkey.smembers('subscribed:symbols');
       
       for (const symbol of activeSymbols) {
-        // 익명 구독자만 (로그인 유저는 50ms에서 처리)
-        // TODO: 익명/로그인 구분 로직 추가 필요
-        // 현재는 50ms가 모든 구독자 처리하므로 이 루프는 캐시 유지용
+        // 구독자 조회
+        const [mainSubs, subSubs, legacySubs] = await Promise.all([
+          valkey.smembers(`symbol:${symbol}:main`),
+          valkey.smembers(`symbol:${symbol}:sub`),
+          valkey.smembers(`symbol:${symbol}:subscribers`),
+        ]);
+        
+        const allMain = [...new Set([...mainSubs, ...legacySubs])];
+        if (allMain.length === 0 && subSubs.length === 0) continue;
+        
+        // 캐시된 데이터 사용 (Valkey 조회 없음)
+        const depthJson = depthCache[symbol];
+        const tickerJson = tickerCache[symbol];
+        const candle = candleCache[symbol];
+        
+        if (!depthJson && !tickerJson) continue;
+        
+        // 익명 사용자에게만 브로드캐스트
+        await broadcastToSubscribers(symbol, allMain, subSubs, {
+          depthJson, tickerJson, candle, closedCandle: null, fromCache: true
+        }, false);  // realtimeOnly = false
       }
     } catch (error) {
       console.error('Slow poll error:', error.message);
@@ -199,7 +248,7 @@ async function slowPollLoop() {
 }
 
 // === 시작 ===
-console.log('Starting Streaming Server v2...');
+console.log('Starting Streaming Server v3...');
 fastPollLoop();
-// slowPollLoop(); // 필요시 활성화
+slowPollLoop();  // 익명 사용자용 활성화
 console.log('Streaming Server running. Press Ctrl+C to stop.');

@@ -95,6 +95,10 @@ export const handler = async (event) => {
     
     // === 7. ws:connectionId 삭제 ===
     await valkey.del(`ws:${connectionId}`);
+    
+    // === 8. realtime:connections에서 제거 (로그인 사용자였다면) ===
+    await valkey.srem('realtime:connections', connectionId);
+    
     console.log(`Deleted ws:${connectionId}`);
     
     return { statusCode: 200, body: 'Disconnected' };

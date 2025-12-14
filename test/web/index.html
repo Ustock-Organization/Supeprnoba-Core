@@ -32,11 +32,11 @@
             background: var(--bg-dark);
             color: var(--text);
             min-height: 100vh;
-            padding: 20px;
+            padding: 10px;
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
         }
 
@@ -481,6 +481,13 @@
                         <label>User ID (로그인 시)</label>
                         <input type="text" id="wsUserId" placeholder="anonymous" value="test-user-1">
                     </div>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="testModeEnabled" checked style="width: auto;">
+                            <span style="font-size: 0.85rem;">🧪 테스트 모드 (JWT 우회)</span>
+                        </label>
+                        <small style="color: var(--text-muted); font-size: 0.7rem;">체크 시 로그인 사용자로 인식 (50ms 폴링)</small>
+                    </div>
                     <div class="btn-group">
                         <button class="btn btn-success" onclick="connectWS()">연결</button>
                         <button class="btn btn-danger" onclick="disconnectWS()">연결 해제</button>
@@ -489,6 +496,8 @@
                     <div id="connectionInfo" style="margin-top: 10px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.8rem; display: none;">
                         <div><strong>연결 URL:</strong> <span id="connectedUrl">-</span></div>
                         <div><strong>User ID:</strong> <span id="connectedUserId">-</span></div>
+                        <div><strong>테스트 모드:</strong> <span id="connectedTestMode">-</span></div>
+                        <div><strong>Valkey 키:</strong> <code style="background: var(--bg-dark); padding: 2px 6px; border-radius: 3px;" id="connectedValkeyKey">-</code></div>
                         <div><strong>연결 시간:</strong> <span id="connectedTime">-</span></div>
                     </div>
                 </div>
@@ -521,18 +530,79 @@
                     <div id="tickerGrid" style="margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;"></div>
                 </div>
 
-            <!-- Kinesis Admin (미구현) -->
-            <div class="card disabled-section">
-                <h2>Kinesis 관리 (미구현)</h2>
-                <div class="form-group">
-                    <label>Admin Lambda Endpoint</label>
-                    <input type="text" id="adminEndpoint" value="" placeholder="미구현" disabled>
+            <!-- 종목 관리 -->
+            <div class="card" style="border-color: var(--success);">
+                <h2 style="color: var(--success);">📈 종목 관리</h2>
+                <div class="form-group" style="margin-bottom: 8px;">
+                    <label style="font-size: 0.75rem;">Symbol Manager Endpoint</label>
+                    <input type="text" id="symbolEndpoint" value="https://0eeto6kblk.execute-api.ap-northeast-2.amazonaws.com/admin/Supernoba-admin" style="padding: 6px 8px; font-size: 0.8rem;">
                 </div>
-                <div class="tabs">
-                    <div class="tab active">스트림 목록</div>
-                    <div class="tab">스트림 상세</div>
+                <div class="form-group" style="margin-bottom: 8px;">
+                    <label style="font-size: 0.75rem;">Admin API Key</label>
+                    <input type="password" id="adminApiKey" placeholder="관리자 전용" style="padding: 6px 8px; font-size: 0.8rem;">
                 </div>
-                <button class="btn btn-secondary" style="margin-top: 10px;" disabled>미구현</button>
+                
+                <div class="btn-group" style="margin-bottom: 12px;">
+                    <button class="btn btn-primary" onclick="listSymbols()">목록 조회</button>
+                </div>
+                
+                <div id="symbolList" style="background: var(--bg-input); padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 0.8rem; min-height: 60px;">
+                    로딩...
+                </div>
+                
+                <div style="display: flex; gap: 8px;">
+                    <input type="text" id="newSymbol" placeholder="TEST" style="flex: 1; padding: 6px 8px; font-size: 0.85rem;">
+                    <button class="btn btn-success" onclick="addSymbol()">+ 추가</button>
+                    <button class="btn btn-danger" onclick="removeSymbol()">- 삭제</button>
+                </div>
+                
+                <div id="symbolResponse" class="response-box" style="display: none; margin-top: 8px; font-size: 0.75rem;"></div>
+            </div>
+
+            <!-- 캔들 테스트 자동화 -->
+            <div class="card" style="border-color: var(--warning);">
+                <h2 style="color: var(--warning);">🕯️ 캔들 테스트 자동화</h2>
+                <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+                    가격 파동을 생성하여 1분/3분/5분 캔들 형성 테스트
+                </p>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                    <div class="form-group" style="margin: 0;">
+                        <label style="font-size: 0.75rem;">기준가</label>
+                        <input type="number" id="candleBasePrice" value="150" style="padding: 6px 8px;">
+                    </div>
+                    <div class="form-group" style="margin: 0;">
+                        <label style="font-size: 0.75rem;">파동 범위 (±)</label>
+                        <input type="number" id="candleRange" value="50" style="padding: 6px 8px;">
+                    </div>
+                    <div class="form-group" style="margin: 0;">
+                        <label style="font-size: 0.75rem;">파동 주기 (분)</label>
+                        <input type="number" id="candleWavePeriod" value="5" style="padding: 6px 8px;">
+                    </div>
+                    <div class="form-group" style="margin: 0;">
+                        <label style="font-size: 0.75rem;">주문 간격 (ms)</label>
+                        <input type="number" id="candleOrderInterval" value="500" style="padding: 6px 8px;">
+                    </div>
+                </div>
+                
+                <div style="background: var(--bg-input); padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 0.75rem;">
+                    <div>📊 현재 상태: <span id="candleTestStatus" style="color: var(--text-muted);">대기</span></div>
+                    <div>📈 현재 가격: <span id="candleCurrentPrice">-</span></div>
+                    <div>⏱️ 실행 시간: <span id="candleElapsedTime">0:00</span></div>
+                    <div>📦 주문 수: <span id="candleOrderCount">0</span></div>
+                    <div>📍 다음 목표: <span id="candleNextTarget">-</span></div>
+                </div>
+                
+                <div class="btn-group">
+                    <button class="btn" style="background: var(--warning); color: #000; flex: 1;" onclick="startCandleTest()">▶ 시작</button>
+                    <button class="btn btn-danger" style="flex: 1;" onclick="stopCandleTest()">■ 중지</button>
+                </div>
+                
+                <div style="margin-top: 12px; padding: 10px; background: var(--bg-input); border-radius: 6px; font-size: 0.75rem;">
+                    <strong>파동 패턴:</strong><br>
+                    150 → 200 (고가) → 150 → 100 (저가) → 150 (5분 주기 반복)<br>
+                    각 1분봉마다 고/저/시/종 형성됨
+                </div>
             </div>
 
             <!-- 메시지 로그 -->
@@ -559,19 +629,26 @@
         // WebSocket 연결
         let connectedEndpoint = '';
         let connectedUser = '';
+        let connectedTestMode = false;
         
         function connectWS() {
             const endpoint = document.getElementById('wsEndpoint').value;
             const userId = document.getElementById('wsUserId').value || 'anonymous';
+            const testMode = document.getElementById('testModeEnabled').checked;
             
             if (!endpoint) {
                 addLog('ERROR', 'WebSocket 엔드포인트를 입력하세요');
                 return;
             }
 
-            const url = `${endpoint}?userId=${userId}`;
+            // testMode가 체크되면 URL에 testMode=true 추가
+            const url = testMode 
+                ? `${endpoint}?userId=${userId}&testMode=true`
+                : `${endpoint}?userId=${userId}`;
+            
             connectedEndpoint = endpoint;
             connectedUser = userId;
+            connectedTestMode = testMode;
             addLog('INFO', `연결 시도: ${url}`);
 
             try {
@@ -579,8 +656,8 @@
 
                 ws.onopen = () => {
                     updateStatus(true);
-                    showConnectionInfo(endpoint, userId);
-                    addLog('INFO', '✅ WebSocket 연결됨');
+                    showConnectionInfo(endpoint, userId, testMode);
+                    addLog('INFO', testMode ? '✅ WebSocket 연결됨 (테스트 모드 - 50ms)' : '✅ WebSocket 연결됨 (익명 - 500ms)');
                     
                     // 30초 heartbeat 시작
                     heartbeatInterval = setInterval(() => {
@@ -640,11 +717,13 @@
             status.textContent = connected ? 'Connected' : 'Disconnected';
         }
         
-        function showConnectionInfo(endpoint, userId) {
+        function showConnectionInfo(endpoint, userId, testMode) {
             const info = document.getElementById('connectionInfo');
             info.style.display = 'block';
             document.getElementById('connectedUrl').textContent = endpoint;
             document.getElementById('connectedUserId').textContent = userId;
+            document.getElementById('connectedTestMode').textContent = testMode ? '✅ 활성 (50ms 폴링)' : '❌ 비활성 (500ms 폴링)';
+            document.getElementById('connectedValkeyKey').textContent = `user:${userId}:connections`;
             document.getElementById('connectedTime').textContent = new Date().toLocaleString();
         }
         
@@ -1049,6 +1128,234 @@
 
         function clearLogs() {
             document.getElementById('logContainer').innerHTML = '';
+        }
+
+        // ======== 종목 관리 ========
+        async function listSymbols() {
+            const endpoint = document.getElementById('symbolEndpoint').value;
+            document.getElementById('symbolList').textContent = '로딩...';
+            
+            try {
+                const response = await fetch(endpoint, { method: 'GET' });
+                const result = await response.json();
+                
+                if (result.symbols && result.symbols.length > 0) {
+                    document.getElementById('symbolList').innerHTML = 
+                        result.symbols.map(s => `<span style="background: var(--success); color: #000; padding: 2px 8px; border-radius: 4px; margin: 2px; display: inline-block;">${s}</span>`).join('');
+                } else {
+                    document.getElementById('symbolList').textContent = '등록된 종목이 없습니다';
+                }
+                addLog('INFO', `종목 목록: ${result.symbols?.join(', ') || '없음'}`);
+            } catch (e) {
+                document.getElementById('symbolList').textContent = '조회 실패: ' + e.message;
+                addLog('ERROR', `종목 조회 실패: ${e.message}`);
+            }
+        }
+        
+        async function addSymbol() {
+            const endpoint = document.getElementById('symbolEndpoint').value;
+            const apiKey = document.getElementById('adminApiKey').value;
+            const symbol = document.getElementById('newSymbol').value.toUpperCase();
+            
+            if (!symbol) {
+                addLog('ERROR', '종목 코드를 입력하세요');
+                return;
+            }
+            
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': apiKey
+                    },
+                    body: JSON.stringify({ symbol })
+                });
+                
+                const result = await response.json();
+                document.getElementById('symbolResponse').style.display = 'block';
+                document.getElementById('symbolResponse').textContent = JSON.stringify(result, null, 2);
+                addLog('INFO', `종목 추가: ${JSON.stringify(result)}`);
+                
+                // 목록 새로고침
+                listSymbols();
+            } catch (e) {
+                addLog('ERROR', `종목 추가 실패: ${e.message}`);
+            }
+        }
+        
+        async function removeSymbol() {
+            const endpoint = document.getElementById('symbolEndpoint').value;
+            const apiKey = document.getElementById('adminApiKey').value;
+            const symbol = document.getElementById('newSymbol').value.toUpperCase();
+            
+            if (!symbol) {
+                addLog('ERROR', '종목 코드를 입력하세요');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${endpoint}/${symbol}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': apiKey }
+                });
+                
+                const result = await response.json();
+                document.getElementById('symbolResponse').style.display = 'block';
+                document.getElementById('symbolResponse').textContent = JSON.stringify(result, null, 2);
+                addLog('INFO', `종목 삭제: ${JSON.stringify(result)}`);
+                
+                // 목록 새로고침
+                listSymbols();
+            } catch (e) {
+                addLog('ERROR', `종목 삭제 실패: ${e.message}`);
+            }
+        }
+
+        // ======== 캔들 테스트 자동화 ========
+        let candleTestInterval = null;
+        let candleTestStartTime = null;
+        let candleOrderCount = 0;
+        let candleCurrentPrice = 150;
+        let candleDirection = 1; // 1 = 상승, -1 = 하락
+        let candlePhase = 0; // 0-3: 기준→고가, 고가→기준, 기준→저가, 저가→기준
+        let candlePhaseStep = 0;
+        
+        function startCandleTest() {
+            console.log('startCandleTest called');
+            
+            if (candleTestInterval) {
+                addLog('ERROR', '이미 실행 중입니다');
+                return;
+            }
+            
+            try {
+                const basePrice = parseFloat(document.getElementById('candleBasePrice').value) || 150;
+                const range = parseFloat(document.getElementById('candleRange').value) || 50;
+                const wavePeriod = parseFloat(document.getElementById('candleWavePeriod').value) || 5;
+                const orderInterval = parseInt(document.getElementById('candleOrderInterval').value) || 500;
+                
+                console.log('Config:', { basePrice, range, wavePeriod, orderInterval });
+                
+                // 1분에 몇 번 주문하는지 계산
+                const ordersPerMinute = 60000 / orderInterval;
+                // 한 파동(5분)에 필요한 총 주문 수
+                const ordersPerWave = ordersPerMinute * wavePeriod;
+                // 가격 변화 단계
+                const priceStepPerOrder = (range * 4) / ordersPerWave;
+                
+                candleCurrentPrice = basePrice;
+                candleOrderCount = 0;
+                candlePhase = 0;
+                candlePhaseStep = 0;
+                candleTestStartTime = Date.now();
+                
+                document.getElementById('candleTestStatus').textContent = '실행 중';
+                document.getElementById('candleTestStatus').style.color = 'var(--success)';
+                
+                addLog('INFO', `캔들 테스트 시작: 기준=${basePrice}, 범위=±${range}, 주기=${wavePeriod}분`);
+                
+                // 타이머 시작
+                const elapsedTimer = setInterval(() => {
+                    if (!candleTestInterval) {
+                        clearInterval(elapsedTimer);
+                        return;
+                    }
+                    const elapsed = Math.floor((Date.now() - candleTestStartTime) / 1000);
+                    const min = Math.floor(elapsed / 60);
+                    const sec = elapsed % 60;
+                    document.getElementById('candleElapsedTime').textContent = `${min}:${sec.toString().padStart(2, '0')}`;
+                }, 1000);
+                
+                // 주문 반복
+                candleTestInterval = setInterval(async () => {
+                    await submitCandleTestOrder(basePrice, range, wavePeriod, ordersPerMinute);
+                }, orderInterval);
+                
+                console.log('Candle test started successfully');
+            } catch (e) {
+                console.error('startCandleTest error:', e);
+                addLog('ERROR', `캔들 테스트 시작 실패: ${e.message}`);
+            }
+        }
+        
+        async function submitCandleTestOrder(basePrice, range, wavePeriod, ordersPerMinute) {
+            // 파동 계산 (사인파 형태)
+            const totalSeconds = (Date.now() - candleTestStartTime) / 1000;
+            const cycleSeconds = wavePeriod * 60; // 5분 = 300초
+            const t = (totalSeconds % cycleSeconds) / cycleSeconds; // 0~1 사이
+            
+            // 사인파: 0→1(고점)→0→-1(저점)→0
+            const sineValue = Math.sin(t * 2 * Math.PI);
+            candleCurrentPrice = Math.round(basePrice + (range * sineValue));
+            
+            // 다음 목표 계산
+            let nextTarget = '';
+            if (t < 0.25) nextTarget = `↗ 고가 (${basePrice + range})`;
+            else if (t < 0.5) nextTarget = `↘ 기준 (${basePrice})`;
+            else if (t < 0.75) nextTarget = `↙ 저가 (${basePrice - range})`;
+            else nextTarget = `↗ 기준 (${basePrice})`;
+            
+            document.getElementById('candleCurrentPrice').textContent = candleCurrentPrice;
+            document.getElementById('candleNextTarget').textContent = nextTarget;
+            
+            // 체결을 발생시키려면 BUY와 SELL 모두 같은 가격에 넣어야 함
+            const endpoint = document.getElementById('orderEndpoint').value;
+            const apiKey = document.getElementById('apiKey').value;
+            const symbol = document.getElementById('orderSymbol').value || 'TEST';
+            
+            // 매수 + 매도 동시 주문 (체결 발생)
+            try {
+                const buyOrder = {
+                    user_id: 'candle-test-buyer',
+                    symbol: symbol,
+                    side: 'BUY',
+                    price: candleCurrentPrice,
+                    quantity: 10,
+                    order_type: 'LIMIT'
+                };
+                
+                const sellOrder = {
+                    user_id: 'candle-test-seller',
+                    symbol: symbol,
+                    side: 'SELL',
+                    price: candleCurrentPrice,
+                    quantity: 10,
+                    order_type: 'LIMIT'
+                };
+                
+                // 매수 먼저
+                await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                    body: JSON.stringify(buyOrder)
+                });
+                
+                // 매도 (체결 발생)
+                await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                    body: JSON.stringify(sellOrder)
+                });
+                
+                candleOrderCount += 2;
+                document.getElementById('candleOrderCount').textContent = candleOrderCount;
+                
+            } catch (e) {
+                addLog('ERROR', `캔들 테스트 주문 실패: ${e.message}`);
+            }
+        }
+        
+        function stopCandleTest() {
+            if (candleTestInterval) {
+                clearInterval(candleTestInterval);
+                candleTestInterval = null;
+                
+                document.getElementById('candleTestStatus').textContent = '중지됨';
+                document.getElementById('candleTestStatus').style.color = 'var(--danger)';
+                
+                addLog('INFO', `캔들 테스트 중지: 총 ${candleOrderCount}개 주문`);
+            }
         }
 
         // 초기화

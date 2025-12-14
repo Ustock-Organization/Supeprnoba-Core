@@ -23,8 +23,21 @@ valkey.on('error', (err) => {
  * - 신버전: {"action":"subscribe","main":"TEST","sub":["AAPL"]}
  */
 export const handler = async (event) => {
-  const connectionId = event.requestContext.connectionId;
-  const body = JSON.parse(event.body);
+  const connectionId = event.requestContext?.connectionId;
+  
+  // connectionId가 없으면 WebSocket이 아닌 요청
+  if (!connectionId) {
+    console.error('No connectionId - event:', JSON.stringify(event));
+    return { statusCode: 400, body: JSON.stringify({ error: 'Not a WebSocket request' }) };
+  }
+  
+  let body;
+  try {
+    body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body || {};
+  } catch (e) {
+    console.error('Failed to parse body:', e.message);
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON' }) };
+  }
   
   // 신구 형식 모두 지원
   let { main, sub, symbols } = body;
