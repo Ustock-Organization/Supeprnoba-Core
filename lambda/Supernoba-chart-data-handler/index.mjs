@@ -22,10 +22,11 @@ const dynamodb = DynamoDBDocumentClient.from(
 const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE || 'candle_history';
 const HOT_DATA_TTL_MS = 10 * 60 * 1000; // 10분
 
-// 타임프레임별 분 수
-const INTERVAL_MINUTES = {
-  '1m': 1, '3m': 3, '5m': 5, '10m': 10,
-  '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440
+// 타임프레임별 초 수 (9개 지원)
+const INTERVAL_SECONDS = {
+  '1m': 60, '3m': 180, '5m': 300, '10m': 600,
+  '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, 
+  '1d': 86400, '1w': 604800
 };
 
 const headers = {
@@ -43,46 +44,28 @@ export const handler = async (event) => {
   console.log(`Chart request: ${symbol} ${interval} limit=${limit}`);
   
   try {
-    const minutes = INTERVAL_MINUTES[interval];
-    if (!minutes) {
+    const intervalSeconds = INTERVAL_SECONDS[interval];
+    if (!intervalSeconds) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: `Invalid interval: ${interval}` }) };
     }
     
-    // === 데이터 조회 ===
-    const minuteCandlesNeeded = limit * minutes;
+    // === 1. 완료된 캔들 조회 (DynamoDB) ===
+    const completedCandles = await getCompletedCandles(symbol, interval, limit);
     
-    // 1. Hot 데이터 (Valkey) - 최근 10분
-    const hotCandles = await getHotCandles(symbol);
+    // === 2. 활성 캔들 계산 (Valkey 1분봉에서) ===
+    const activeCandle = await computeActiveCandle(symbol, intervalSeconds);
     
-    // 2. Cold 데이터 (DynamoDB) - 과거
-    const coldCandles = await getColdCandles(symbol, minuteCandlesNeeded);
-    
-    // 3. 활성 캔들 (현재 진행 중)
-    const activeCandle = await getActiveCandle(symbol);
-    
-    // 4. 병합 및 중복 제거
-    let oneMinCandles = mergeCandles(coldCandles, hotCandles, activeCandle);
-    
-    console.log(`Data: cold=${coldCandles.length}, hot=${hotCandles.length}, active=${activeCandle ? 1 : 0}`);
-    
-    if (oneMinCandles.length === 0) {
-      return { statusCode: 200, headers, body: JSON.stringify({ symbol, interval, data: [] }) };
+    // === 3. 병합 ===
+    const allCandles = [...completedCandles];
+    if (activeCandle) {
+      allCandles.push({ ...activeCandle, active: true });
     }
     
-    // 1분봉 그대로 반환
-    if (interval === '1m') {
-      return {
-        statusCode: 200, headers,
-        body: JSON.stringify({ symbol, interval, data: oneMinCandles.slice(-limit).map(formatCandle) })
-      };
-    }
-    
-    // 상위 타임프레임 집계
-    const aggregated = aggregateCandles(oneMinCandles, minutes);
+    console.log(`Data: completed=${completedCandles.length}, active=${activeCandle ? 1 : 0}`);
     
     return {
       statusCode: 200, headers,
-      body: JSON.stringify({ symbol, interval, data: aggregated.slice(-limit).map(formatCandle) })
+      body: JSON.stringify({ symbol, interval, data: allCandles.map(formatCandle) })
     };
     
   } catch (error) {
@@ -90,6 +73,92 @@ export const handler = async (event) => {
     return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
   }
 };
+
+// === 완료된 캔들 조회 (DynamoDB에서 사전 집계된 데이터) ===
+async function getCompletedCandles(symbol, interval, limit) {
+  try {
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: DYNAMODB_TABLE,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: { ':pk': `CANDLE#${symbol}#${interval}` },
+      ScanIndexForward: false,  // 최신순
+      Limit: limit
+    }));
+    
+    if (!result.Items || result.Items.length === 0) return [];
+    
+    return result.Items.map(item => ({
+      time: item.time || item.sk,
+      open: item.open || item.o,
+      high: item.high || item.h,
+      low: item.low || item.l,
+      close: item.close || item.c,
+      volume: item.volume || item.v || 0
+    })).sort((a, b) => a.time - b.time);  // 오래된 순으로 정렬
+    
+  } catch (error) {
+    console.error(`DynamoDB query error for ${interval}:`, error);
+    return [];
+  }
+}
+
+// === 활성 캔들 계산 (Valkey 1분봉에서 현재 기간 집계) ===
+async function computeActiveCandle(symbol, intervalSeconds) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const periodStart = Math.floor(now / intervalSeconds) * intervalSeconds;
+    
+    // 현재 기간 내의 마감된 1분봉 조회
+    const closedList = await valkey.lrange(`candle:closed:1m:${symbol}`, 0, -1);
+    const closedCandles = closedList
+      .map(c => { try { return JSON.parse(c); } catch { return null; } })
+      .filter(c => c !== null)
+      .filter(c => parseInt(c.t) >= periodStart && parseInt(c.t) < periodStart + intervalSeconds)
+      .map(c => ({
+        t: parseInt(c.t),
+        o: parseFloat(c.o),
+        h: parseFloat(c.h),
+        l: parseFloat(c.l),
+        c: parseFloat(c.c),
+        v: parseFloat(c.v) || 0
+      }));
+    
+    // 현재 진행 중인 1분봉 조회
+    const activeOneMin = await valkey.hgetall(`candle:1m:${symbol}`);
+    
+    // 병합
+    const allCandles = [...closedCandles];
+    if (activeOneMin && activeOneMin.t && parseInt(activeOneMin.t) >= periodStart) {
+      allCandles.push({
+        t: parseInt(activeOneMin.t),
+        o: parseFloat(activeOneMin.o),
+        h: parseFloat(activeOneMin.h),
+        l: parseFloat(activeOneMin.l),
+        c: parseFloat(activeOneMin.c),
+        v: parseFloat(activeOneMin.v) || 0
+      });
+    }
+    
+    if (allCandles.length === 0) return null;
+    
+    // 시간순 정렬
+    allCandles.sort((a, b) => a.t - b.t);
+    
+    // 집계
+    return {
+      time: periodStart,
+      open: allCandles[0].o,                          // 첫 캔들의 시가
+      high: Math.max(...allCandles.map(c => c.h)),    // 최고가
+      low: Math.min(...allCandles.map(c => c.l)),     // 최저가
+      close: allCandles[allCandles.length - 1].c,     // 마지막 캔들의 종가 (현재가!)
+      volume: allCandles.reduce((sum, c) => sum + (c.v || 0), 0)
+    };
+    
+  } catch (error) {
+    console.error('Active candle computation error:', error);
+    return null;
+  }
+}
 
 // === Hot 데이터: Valkey candle:closed:* ===
 async function getHotCandles(symbol) {

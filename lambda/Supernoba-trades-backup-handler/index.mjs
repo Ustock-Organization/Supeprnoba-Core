@@ -44,6 +44,56 @@ const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
 const DYNAMODB_CANDLE_TABLE = process.env.DYNAMODB_CANDLE_TABLE || 'candle_history';
 const DYNAMODB_TRADE_TABLE = process.env.DYNAMODB_TRADE_TABLE || 'trade_history';
 
+// === 타임프레임 정의 (9개) ===
+const TIMEFRAMES = [
+  { interval: '1m', seconds: 60 },
+  { interval: '3m', seconds: 180 },
+  { interval: '5m', seconds: 300 },
+  { interval: '15m', seconds: 900 },
+  { interval: '30m', seconds: 1800 },
+  { interval: '1h', seconds: 3600 },
+  { interval: '4h', seconds: 14400 },
+  { interval: '1d', seconds: 86400 },
+  { interval: '1w', seconds: 604800 }
+];
+
+// === 캔들 완료 여부 확인 ===
+// EventBridge 10분 트리거 시점에 완전히 마감된 캔들만 저장
+function isCompletedCandle(candleStartTime, intervalSeconds) {
+  const now = Math.floor(Date.now() / 1000);
+  const candleEndTime = candleStartTime + intervalSeconds;
+  return now >= candleEndTime;
+}
+
+// === 1분봉을 상위 타임프레임으로 집계 ===
+function aggregateCandles(oneMinCandles, intervalSeconds) {
+  const grouped = new Map();
+  
+  for (const c of oneMinCandles) {
+    // 타임프레임 경계로 정렬 (예: 5분봉이면 12:00, 12:05, 12:10...)
+    const alignedTime = Math.floor(c.t / intervalSeconds) * intervalSeconds;
+    
+    if (!grouped.has(alignedTime)) {
+      grouped.set(alignedTime, {
+        t: alignedTime,
+        o: parseFloat(c.o),
+        h: parseFloat(c.h),
+        l: parseFloat(c.l),
+        c: parseFloat(c.c),
+        v: parseFloat(c.v) || 0
+      });
+    } else {
+      const existing = grouped.get(alignedTime);
+      existing.h = Math.max(existing.h, parseFloat(c.h));
+      existing.l = Math.min(existing.l, parseFloat(c.l));
+      existing.c = parseFloat(c.c);  // 마지막 캔들의 종가
+      existing.v += parseFloat(c.v) || 0;
+    }
+  }
+  
+  return Array.from(grouped.values()).sort((a, b) => a.t - b.t);
+}
+
 export const handler = async (event) => {
   console.log('[HANDLER] Lambda invoked');
   debug('[HANDLER] Event:', JSON.stringify(event));
@@ -141,6 +191,54 @@ export const handler = async (event) => {
         }
       }
       debug(`[DYNAMO] ${symbol}: Completed - ${dynamoSuccess} success, ${dynamoFail} failed`);
+      
+      // === 상위 타임프레임 집계 및 저장 ===
+      // 1분봉 데이터를 기반으로 상위 타임프레임 캔들 생성
+      for (const tf of TIMEFRAMES) {
+        if (tf.interval === '1m') continue;  // 1분봉은 이미 저장됨
+        
+        // 집계
+        const aggregated = aggregateCandles(candleData, tf.seconds);
+        
+        // 완료된 캔들만 필터링 (현재 시간 기준)
+        const completed = aggregated.filter(c => isCompletedCandle(c.t, tf.seconds));
+        
+        if (completed.length === 0) {
+          debug(`[TF] ${symbol} ${tf.interval}: No completed candles`);
+          continue;
+        }
+        
+        debug(`[TF] ${symbol} ${tf.interval}: Saving ${completed.length} completed candles`);
+        
+        let tfSuccess = 0, tfFail = 0;
+        for (const candle of completed) {
+          try {
+            await dynamodb.send(new PutCommand({
+              TableName: DYNAMODB_CANDLE_TABLE,
+              Item: {
+                pk: `CANDLE#${symbol}#${tf.interval}`,
+                sk: candle.t,
+                time: candle.t,
+                open: candle.o,
+                high: candle.h,
+                low: candle.l,
+                close: candle.c,
+                volume: candle.v,
+                symbol,
+                interval: tf.interval
+              }
+            }));
+            tfSuccess++;
+          } catch (dbErr) {
+            tfFail++;
+            debug(`[TF] ${symbol} ${tf.interval}: Put failed - ${dbErr.message}`);
+          }
+        }
+        
+        if (tfSuccess > 0) {
+          console.log(`[TF] ${symbol} ${tf.interval}: Saved ${tfSuccess} candles`);
+        }
+      }
       
       // Valkey에서 백업된 캔들 삭제
       debug(`[REDIS] ${symbol}: Deleting backup key ${key}`);

@@ -186,6 +186,7 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "lambda/Supernoba-admin/function.zip",
     "docs/results.csv",
     "docs/CODE_ANALYSIS_REPORT.md",
     "docs/FRONTEND_INTEGRATION_GUIDE.md",
@@ -202,7 +203,6 @@
     "lambda/Supernoba-daily-backup-handler/index.mjs",
     "lambda/Supernoba-daily-backup-handler",
     "lambda/Supernoba-chart-data-handler/index.mjs",
-    "lambda/Supernoba-chart-data-handler",
     "AWS_CONSOLE_SETUP_GUIDE.md",
     "docs/DATA_BACKUP_REDESIGN.md",
     "doc/OHLCV_dataformat.md",

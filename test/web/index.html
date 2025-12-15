@@ -507,15 +507,36 @@
                 <!-- Main 구독 (호가창 - 1개만) -->
                 <div class="card">
                     <h2 style="display: flex; justify-content: space-between; align-items: center;">Main 구독 <span style="background: var(--accent); color: #000; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem;">1개</span></h2>
-                    <div class="inline-form">
-                        <div class="form-group">
-                            <label>심볼 (호가창 표시)</label>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <label style="font-size: 0.75rem;">Chart API Endpoint</label>
+                        <input type="text" id="chartApiEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/chart" style="font-size: 0.8rem; padding: 6px 8px;">
+                    </div>
+                    <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                        <div class="form-group" style="flex: 2; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">심볼 (호가창 + 차트)</label>
                             <input type="text" id="mainSymbol" placeholder="TEST">
                         </div>
-                        <button class="btn btn-primary" onclick="subscribeMain()">구독</button>
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">타임프레임</label>
+                            <select id="chartTimeframe" style="padding: 8px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; color: var(--text);">
+                                <option value="1m">1분</option>
+                                <option value="3m">3분</option>
+                                <option value="5m">5분</option>
+                                <option value="15m">15분</option>
+                                <option value="30m">30분</option>
+                                <option value="1h">1시간</option>
+                                <option value="4h">4시간</option>
+                                <option value="1d">1일</option>
+                                <option value="1w">1주</option>
+                            </select>
+                        </div>
                     </div>
+                    <button class="btn btn-primary" style="width: 100%;" onclick="subscribeMain()">구독</button>
                     <div id="mainSubscribedInfo" style="margin-top: 10px; color: var(--accent); font-size: 0.85rem;">
                         호가창: 없음
+                    </div>
+                    <div id="chartLoadStatus" style="margin-top: 4px; font-size: 0.75rem; color: var(--text-muted);">
+                        📊 차트: 대기 중
                     </div>
                     
                     <!-- 실시간 메시지 인디케이터 -->
@@ -729,6 +750,66 @@
                 </div>
             </div>
 
+            <!-- 관리자 패널 (비밀번호 보호) -->
+            <div class="card" style="grid-column: span 2;">
+                <h2 style="display: flex; justify-content: space-between; align-items: center;">
+                    🔐 관리자 패널
+                    <span id="adminStatus" style="font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; background: var(--danger); color: #fff;">잠김</span>
+                </h2>
+                
+                <!-- API Key 입력 (잠김 상태) -->
+                <div id="adminLocked">
+                    <div style="display: flex; gap: 8px; align-items: flex-end;">
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label style="font-size: 0.75rem;">Admin API Key</label>
+                            <input type="password" id="adminPassword" placeholder="Lambda ADMIN_API_KEY 입력" style="padding: 8px;">
+                        </div>
+                        <button class="btn btn-primary" onclick="unlockAdmin()">인증</button>
+                    </div>
+                </div>
+                
+                <!-- 관리자 기능 (잠금 해제 상태) -->
+                <div id="adminUnlocked" style="display: none;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <!-- 종목 조회 -->
+                        <div style="background: var(--bg-input); padding: 12px; border-radius: 6px;">
+                            <h3 style="font-size: 0.85rem; margin-bottom: 10px; color: var(--accent);">📊 DynamoDB 종목 조회</h3>
+                            <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                                <input type="text" id="querySymbol" placeholder="심볼 (예: TEST)" style="flex: 1; padding: 6px;">
+                                <select id="queryInterval" style="padding: 6px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; color: var(--text);">
+                                    <option value="1m">1분</option>
+                                    <option value="5m">5분</option>
+                                    <option value="15m">15분</option>
+                                    <option value="1h">1시간</option>
+                                    <option value="1d">1일</option>
+                                </select>
+                                <button class="btn btn-secondary" onclick="queryDynamoDB()">조회</button>
+                            </div>
+                            <div id="queryResult" style="background: #161b22; padding: 8px; border-radius: 4px; font-size: 0.7rem; color: #79c0ff; max-height: 100px; overflow-y: auto;">
+                                조회 결과가 여기에 표시됩니다.
+                            </div>
+                        </div>
+                        
+                        <!-- 데이터베이스 초기화 -->
+                        <div style="background: var(--bg-input); padding: 12px; border-radius: 6px;">
+                            <h3 style="font-size: 0.85rem; margin-bottom: 10px; color: var(--danger);">⚠️ 데이터베이스 초기화</h3>
+                            <p style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 10px;">
+                                DynamoDB candle_history 테이블과 S3 버킷의 모든 데이터를 삭제합니다.
+                                <br><strong style="color: var(--danger);">이 작업은 되돌릴 수 없습니다!</strong>
+                            </p>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <input type="text" id="resetConfirm" placeholder="DELETE 입력" style="flex: 1; padding: 6px;">
+                                <button class="btn btn-danger" onclick="resetDatabase()" style="background: var(--danger);">🗑️ 초기화</button>
+                            </div>
+                            <div id="resetStatus" style="margin-top: 8px; font-size: 0.7rem;"></div>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 12px; text-align: right;">
+                        <button class="btn btn-secondary" onclick="lockAdmin()" style="font-size: 0.75rem;">🔒 잠금</button>
+                    </div>
+                </div>
+            </div>
 
             <div class="card" style="grid-column: span 2;">
                 <h2>메시지 로그</h2>
@@ -921,12 +1002,12 @@
                     renderTickerGrid();
                 }
             } else if (msg.e === 'candle') {
-                // 실시간 캔들 업데이트 - 캔들 테이블에 추가
+                // 실시간 캔들 업데이트 - 캔들 차트에만 표시 (Main 구독 테이블에서 제외)
                 candleEventCount++;
                 lastCandleData = msg;
                 updateLiveCandleChart(msg);
                 updateCandleLogTable(msg);
-                updateRealtimeDisplay('CANDLE', msg.s, '-', '-');
+                // updateRealtimeDisplay 호출 제거 - 캔들은 Main 구독 표시에서 제외
                 
             } else if (msg.e === 'candle_close') {
                 // 캔들 마감 알림
@@ -1151,6 +1232,75 @@
             document.getElementById('mainSubscribedInfo').innerHTML = `호가창: <strong style="color: var(--accent);">${symbol}</strong>`;
             document.getElementById('mainSymbol').value = '';
             addLog('INFO', `[MAIN] 구독: ${symbol}`);
+            
+            // ✅ 차트 히스토리 로드 (Chart API에서 과거 데이터 가져오기)
+            loadChartHistory(symbol);
+        }
+        
+        // 차트 히스토리 로드 (Chart API)
+        async function loadChartHistory(symbol) {
+            const chartApiEndpoint = document.getElementById('chartApiEndpoint').value;
+            const interval = document.getElementById('chartTimeframe').value;
+            
+            if (!chartApiEndpoint) {
+                document.getElementById('chartLoadStatus').innerHTML = '⚠️ Chart API 엔드포인트 필요';
+                return;
+            }
+            
+            document.getElementById('chartLoadStatus').innerHTML = `⏳ ${symbol} ${interval} 차트 로딩 중...`;
+            
+            try {
+                const url = `${chartApiEndpoint}?symbol=${symbol}&interval=${interval}&limit=100`;
+                const response = await fetch(url);
+                const result = await response.json();
+                
+                if (response.ok && result.data && result.data.length > 0) {
+                    // 차트 데이터 초기화 및 로드
+                    candleData = [];
+                    volumeData = [];
+                    
+                    for (const candle of result.data) {
+                        const t = candle.time;
+                        const o = parseFloat(candle.open);
+                        const h = parseFloat(candle.high);
+                        const l = parseFloat(candle.low);
+                        const c = parseFloat(candle.close);
+                        const v = parseFloat(candle.volume) || 0;
+                        const isBullish = c >= o;
+                        const isActive = candle.active === true;
+                        
+                        candleData.push({ time: t, open: o, high: h, low: l, close: c });
+                        // 활성 캔들은 다른 색상으로 표시 (진한 색)
+                        const upColor = isActive ? 'rgba(63, 185, 80, 0.8)' : 'rgba(63, 185, 80, 0.5)';
+                        const downColor = isActive ? 'rgba(248, 81, 73, 0.8)' : 'rgba(248, 81, 73, 0.5)';
+                        volumeData.push({ time: t, value: v, color: isBullish ? upColor : downColor });
+                    }
+                    
+                    // TradingView 차트에 반영
+                    if (!tvChart) initTradingViewChart();
+                    if (candleSeries) {
+                        candleSeries.setData(candleData);
+                        volumeSeries.setData(volumeData);
+                    }
+                    
+                    // 활성 캔들 여부 확인
+                    const hasActive = result.data.some(c => c.active);
+                    const activeLabel = hasActive ? ' 🟢 실시간' : '';
+                    
+                    document.getElementById('chartCandleTotal').textContent = candleData.length;
+                    document.getElementById('chartSymbolDisplay').textContent = `${symbol} (${interval})`;
+                    document.getElementById('chartLoadStatus').innerHTML = `✅ ${symbol} ${interval} 로드 완료 (${result.data.length}개)${activeLabel}`;
+                    addLog('INFO', `[CHART] ${symbol} ${interval} 히스토리 로드: ${result.data.length}개 캔들${hasActive ? ' (활성 캔들 포함)' : ''}`);
+                    
+                } else {
+                    document.getElementById('chartLoadStatus').innerHTML = `📊 ${symbol} 차트 데이터 없음`;
+                    addLog('WARN', `[CHART] ${symbol} 차트 데이터 없음`);
+                }
+                
+            } catch (error) {
+                document.getElementById('chartLoadStatus').innerHTML = `❌ 차트 로드 실패: ${error.message}`;
+                addLog('ERROR', `[CHART] 로드 실패: ${error.message}`);
+            }
         }
         
         // Sub 구독 (전광판 - 무제한)
@@ -1874,6 +2024,123 @@
                     </tr>
                 `;
             }).reverse().join('');
+        }
+
+        // =====================================================
+        // 관리자 패널 기능
+        // =====================================================
+        const ADMIN_API_ENDPOINT = 'https://0eeto6kblk.execute-api.ap-northeast-2.amazonaws.com/admin/Supernoba-admin';
+        let adminUnlocked = false;
+        let adminApiKey = '';  // Lambda ADMIN_API_KEY
+        
+        function unlockAdmin() {
+            const inputKey = document.getElementById('adminPassword').value.trim();
+            if (!inputKey) {
+                alert('API Key를 입력하세요.');
+                return;
+            }
+            
+            // API Key 저장 (실제 검증은 Admin 기능 사용 시 수행)
+            adminUnlocked = true;
+            adminApiKey = inputKey;
+            document.getElementById('adminLocked').style.display = 'none';
+            document.getElementById('adminUnlocked').style.display = 'block';
+            document.getElementById('adminStatus').style.background = 'var(--success)';
+            document.getElementById('adminStatus').textContent = '인증됨';
+            document.getElementById('adminPassword').value = '';
+            addLog('INFO', '[ADMIN] API Key 설정됨 (실제 검증은 기능 사용 시 수행)');
+        }
+        
+        function lockAdmin() {
+            adminUnlocked = false;
+            adminApiKey = '';
+            document.getElementById('adminLocked').style.display = 'block';
+            document.getElementById('adminUnlocked').style.display = 'none';
+            document.getElementById('adminStatus').style.background = 'var(--danger)';
+            document.getElementById('adminStatus').textContent = '잠김';
+            addLog('INFO', '[ADMIN] 관리자 패널 잠금됨');
+        }
+        
+        async function queryDynamoDB() {
+            const symbol = document.getElementById('querySymbol').value.toUpperCase().trim();
+            const interval = document.getElementById('queryInterval').value;
+            
+            if (!symbol) {
+                document.getElementById('queryResult').innerHTML = '<span style="color: var(--danger);">심볼을 입력하세요</span>';
+                return;
+            }
+            
+            document.getElementById('queryResult').innerHTML = '⏳ 조회 중...';
+            
+            try {
+                const chartApiEndpoint = document.getElementById('chartApiEndpoint').value;
+                const url = `${chartApiEndpoint}?symbol=${symbol}&interval=${interval}&limit=10`;
+                const response = await fetch(url);
+                const result = await response.json();
+                
+                if (response.ok && result.data) {
+                    const count = result.data.length;
+                    const hasActive = result.data.some(c => c.active);
+                    let html = `<strong>${symbol} ${interval}</strong>: ${count}개 캔들`;
+                    if (hasActive) html += ' 🟢';
+                    html += '<br>';
+                    
+                    if (count > 0) {
+                        const first = result.data[0];
+                        const last = result.data[count - 1];
+                        const firstTime = new Date(first.time * 1000).toLocaleString('ko-KR');
+                        const lastTime = new Date(last.time * 1000).toLocaleString('ko-KR');
+                        html += `<span style="color: var(--text-muted);">범위: ${firstTime} ~ ${lastTime}</span>`;
+                    }
+                    
+                    document.getElementById('queryResult').innerHTML = html;
+                    addLog('INFO', `[ADMIN] ${symbol} ${interval} 조회: ${count}개`);
+                } else {
+                    document.getElementById('queryResult').innerHTML = `<span style="color: var(--danger);">데이터 없음 또는 오류</span>`;
+                }
+            } catch (error) {
+                document.getElementById('queryResult').innerHTML = `<span style="color: var(--danger);">오류: ${error.message}</span>`;
+            }
+        }
+        
+        async function resetDatabase() {
+            const confirm = document.getElementById('resetConfirm').value;
+            
+            if (confirm !== 'DELETE') {
+                document.getElementById('resetStatus').innerHTML = '<span style="color: var(--danger);">DELETE를 정확히 입력하세요</span>';
+                return;
+            }
+            
+            if (!window.confirm('⚠️ 정말로 모든 데이터를 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다!')) {
+                return;
+            }
+            
+            document.getElementById('resetStatus').innerHTML = '⏳ 초기화 중...';
+            
+            try {
+                // Admin Lambda 호출 (저장된 API Key 사용)
+                const response = await fetch(ADMIN_API_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': adminApiKey
+                    },
+                    body: JSON.stringify({ action: 'resetDatabase', confirm: true })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    document.getElementById('resetStatus').innerHTML = '<span style="color: var(--success);">✅ 초기화 완료!</span>';
+                    document.getElementById('resetConfirm').value = '';
+                    addLog('WARN', '[ADMIN] 데이터베이스 초기화 완료');
+                } else {
+                    document.getElementById('resetStatus').innerHTML = `<span style="color: var(--danger);">오류: ${result.error || response.status}</span>`;
+                }
+            } catch (error) {
+                document.getElementById('resetStatus').innerHTML = `<span style="color: var(--danger);">API 오류: ${error.message}</span>`;
+                addLog('ERROR', `[ADMIN] 초기화 실패: ${error.message}`);
+            }
         }
 
         // 초기화
