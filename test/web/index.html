@@ -718,6 +718,15 @@
                     <span>🕐 마지막 업데이트: <span id="chartLastUpdate">-</span></span>
                     <span>📈 캔들 수: <span id="chartCandleTotal">0</span>개</span>
                 </div>
+                
+                <!-- RAW JSON 표시 영역 -->
+                <div style="margin-top: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <span style="font-size: 0.75rem; font-weight: bold; color: var(--accent);">🔍 현재 캔들 RAW JSON</span>
+                        <span id="rawJsonTimestamp" style="font-size: 0.65rem; color: var(--text-muted);">-</span>
+                    </div>
+                    <pre id="rawCandleJson" style="background: #161b22; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 0.7rem; color: #79c0ff; overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-all; max-height: 120px;">{ 등대 대기 중... }</pre>
+                </div>
             </div>
 
 
@@ -1649,6 +1658,11 @@
             // 종가 색상 (시가 대비)
             const isBullish = c >= o;
             document.getElementById('chartClose').style.color = isBullish ? 'var(--buy)' : 'var(--sell)';
+            
+            // === RAW JSON 표시 업데이트 ===
+            const candleTime = t ? new Date(t * 1000).toLocaleString() : '-';
+            document.getElementById('rawJsonTimestamp').textContent = `수신: ${new Date().toLocaleTimeString()} | 캔들 시작: ${candleTime}`;
+            document.getElementById('rawCandleJson').textContent = JSON.stringify(msg, null, 2);
             
             // TradingView 차트 업데이트
             if (candleSeries) {

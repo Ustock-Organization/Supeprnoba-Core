@@ -316,7 +316,7 @@ std::string RedisClient::eval(const std::string& script, int numKeys,
 bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64_t qty, int64_t timestamp) {
     if (!context_) return false;
     
-    // Lua Script: 원자적 캔들 업데이트
+    // Lua Script: 원자적 캔들 업데이트 (수정됨 - DEL 갭 제거, cjson 객체 변환)
     static const std::string luaScript = R"(
         local key = KEYS[1]
         local closedKey = KEYS[2]
@@ -329,28 +329,31 @@ bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64
         
         -- 현재 분과 이전 캔들의 분이 다르면 이전 캔들을 닫고 새 캔들을 시작
         if current_t and tonumber(current_t) < minute then
-            local old = redis.call("HGETALL", key)
-            if #old > 0 then
-                local json = cjson.encode(old)
+            -- 이전 캔들 데이터 가져오기 (HGETALL은 flat array 반환)
+            local oldArr = redis.call("HGETALL", key)
+            if #oldArr > 0 then
+                -- flat array를 객체로 변환: {"o", "145", "h", "147"} -> {o=145, h=147}
+                local oldObj = {}
+                for i = 1, #oldArr, 2 do
+                    oldObj[oldArr[i]] = oldArr[i + 1]
+                end
+                local json = cjson.encode(oldObj)
                 redis.call("LPUSH", closedKey, json)
                 redis.call("LTRIM", closedKey, 0, 999)  -- 닫힌 캔들은 최대 1000개 유지
             end
-            redis.call("DEL", key) -- 이전 캔들 키 삭제
-            current_t = nil
-        end
-        
-        -- 캔들 데이터 갱신
-        if not current_t then
-            -- 새 캔들 생성 (시가, 고가, 저가, 종가, 거래량, 타임스탬프 초기화)
+            -- 이전 캔들을 덮어쓰기 (DEL 없이 바로 HMSET으로 새 캔들 생성)
+            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute)
+        elseif not current_t then
+            -- 새 캔들 생성 (처음 또는 만료 후)
             redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute)
         else
-            -- 기존 캔들 데이터 갱신
+            -- 기존 캔들 데이터 갱신 (같은 분 내)
             local h = tonumber(redis.call("HGET", key, "h")) -- 현재 고가
             local l = tonumber(redis.call("HGET", key, "l")) -- 현재 저가
             if price > h then redis.call("HSET", key, "h", price) end -- 고가 갱신
             if price < l then redis.call("HSET", key, "l", price) end -- 저가 갱신
             redis.call("HSET", key, "c", price) -- 종가 갱신
-            redis.call("HINCRBYFLOAT", key, "v", qty) -- 거래량 증가
+            redis.call("HINCRBY", key, "v", qty) -- 거래량 증가 (정수 사용)
         end
         
         -- 현재 캔들과 닫힌 캔들 버퍼에 만료 시간 설정
