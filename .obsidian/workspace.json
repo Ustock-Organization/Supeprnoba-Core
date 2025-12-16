@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/CANDLE_ARCHITECTURE.md",
+                "file": "docs/CANDLE_TESTING.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "CANDLE_ARCHITECTURE"
+              "title": "CANDLE_TESTING"
             }
           }
         ]
@@ -185,25 +185,25 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
-    "AWS_ARCHITECTURE.md",
-    "docs/CANDLE_TESTING.md",
     "docs/CANDLE_IMPROVEMENTS.md",
     "docs/CANDLE_ARCHITECTURE.md",
-    "lambda/Supernoba-admin/function.zip",
-    "docs/results.csv",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/14.json",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/14.json.crdownload",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/11.json",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/11.json.crdownload",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/08.json",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/08.json.crdownload",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/05.json",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/05.json.crdownload",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/02.json",
+    "docs/data/supernoba-market-data/trades/TEST/20251215/14/02.json.crdownload",
+    "AWS_ARCHITECTURE.md",
+    "docs/CANDLE_TESTING.md",
     "docs/CODE_ANALYSIS_REPORT.md",
     "docs/FRONTEND_INTEGRATION_GUIDE.md",
     "docs/DATA_SCENARIOS.md",
     "docs/AWS_LAMBDA_SETUP_GUIDE.md",
     "docs/캔들 데이터 생성 및 실시간 처리 아키텍처.md",
-    "lambda/Supernoba-order-router/index.mjs",
-    "lambda/Supernoba-order-router",
-    "lambda/Supernoba-symbol-manager/index.mjs",
-    "lambda/Supernoba-symbol-manager",
-    "lambda/Supernoba-trades-backup-handler/index.mjs",
-    "lambda/Supernoba-trades-backup-handler",
-    "lambda/Supernoba-daily-backup-handler/index.mjs",
-    "lambda/Supernoba-daily-backup-handler",
     "AWS_CONSOLE_SETUP_GUIDE.md",
     "docs/DATA_BACKUP_REDESIGN.md",
     "doc/OHLCV_dataformat.md",
@@ -229,7 +229,6 @@
     "doc/settAug2013/images/Middle.png",
     "doc/settAug2013/images/Left.png",
     "doc/KINESIS_ARCHITECTURE.md",
-    "doc/STREAMER_EC2_SETUP.md",
     "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/aws_logo_dark.svg"
   ]
 }

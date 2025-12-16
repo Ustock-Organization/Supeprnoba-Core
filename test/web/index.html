@@ -1745,6 +1745,19 @@
             '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
         };
         
+        // === YYYYMMDDHHmm → epoch 변환 (TradingView용) ===
+        function ymdhmToEpoch(ymdhm) {
+            // "202512161404" → Unix epoch seconds
+            if (typeof ymdhm === 'number') return ymdhm;  // 이미 epoch인 경우
+            if (!ymdhm || ymdhm.length < 12) return 0;
+            const y = parseInt(ymdhm.slice(0, 4));
+            const m = parseInt(ymdhm.slice(4, 6)) - 1;
+            const d = parseInt(ymdhm.slice(6, 8));
+            const h = parseInt(ymdhm.slice(8, 10));
+            const min = parseInt(ymdhm.slice(10, 12));
+            return Math.floor(new Date(y, m, d, h, min).getTime() / 1000);
+        }
+        
         // 타임프레임 선택 함수 (버튼 클릭 시)
         async function selectTimeframe(tf) {
             selectedTimeframe = tf;
@@ -1788,8 +1801,9 @@
                 
                 if (response.ok && result.data && result.data.length > 0) {
                     // TradingView 권장: setData()로 전체 데이터 교체
+                    // YYYYMMDDHHmm → epoch 변환 (TradingView용)
                     const candles = result.data.map(c => ({
-                        time: c.time,
+                        time: ymdhmToEpoch(c.time),  // 변환
                         open: parseFloat(c.open),
                         high: parseFloat(c.high),
                         low: parseFloat(c.low),
@@ -1797,7 +1811,7 @@
                     }));
                     
                     const volumes = result.data.map(c => ({
-                        time: c.time,
+                        time: ymdhmToEpoch(c.time),  // 변환
                         value: parseFloat(c.volume) || 0,
                         color: parseFloat(c.close) >= parseFloat(c.open) 
                             ? 'rgba(63, 185, 80, 0.5)' 
@@ -1811,7 +1825,7 @@
                     const lastCandle = result.data[result.data.length - 1];
                     if (lastCandle && lastCandle.active) {
                         apiActiveCandle = {
-                            time: lastCandle.time,
+                            time: ymdhmToEpoch(lastCandle.time),  // YYYYMMDDHHmm → epoch 변환
                             open: parseFloat(lastCandle.open),
                             high: parseFloat(lastCandle.high),
                             low: parseFloat(lastCandle.low),
@@ -1973,7 +1987,7 @@
             const l = parseFloat(msg.l);
             const c = parseFloat(msg.c);
             const v = parseFloat(msg.v) || 0;
-            const t = parseInt(msg.t);  // 유닉스 타임스탬프 (초)
+            const t = ymdhmToEpoch(msg.t);  // YYYYMMDDHHmm → epoch 변환
             
             // 심볼 저장 (타임프레임 전환에 사용)
             if (msg.s && msg.s !== chartSymbol) {

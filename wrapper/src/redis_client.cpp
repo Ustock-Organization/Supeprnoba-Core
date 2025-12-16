@@ -311,24 +311,41 @@ std::string RedisClient::eval(const std::string& script, int numKeys,
     return result;
 }
 
+// === Unix epoch → YYYYMMDDHHmm 형식 변환 (KST 기준) ===
+std::string epochToYMDHM(int64_t epoch) {
+    time_t time = static_cast<time_t>(epoch);
+    struct tm* tm_info = localtime(&time);  // 로컬 시간대 (KST)
+    
+    char buffer[13];  // YYYYMMDDHHmm + null
+    snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d",
+        tm_info->tm_year + 1900,
+        tm_info->tm_mon + 1,
+        tm_info->tm_mday,
+        tm_info->tm_hour,
+        tm_info->tm_min);
+    
+    return std::string(buffer);
+}
+
 // === 캔들 집계 (Lua Script) ===
 
 bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64_t qty, int64_t timestamp) {
     if (!context_) return false;
     
-    // Lua Script: 원자적 캔들 업데이트 (수정됨 - DEL 갭 제거, cjson 객체 변환)
+    // Lua Script: 원자적 캔들 업데이트 (YYYYMMDDHHmm 형식 사용)
     static const std::string luaScript = R"(
         local key = KEYS[1]
         local closedKey = KEYS[2]
         local price = tonumber(ARGV[1])
         local qty = tonumber(ARGV[2])
-        local ts = tonumber(ARGV[3])
-        local minute = math.floor(ts / 60) * 60
+        local ts = ARGV[3]      -- Unix epoch (참조용)
+        local minute = ARGV[4]  -- YYYYMMDDHHmm 형식 (C++에서 변환됨)
         
         local current_t = redis.call("HGET", key, "t")
         
         -- 현재 분과 이전 캔들의 분이 다르면 이전 캔들을 닫고 새 캔들을 시작
-        if current_t and tonumber(current_t) < minute then
+        -- 문자열 비교: "202512161403" < "202512161404"
+        if current_t and current_t < minute then
             -- 이전 캔들 데이터 가져오기 (HGETALL은 flat array 반환)
             local oldArr = redis.call("HGETALL", key)
             if #oldArr > 0 then
@@ -366,11 +383,15 @@ bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64
     std::string key = "candle:1m:" + symbol;
     std::string closedKey = "candle:closed:1m:" + symbol;
     
+    // YYYYMMDDHHmm 형식으로 변환
+    std::string minuteStr = epochToYMDHM(timestamp);
+    
     std::vector<std::string> keys = {key, closedKey};
     std::vector<std::string> args = {
         std::to_string(price),
         std::to_string(qty),
-        std::to_string(timestamp)
+        std::to_string(timestamp),  // epoch (참조용)
+        minuteStr                   // YYYYMMDDHHmm (실제 사용)
     };
     
     std::string result = eval(luaScript, 2, keys, args);

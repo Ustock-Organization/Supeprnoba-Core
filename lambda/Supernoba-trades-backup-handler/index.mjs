@@ -79,23 +79,47 @@ async function withRetry(operation, operationName, maxRetries = MAX_RETRIES) {
   throw lastError;
 }
 
-// === 캔들 완료 여부 확인 ===
-// EventBridge 10분 트리거 시점에 완전히 마감된 캔들만 저장
-function isCompletedCandle(candleStartTime, intervalSeconds) {
-  const now = Math.floor(Date.now() / 1000);
-  const candleEndTime = candleStartTime + intervalSeconds;
-  return now >= candleEndTime;
+// === YYYYMMDDHHmm ↔ epoch 변환 헬퍼 ===
+function ymdhmToEpoch(ymdhm) {
+  // "202512161404" → Unix epoch
+  const y = parseInt(ymdhm.slice(0, 4));
+  const m = parseInt(ymdhm.slice(4, 6)) - 1;
+  const d = parseInt(ymdhm.slice(6, 8));
+  const h = parseInt(ymdhm.slice(8, 10));
+  const min = parseInt(ymdhm.slice(10, 12));
+  return Math.floor(new Date(y, m, d, h, min).getTime() / 1000);
 }
 
-// === 1분봉을 상위 타임프레임으로 집계 ===
+function epochToYMDHM(epoch) {
+  const d = new Date(epoch * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+// 타임프레임 경계로 정렬된 YYYYMMDDHHmm 반환
+function alignToTimeframe(ymdhm, intervalMinutes) {
+  const epoch = ymdhmToEpoch(ymdhm);
+  const aligned = Math.floor(epoch / (intervalMinutes * 60)) * (intervalMinutes * 60);
+  return epochToYMDHM(aligned);
+}
+
+// === 1분봉을 상위 타임프레임으로 집계 (YYYYMMDDHHmm 형식) ===
 function aggregateCandles(oneMinCandles, intervalSeconds) {
+  const intervalMinutes = intervalSeconds / 60;
+  
+  // 🔧 FIX: 시간순 정렬 (과거 → 최신) - 문자열 비교로 정렬
+  const sortedCandles = [...oneMinCandles].sort((a, b) => 
+    a.t.localeCompare(b.t)
+  );
+  
   const grouped = new Map();
   
-  for (const c of oneMinCandles) {
+  for (const c of sortedCandles) {
     // 타임프레임 경계로 정렬 (예: 5분봉이면 12:00, 12:05, 12:10...)
-    const alignedTime = Math.floor(c.t / intervalSeconds) * intervalSeconds;
+    const alignedTime = alignToTimeframe(c.t, intervalMinutes);
     
     if (!grouped.has(alignedTime)) {
+      // 첫 번째 1분봉 = 이 기간의 시가
       grouped.set(alignedTime, {
         t: alignedTime,
         o: parseFloat(c.o),
@@ -105,15 +129,24 @@ function aggregateCandles(oneMinCandles, intervalSeconds) {
         v: parseFloat(c.v) || 0
       });
     } else {
+      // 추가 1분봉 데이터 병합
       const existing = grouped.get(alignedTime);
-      existing.h = Math.max(existing.h, parseFloat(c.h));
-      existing.l = Math.min(existing.l, parseFloat(c.l));
+      existing.h = Math.max(existing.h, parseFloat(c.h));  // 최고가
+      existing.l = Math.min(existing.l, parseFloat(c.l));  // 최저가
       existing.c = parseFloat(c.c);  // 마지막 캔들의 종가
-      existing.v += parseFloat(c.v) || 0;
+      existing.v += parseFloat(c.v) || 0;  // 거래량 누적
     }
   }
   
-  return Array.from(grouped.values()).sort((a, b) => a.t - b.t);
+  return Array.from(grouped.values()).sort((a, b) => a.t.localeCompare(b.t));
+}
+
+// === 캔들 완료 여부 확인 (YYYYMMDDHHmm 형식 지원) ===
+function isCompletedCandle(candleStartYMDHM, intervalSeconds) {
+  const candleStartEpoch = ymdhmToEpoch(candleStartYMDHM);
+  const candleEndTime = candleStartEpoch + intervalSeconds;
+  const now = Math.floor(Date.now() / 1000);
+  return now >= candleEndTime;
 }
 
 export const handler = async (event) => {
@@ -199,8 +232,8 @@ export const handler = async (event) => {
               TableName: DYNAMODB_CANDLE_TABLE,
               Item: {
                 pk: `CANDLE#${symbol}#1m`,
-                sk: parseInt(candle.t),
-                time: parseInt(candle.t),
+                sk: candle.t,              // YYYYMMDDHHmm 문자열
+                time: candle.t,            // YYYYMMDDHHmm 문자열
                 open: parseFloat(candle.o),
                 high: parseFloat(candle.h),
                 low: parseFloat(candle.l),
