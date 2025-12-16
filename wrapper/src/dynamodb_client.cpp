@@ -45,7 +45,8 @@ bool DynamoDBClient::putTrade(const std::string& symbol,
     request.SetTableName(table_name_);
     
     // 날짜 문자열 생성 (YYYYMMDD)
-    time_t rawtime = timestamp / 1000;  // milliseconds to seconds
+    // 🔧 FIX: timestamp는 이미 초 단위로 전달됨 (market_data_handler.cpp에서 epoch_sec)
+    time_t rawtime = timestamp;  // timestamp is already in seconds
     struct tm* timeinfo = gmtime(&rawtime);
     char dateStr[9];
     strftime(dateStr, sizeof(dateStr), "%Y%m%d", timeinfo);

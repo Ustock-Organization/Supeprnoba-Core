@@ -1791,95 +1791,109 @@
         async function loadChartDataForTimeframe(symbol, interval) {
             if (!candleSeries) return;
             
+            const intervalSeconds = TIMEFRAME_SECONDS[interval] || 60;
+            
+            // 1. 먼저 버퍼에서 집계 (항상 실행)
+            let bufferCandles = [];
+            if (oneMinCandleBuffer.length > 0) {
+                const aggregated = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
+                bufferCandles = aggregated.map(c => ({
+                    time: c.time,
+                    open: c.open,
+                    high: c.high,
+                    low: c.low,
+                    close: c.close,
+                    volume: c.volume || 0
+                }));
+                addLog('INFO', `[CHART] 버퍼에서 ${bufferCandles.length}개 캔들 집계`);
+            }
+            
+            // 2. API 호출 시도
             const chartEndpoint = document.getElementById('chartEndpoint')?.value || 
                 'https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/chart';
             const url = `${chartEndpoint}?symbol=${symbol}&interval=${interval}&limit=200`;
             
+            let apiCandles = [];
             try {
                 const response = await fetch(url);
                 const result = await response.json();
                 
                 if (response.ok && result.data && result.data.length > 0) {
-                    // TradingView 권장: setData()로 전체 데이터 교체
-                    // YYYYMMDDHHmm → epoch 변환 (TradingView용)
-                    const candles = result.data.map(c => ({
-                        time: ymdhmToEpoch(c.time),  // 변환
+                    apiCandles = result.data.map(c => ({
+                        time: ymdhmToEpoch(c.time),
                         open: parseFloat(c.open),
                         high: parseFloat(c.high),
                         low: parseFloat(c.low),
-                        close: parseFloat(c.close)
+                        close: parseFloat(c.close),
+                        volume: parseFloat(c.volume) || 0,
+                        active: c.active || false
                     }));
+                    addLog('INFO', `[CHART] API에서 ${apiCandles.length}개 캔들 로드`);
                     
-                    const volumes = result.data.map(c => ({
-                        time: ymdhmToEpoch(c.time),  // 변환
-                        value: parseFloat(c.volume) || 0,
-                        color: parseFloat(c.close) >= parseFloat(c.open) 
-                            ? 'rgba(63, 185, 80, 0.5)' 
-                            : 'rgba(248, 81, 73, 0.5)'
-                    }));
-                    
-                    candleData = candles;
-                    volumeData = volumes;
-                    
-                    // 활성 캔들 추적 (실시간 병합용)
+                    // 활성 캔들 추적
                     const lastCandle = result.data[result.data.length - 1];
                     if (lastCandle && lastCandle.active) {
                         apiActiveCandle = {
-                            time: ymdhmToEpoch(lastCandle.time),  // YYYYMMDDHHmm → epoch 변환
+                            time: ymdhmToEpoch(lastCandle.time),
                             open: parseFloat(lastCandle.open),
                             high: parseFloat(lastCandle.high),
                             low: parseFloat(lastCandle.low),
                             close: parseFloat(lastCandle.close),
                             volume: parseFloat(lastCandle.volume) || 0
                         };
-                        addLog('INFO', `[CHART] 활성 캔들 기준점 설정: t=${apiActiveCandle.time}`);
                     } else {
                         apiActiveCandle = null;
                     }
-                    
-                    candleSeries.setData(candles);
-                    volumeSeries.setData(volumes);
-                    tvChart.timeScale().fitContent();
-                    
-                    document.getElementById('chartCandleTotal').textContent = `${candles.length} (${interval})`;
-                    addLog('SUCCESS', `[CHART] ${symbol} ${interval}: ${candles.length}개 캔들 로드`);
-                } else {
-                    // API 데이터 없음 → 1분봉 버퍼에서 집계하여 표시
-                    addLog('WARN', `[CHART] API 데이터 없음 → 버퍼에서 집계`);
-                    
-                    if (oneMinCandleBuffer.length > 0) {
-                        const intervalSeconds = TIMEFRAME_SECONDS[interval] || 60;
-                        const aggregated = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
-                        
-                        const candles = aggregated.map(c => ({
-                            time: c.time,
-                            open: c.open,
-                            high: c.high,
-                            low: c.low,
-                            close: c.close
-                        }));
-                        
-                        const volumes = aggregated.map(c => ({
-                            time: c.time,
-                            value: c.volume || 0,
-                            color: c.close >= c.open 
-                                ? 'rgba(63, 185, 80, 0.5)' 
-                                : 'rgba(248, 81, 73, 0.5)'
-                        }));
-                        
-                        candleData = candles;
-                        volumeData = volumes;
-                        
-                        candleSeries.setData(candles);
-                        volumeSeries.setData(volumes);
-                        tvChart.timeScale().fitContent();
-                        
-                        document.getElementById('chartCandleTotal').textContent = `${candles.length} (${interval}, 버퍼)`;
-                        addLog('INFO', `[CHART] 버퍼에서 ${candles.length}개 캔들 집계`);
-                    }
                 }
             } catch (error) {
-                addLog('ERROR', `[CHART] API 오류: ${error.message}`);
+                addLog('WARN', `[CHART] API 오류: ${error.message}`);
+            }
+            
+            // 3. API + 버퍼 병합 (시간 기준 중복 제거)
+            const mergedMap = new Map();
+            
+            // API 데이터 먼저 (오래된 데이터)
+            for (const c of apiCandles) {
+                mergedMap.set(c.time, c);
+            }
+            
+            // 버퍼 데이터로 덮어쓰기 (최신 데이터 우선)
+            for (const c of bufferCandles) {
+                mergedMap.set(c.time, c);
+            }
+            
+            const allCandles = Array.from(mergedMap.values()).sort((a, b) => a.time - b.time);
+            
+            // 4. 데이터가 있으면 차트 업데이트
+            if (allCandles.length > 0) {
+                const candles = allCandles.map(c => ({
+                    time: c.time,
+                    open: c.open,
+                    high: c.high,
+                    low: c.low,
+                    close: c.close
+                }));
+                
+                const volumes = allCandles.map(c => ({
+                    time: c.time,
+                    value: c.volume || 0,
+                    color: c.close >= c.open 
+                        ? 'rgba(63, 185, 80, 0.5)' 
+                        : 'rgba(248, 81, 73, 0.5)'
+                }));
+                
+                candleData = candles;
+                volumeData = volumes;
+                
+                candleSeries.setData(candles);
+                volumeSeries.setData(volumes);
+                tvChart.timeScale().fitContent();
+                
+                const source = apiCandles.length > 0 ? 'API+버퍼' : '버퍼';
+                document.getElementById('chartCandleTotal').textContent = `${candles.length} (${interval}, ${source})`;
+                addLog('SUCCESS', `[CHART] ${symbol} ${interval}: ${candles.length}개 캔들 표시`);
+            } else {
+                addLog('WARN', `[CHART] 표시할 데이터 없음`);
             }
         }
         

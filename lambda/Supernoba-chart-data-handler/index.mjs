@@ -103,14 +103,17 @@ async function getCompletedCandles(symbol, interval, limit) {
     
     if (!result.Items || result.Items.length === 0) return [];
     
-    return result.Items.map(item => ({
-      time: item.time || item.sk,
-      open: item.open || item.o,
-      high: item.high || item.h,
-      low: item.low || item.l,
-      close: item.close || item.c,
-      volume: item.volume || item.v || 0
-    })).sort((a, b) => a.time.localeCompare(b.time));  // 문자열 비교로 오래된 순 정렬
+    return result.Items.map(item => {
+      const timeStr = item.time || item.sk;  // YYYYMMDDHHmm 형식
+      return {
+        time: ymdhmToEpoch(timeStr),  // epoch으로 변환
+        open: parseFloat(item.open || item.o),
+        high: parseFloat(item.high || item.h),
+        low: parseFloat(item.low || item.l),
+        close: parseFloat(item.close || item.c),
+        volume: parseFloat(item.volume || item.v) || 0
+      };
+    }).sort((a, b) => a.time - b.time);  // 숫자 비교로 오래된 순 정렬
     
   } catch (error) {
     console.error(`DynamoDB query error for ${interval}:`, error);
@@ -128,14 +131,14 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     const periodEndEpoch = periodStartEpoch + intervalSeconds;
     const periodEndYMDHM = epochToYMDHM(periodEndEpoch);
     
-    // 1. Valkey에서 마감된 1분봉 조회 (최근 데이터) - YYYYMMDDHHmm 형식
+    // 1. Valkey에서 마감된 1분봉 조회 (최근 데이터) - YYYYMMDDHHmm → epoch 변환
     const closedList = await valkey.lrange(`candle:closed:1m:${symbol}`, 0, -1);
     const valkeyClosedCandles = closedList
       .map(c => { try { return JSON.parse(c); } catch { return null; } })
       .filter(c => c !== null)
-      .filter(c => c.t >= periodStartYMDHM && c.t < periodEndYMDHM)  // 문자열 비교
+      .filter(c => c.t >= periodStartYMDHM && c.t < periodEndYMDHM)
       .map(c => ({
-        t: c.t,  // YYYYMMDDHHmm 문자열 유지
+        time: ymdhmToEpoch(c.t),  // epoch으로 변환
         o: parseFloat(c.o),
         h: parseFloat(c.h),
         l: parseFloat(c.l),
@@ -146,7 +149,6 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     // 2. DynamoDB에서 현재 기간 1분봉 조회 (백업된 데이터 - Valkey 비었을 때 대비)
     let dbCandles = [];
     if (valkeyClosedCandles.length === 0) {
-      // Valkey가 비어있으면 DynamoDB에서 1분봉 조회
       try {
         const result = await dynamodb.send(new QueryCommand({
           TableName: DYNAMODB_TABLE,
@@ -159,7 +161,7 @@ async function computeActiveCandle(symbol, intervalSeconds) {
         }));
         
         dbCandles = (result.Items || []).map(item => ({
-          t: item.time || item.sk,  // YYYYMMDDHHmm 문자열
+          time: ymdhmToEpoch(item.time || item.sk),  // epoch으로 변환
           o: parseFloat(item.open || item.o),
           h: parseFloat(item.high || item.h),
           l: parseFloat(item.low || item.l),
@@ -175,24 +177,25 @@ async function computeActiveCandle(symbol, intervalSeconds) {
       }
     }
     
-    // 3. 현재 진행 중인 1분봉 조회 (Valkey) - YYYYMMDDHHmm 형식
+    // 3. 현재 진행 중인 1분봉 조회 (Valkey)
     const activeOneMin = await valkey.hgetall(`candle:1m:${symbol}`);
     
-    // 4. 모든 소스 병합
+    // 4. 모든 소스 병합 (epoch 기준)
     const allCandles = [...valkeyClosedCandles, ...dbCandles];
     
     // 중복 제거 (같은 시간의 캔들은 Valkey 우선)
     const candleMap = new Map();
     for (const c of allCandles) {
-      if (!candleMap.has(c.t)) {
-        candleMap.set(c.t, c);
+      if (!candleMap.has(c.time)) {
+        candleMap.set(c.time, c);
       }
     }
     
-    // 현재 진행 중인 1분봉 추가 (YYYYMMDDHHmm 형식)
+    // 현재 진행 중인 1분봉 추가
     if (activeOneMin && activeOneMin.t && activeOneMin.t >= periodStartYMDHM) {
-      candleMap.set(activeOneMin.t, {
-        t: activeOneMin.t,
+      const activeEpoch = ymdhmToEpoch(activeOneMin.t);
+      candleMap.set(activeEpoch, {
+        time: activeEpoch,
         o: parseFloat(activeOneMin.o),
         h: parseFloat(activeOneMin.h),
         l: parseFloat(activeOneMin.l),
@@ -205,16 +208,16 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     
     if (mergedCandles.length === 0) return null;
     
-    // 시간순 정렬 (문자열 비교)
-    mergedCandles.sort((a, b) => a.t.localeCompare(b.t));
+    // 시간순 정렬 (숫자 비교)
+    mergedCandles.sort((a, b) => a.time - b.time);
     
-    // 집계
+    // 집계 - epoch으로 반환
     return {
-      time: periodStartYMDHM,  // YYYYMMDDHHmm 문자열
-      open: mergedCandles[0].o,                          // 첫 캔들의 시가
-      high: Math.max(...mergedCandles.map(c => c.h)),    // 최고가
-      low: Math.min(...mergedCandles.map(c => c.l)),     // 최저가
-      close: mergedCandles[mergedCandles.length - 1].c,  // 마지막 캔들의 종가 (현재가!)
+      time: periodStartEpoch,  // epoch 타임스탬프
+      open: mergedCandles[0].o,
+      high: Math.max(...mergedCandles.map(c => c.h)),
+      low: Math.min(...mergedCandles.map(c => c.l)),
+      close: mergedCandles[mergedCandles.length - 1].c,
       volume: mergedCandles.reduce((sum, c) => sum + (c.v || 0), 0)
     };
     
@@ -233,7 +236,7 @@ async function getHotCandles(symbol) {
       try {
         const parsed = JSON.parse(item);
         return {
-          time: parsed.t,  // YYYYMMDDHHmm 문자열 유지
+          time: ymdhmToEpoch(parsed.t),  // epoch으로 변환
           open: parseFloat(parsed.o),
           high: parseFloat(parsed.h),
           low: parseFloat(parsed.l),
@@ -259,7 +262,7 @@ async function getActiveCandle(symbol) {
     if (!candle || !candle.t) return null;
     
     return {
-      time: candle.t,  // YYYYMMDDHHmm 문자열 유지
+      time: ymdhmToEpoch(candle.t),  // epoch으로 변환
       open: parseFloat(candle.o),
       high: parseFloat(candle.h),
       low: parseFloat(candle.l),
@@ -288,12 +291,12 @@ async function getColdCandles(symbol, limit) {
     if (!result.Items || result.Items.length === 0) return [];
     
     return result.Items.map(item => ({
-      time: item.time || item.sk,
-      open: item.open || item.o,
-      high: item.high || item.h,
-      low: item.low || item.l,
-      close: item.close || item.c,
-      volume: item.volume || item.v || 0
+      time: ymdhmToEpoch(item.time || item.sk),  // epoch으로 변환
+      open: parseFloat(item.open || item.o),
+      high: parseFloat(item.high || item.h),
+      low: parseFloat(item.low || item.l),
+      close: parseFloat(item.close || item.c),
+      volume: parseFloat(item.volume || item.v) || 0
     })).sort((a, b) => a.time - b.time);
     
   } catch (error) {
@@ -321,29 +324,27 @@ function mergeCandles(cold, hot, active) {
     timeMap.set(active.time, active);
   }
   
-  // 시간순 정렬 (문자열 비교)
-  return Array.from(timeMap.values()).sort((a, b) => a.time.localeCompare(b.time));
+  // 시간순 정렬 (숫자 비교 - epoch)
+  return Array.from(timeMap.values()).sort((a, b) => a.time - b.time);
 }
 
-// === 상위 타임프레임 집계 (YYYYMMDDHHmm 형식 지원) ===
+// === 상위 타임프레임 집계 (epoch 형식) ===
 function aggregateCandles(oneMinCandles, intervalMinutes) {
   if (oneMinCandles.length === 0) return [];
   
   const grouped = new Map();
   const intervalSeconds = intervalMinutes * 60;
   
-  // 정렬 먼저
-  const sorted = [...oneMinCandles].sort((a, b) => a.time.localeCompare(b.time));
+  // 정렬 먼저 (epoch 숫자 비교)
+  const sorted = [...oneMinCandles].sort((a, b) => a.time - b.time);
   
   for (const c of sorted) {
-    // YYYYMMDDHHmm → epoch → 정렬 → 다시 YMDHM
-    const epoch = ymdhmToEpoch(c.time);
-    const alignedEpoch = Math.floor(epoch / intervalSeconds) * intervalSeconds;
-    const alignedYMDHM = epochToYMDHM(alignedEpoch);
+    // epoch을 interval에 맞춰 정렬
+    const alignedEpoch = Math.floor(c.time / intervalSeconds) * intervalSeconds;
     
-    if (!grouped.has(alignedYMDHM)) {
-      grouped.set(alignedYMDHM, {
-        time: alignedYMDHM,
+    if (!grouped.has(alignedEpoch)) {
+      grouped.set(alignedEpoch, {
+        time: alignedEpoch,
         open: c.open,
         high: c.high,
         low: c.low,
@@ -351,7 +352,7 @@ function aggregateCandles(oneMinCandles, intervalMinutes) {
         volume: c.volume || 0
       });
     } else {
-      const existing = grouped.get(alignedYMDHM);
+      const existing = grouped.get(alignedEpoch);
       if (c.high > existing.high) existing.high = c.high;
       if (c.low < existing.low) existing.low = c.low;
       existing.close = c.close;
@@ -359,7 +360,7 @@ function aggregateCandles(oneMinCandles, intervalMinutes) {
     }
   }
   
-  return Array.from(grouped.values()).sort((a, b) => a.time.localeCompare(b.time));
+  return Array.from(grouped.values()).sort((a, b) => a.time - b.time);
 }
 
 // === 포맷 ===

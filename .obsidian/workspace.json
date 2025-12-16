@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/CANDLE_TESTING.md",
+                "file": "AWS_ARCHITECTURE.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "CANDLE_TESTING"
+              "title": "AWS_ARCHITECTURE"
             }
           }
         ]
@@ -185,6 +185,7 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "docs/CANDLE_TESTING.md",
     "docs/CANDLE_IMPROVEMENTS.md",
     "docs/CANDLE_ARCHITECTURE.md",
     "docs/data/supernoba-market-data/trades/TEST/20251215/14/14.json",
@@ -198,7 +199,6 @@
     "docs/data/supernoba-market-data/trades/TEST/20251215/14/02.json",
     "docs/data/supernoba-market-data/trades/TEST/20251215/14/02.json.crdownload",
     "AWS_ARCHITECTURE.md",
-    "docs/CANDLE_TESTING.md",
     "docs/CODE_ANALYSIS_REPORT.md",
     "docs/FRONTEND_INTEGRATION_GUIDE.md",
     "docs/DATA_SCENARIOS.md",
