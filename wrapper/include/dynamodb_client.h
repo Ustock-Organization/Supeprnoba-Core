@@ -31,9 +31,6 @@ public:
                   const std::string& buyer_order,
                   const std::string& seller_order);
     
-    // 전일 종가 조회
-    std::optional<uint64_t> getPrevClose(const std::string& symbol);
-    
 private:
     std::string region_;
     std::string table_name_;

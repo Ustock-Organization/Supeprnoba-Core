@@ -83,31 +83,4 @@ bool DynamoDBClient::putTrade(const std::string& symbol,
 #endif
 }
 
-std::optional<uint64_t> DynamoDBClient::getPrevClose(const std::string& symbol) {
-#ifdef USE_KINESIS
-    if (!connected_ || !client_) {
-        return std::nullopt;
-    }
-    
-    // symbol_history 테이블에서 가장 최근 종가 조회
-    // (실제 구현 시 날짜 기반 쿼리 필요)
-    Aws::DynamoDB::Model::GetItemRequest request;
-    request.SetTableName("symbol_history");
-    request.AddKey("symbol", Aws::DynamoDB::Model::AttributeValue(symbol));
-    
-    auto outcome = client_->GetItem(request);
-    
-    if (outcome.IsSuccess()) {
-        const auto& item = outcome.GetResult().GetItem();
-        if (item.find("close") != item.end()) {
-            return std::stoull(item.at("close").GetN());
-        }
-    }
-    
-    return std::nullopt;
-#else
-    return std::nullopt;
-#endif
-}
-
 } // namespace aws_wrapper
