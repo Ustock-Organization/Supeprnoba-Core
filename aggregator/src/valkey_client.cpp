@@ -10,7 +10,7 @@ using json = nlohmann::json;
 
 namespace aggregator {
 
-// YYYYMMDDHHmm → epoch 초 변환
+// YYYYMMDDHHmm → epoch 초 변환 (KST 기준)
 int64_t Candle::epoch() const {
     struct tm tm = {};
     tm.tm_year = std::stoi(time.substr(0, 4)) - 1900;
@@ -18,7 +18,16 @@ int64_t Candle::epoch() const {
     tm.tm_mday = std::stoi(time.substr(6, 2));
     tm.tm_hour = std::stoi(time.substr(8, 2));
     tm.tm_min = std::stoi(time.substr(10, 2));
-    return mktime(&tm);
+    tm.tm_sec = 0;
+    
+    // timegm 대신 mktime 사용 + KST offset 적용
+    // time 문자열이 KST이므로 UTC로 변환 필요: KST = UTC + 9h
+    time_t local_epoch = mktime(&tm);
+    
+    // 시스템이 UTC라면 KST 시간을 그대로 사용
+    // time 문자열 자체가 KST 시간이므로 9시간을 빼서 UTC epoch로 변환
+    const int64_t KST_OFFSET = 9 * 3600;  // 9시간
+    return local_epoch - KST_OFFSET;
 }
 
 ValkeyClient::ValkeyClient(const std::string& host, int port)

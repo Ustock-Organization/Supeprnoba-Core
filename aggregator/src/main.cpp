@@ -13,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <map>
 
 #include <aws/core/Aws.h>
 
@@ -106,7 +107,7 @@ int main(int argc, char* argv[]) {
                 // 3. 타임프레임별 집계
                 auto aggregated = aggregator.aggregate(closed_candles);
                 
-                // 4. DynamoDB 저장
+                // 4. DynamoDB 저장 (모든 캔들 즉시 저장)
                 for (const auto& [interval, candles] : aggregated) {
                     if (candles.empty()) continue;
                     
@@ -114,16 +115,33 @@ int main(int argc, char* argv[]) {
                     Logger::info("[DDB]", symbol, interval, ":", saved, "candles saved");
                 }
                 
-                // 5. S3 백업 (1분봉만)
-                if (!closed_candles.empty()) {
-                    if (s3.put_candles(symbol, "1m", closed_candles)) {
-                        Logger::info("[S3]", symbol, "1m:", closed_candles.size(), "candles saved");
+                // 5. S3 백업 (60개 이상일 때만 - 1시간치)
+                // 시간 단위로 그룹핑: YYYYMMDDHHmm에서 YYYYMMDDHHxx 기준
+                if (closed_candles.size() >= 60) {
+                    // 시간별로 그룹화
+                    std::map<std::string, std::vector<Candle>> hourly_groups;
+                    for (const auto& c : closed_candles) {
+                        // time = YYYYMMDDHHmm → YYYYMMDDHH (시간 단위)
+                        std::string hour_key = c.time.substr(0, 10);  // 10자리: YYYYMMDDHH
+                        hourly_groups[hour_key].push_back(c);
                     }
+                    
+                    for (const auto& [hour, hour_candles] : hourly_groups) {
+                        // 60개가 모인 시간만 저장 (정시 마감된 시간)
+                        if (hour_candles.size() >= 60) {
+                            if (s3.put_candles(symbol, "1m", hour_candles)) {
+                                Logger::info("[S3]", symbol, "1m:", hour_candles.size(), "candles saved for hour", hour);
+                            }
+                        }
+                    }
+                    
+                    // 6. 저장된 캔들만 Valkey에서 삭제
+                    valkey.delete_closed_candles(symbol);
+                    Logger::debug("[VALKEY]", symbol, "closed candles deleted");
+                } else {
+                    Logger::debug("[S3] Waiting for 60 candles, current:", closed_candles.size());
+                    // 아직 60개 미만이면 Valkey에서 삭제하지 않음
                 }
-                
-                // 6. Valkey에서 처리된 캔들 삭제
-                valkey.delete_closed_candles(symbol);
-                Logger::debug("[VALKEY]", symbol, "closed candles deleted");
             }
             
         } catch (const std::exception& e) {
