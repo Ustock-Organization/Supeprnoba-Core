@@ -114,8 +114,10 @@ async function getCompletedCandles(symbol, interval, limit) {
     
     return result.Items.map(item => {
       const timeStr = item.time || item.sk;  // YYYYMMDDHHmm 형식
+      const epoch = ymdhmToEpoch(timeStr);  // epoch으로 변환
       return {
-        time: ymdhmToEpoch(timeStr),  // epoch으로 변환
+        time: epoch,  // epoch (초, UTC 기준) - 클라이언트가 우선 사용
+        time_ymdhm: timeStr,  // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
         open: parseFloat(item.open || item.o),
         high: parseFloat(item.high || item.h),
         low: parseFloat(item.low || item.l),
@@ -146,14 +148,18 @@ async function computeActiveCandle(symbol, intervalSeconds) {
       .map(c => { try { return JSON.parse(c); } catch { return null; } })
       .filter(c => c !== null)
       .filter(c => c.t >= periodStartYMDHM && c.t < periodEndYMDHM)
-      .map(c => ({
-        time: ymdhmToEpoch(c.t),  // epoch으로 변환
-        o: parseFloat(c.o),
-        h: parseFloat(c.h),
-        l: parseFloat(c.l),
-        c: parseFloat(c.c),
-        v: parseFloat(c.v) || 0
-      }));
+      .map(c => {
+        const epoch = ymdhmToEpoch(c.t);  // epoch으로 변환
+        return {
+          time: epoch,  // epoch (초, UTC 기준)
+          time_ymdhm: c.t,  // YYYYMMDDHHmm
+          o: parseFloat(c.o),
+          h: parseFloat(c.h),
+          l: parseFloat(c.l),
+          c: parseFloat(c.c),
+          v: parseFloat(c.v) || 0
+        };
+      });
     
     // 2. DynamoDB에서 현재 기간 1분봉 조회 (백업된 데이터 - Valkey 비었을 때 대비)
     let dbCandles = [];
@@ -169,14 +175,19 @@ async function computeActiveCandle(symbol, intervalSeconds) {
           }
         }));
         
-        dbCandles = (result.Items || []).map(item => ({
-          time: ymdhmToEpoch(item.time || item.sk),  // epoch으로 변환
-          o: parseFloat(item.open || item.o),
-          h: parseFloat(item.high || item.h),
-          l: parseFloat(item.low || item.l),
-          c: parseFloat(item.close || item.c),
-          v: parseFloat(item.volume || item.v) || 0
-        }));
+        dbCandles = (result.Items || []).map(item => {
+          const timeStr = item.time || item.sk;
+          const epoch = ymdhmToEpoch(timeStr);
+          return {
+            time: epoch,  // epoch (초, UTC 기준)
+            time_ymdhm: timeStr,  // YYYYMMDDHHmm
+            o: parseFloat(item.open || item.o),
+            h: parseFloat(item.high || item.h),
+            l: parseFloat(item.low || item.l),
+            c: parseFloat(item.close || item.c),
+            v: parseFloat(item.volume || item.v) || 0
+          };
+        });
         
         if (dbCandles.length > 0) {
           console.log(`[ACTIVE] Using ${dbCandles.length} 1m candles from DynamoDB for ${symbol}`);
@@ -202,9 +213,10 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     
     // 현재 진행 중인 1분봉 추가
     if (activeOneMin && activeOneMin.t && activeOneMin.t >= periodStartYMDHM) {
-      const activeEpoch = ymdhmToEpoch(activeOneMin.t);
+      const activeEpoch = activeOneMin.t_epoch ? parseInt(activeOneMin.t_epoch) : ymdhmToEpoch(activeOneMin.t);
       candleMap.set(activeEpoch, {
-        time: activeEpoch,
+        time: activeEpoch,  // epoch (초, UTC 기준)
+        time_ymdhm: activeOneMin.t,  // YYYYMMDDHHmm
         o: parseFloat(activeOneMin.o),
         h: parseFloat(activeOneMin.h),
         l: parseFloat(activeOneMin.l),
@@ -220,9 +232,10 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     // 시간순 정렬 (숫자 비교)
     mergedCandles.sort((a, b) => a.time - b.time);
     
-    // 집계 - epoch으로 반환
+    // 집계 - epoch과 ymdhm 둘 다 반환
     return {
-      time: periodStartEpoch,  // epoch 타임스탬프
+      time: periodStartEpoch,  // epoch 타임스탬프 (초, UTC 기준)
+      time_ymdhm: periodStartYMDHM,  // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
       open: mergedCandles[0].o,
       high: Math.max(...mergedCandles.map(c => c.h)),
       low: Math.min(...mergedCandles.map(c => c.l)),
@@ -270,8 +283,10 @@ async function getActiveCandle(symbol) {
     
     if (!candle || !candle.t) return null;
     
+    const epoch = candle.t_epoch ? parseInt(candle.t_epoch) : ymdhmToEpoch(candle.t);
     return {
-      time: ymdhmToEpoch(candle.t),  // epoch으로 변환
+      time: epoch,  // epoch (초, UTC 기준)
+      time_ymdhm: candle.t,  // YYYYMMDDHHmm
       open: parseFloat(candle.o),
       high: parseFloat(candle.h),
       low: parseFloat(candle.l),
@@ -299,14 +314,19 @@ async function getColdCandles(symbol, limit) {
     
     if (!result.Items || result.Items.length === 0) return [];
     
-    return result.Items.map(item => ({
-      time: ymdhmToEpoch(item.time || item.sk),  // epoch으로 변환
-      open: parseFloat(item.open || item.o),
-      high: parseFloat(item.high || item.h),
-      low: parseFloat(item.low || item.l),
-      close: parseFloat(item.close || item.c),
-      volume: parseFloat(item.volume || item.v) || 0
-    })).sort((a, b) => a.time - b.time);
+    return result.Items.map(item => {
+      const timeStr = item.time || item.sk;
+      const epoch = ymdhmToEpoch(timeStr);
+      return {
+        time: epoch,  // epoch (초, UTC 기준)
+        time_ymdhm: timeStr,  // YYYYMMDDHHmm
+        open: parseFloat(item.open || item.o),
+        high: parseFloat(item.high || item.h),
+        low: parseFloat(item.low || item.l),
+        close: parseFloat(item.close || item.c),
+        volume: parseFloat(item.volume || item.v) || 0
+      };
+    }).sort((a, b) => a.time - b.time);
     
   } catch (error) {
     console.error('DynamoDB query error:', error);
@@ -353,7 +373,8 @@ function aggregateCandles(oneMinCandles, intervalMinutes) {
     
     if (!grouped.has(alignedEpoch)) {
       grouped.set(alignedEpoch, {
-        time: alignedEpoch,
+        time: alignedEpoch,  // epoch (초, UTC 기준)
+        time_ymdhm: epochToYMDHM(alignedEpoch),  // YYYYMMDDHHmm
         open: c.open,
         high: c.high,
         low: c.low,
@@ -375,7 +396,8 @@ function aggregateCandles(oneMinCandles, intervalMinutes) {
 // === 포맷 ===
 function formatCandle(candle) {
   return {
-    time: candle.time,
+    time: candle.time,  // epoch (초, UTC 기준) - 클라이언트가 우선 사용
+    time_ymdhm: candle.time_ymdhm || epochToYMDHM(candle.time),  // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
     open: candle.open,
     high: candle.high,
     low: candle.low,

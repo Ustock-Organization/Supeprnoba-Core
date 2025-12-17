@@ -85,6 +85,24 @@ async function isRealtimeConnection(connectionId) {
   return await valkey.sismember('realtime:connections', connectionId);
 }
 
+// === YYYYMMDDHHmm → epoch 변환 (KST → UTC) ===
+function ymdhmToEpoch(ymdhm) {
+  if (!ymdhm || ymdhm.length !== 12) return null;
+  
+  const y = parseInt(ymdhm.slice(0, 4));
+  const m = parseInt(ymdhm.slice(4, 6)) - 1;
+  const d = parseInt(ymdhm.slice(6, 8));
+  const h = parseInt(ymdhm.slice(8, 10));
+  const min = parseInt(ymdhm.slice(10, 12));
+  
+  // KST 시간을 UTC epoch으로 변환
+  // Date.UTC()는 주어진 시간을 UTC로 해석하므로,
+  // KST 시간을 UTC로 잘못 해석한 후 9시간을 빼서 올바른 UTC 시간을 얻음
+  // 예: KST 2025-12-17 17:00 → Date.UTC는 UTC 17:00로 해석 → 9시간 빼면 UTC 08:00 (정확)
+  const utcMs = Date.UTC(y, m, d, h, min, 0, 0) - (9 * 60 * 60 * 1000);
+  return Math.floor(utcMs / 1000);
+}
+
 // === 데이터 조회 ===
 async function fetchSymbolData(symbol) {
   const [depthJson, tickerJson, candle] = await Promise.all([
@@ -93,10 +111,22 @@ async function fetchSymbolData(symbol) {
     valkey.hgetall(`candle:1m:${symbol}`),
   ]);
   
+  // 캔들 데이터에 epoch 추가 (t_epoch가 없으면 t에서 변환)
+  if (candle && candle.t) {
+    // t_epoch가 있으면 사용, 없으면 t에서 변환
+    if (!candle.t_epoch && candle.t) {
+      candle.t_epoch = ymdhmToEpoch(candle.t);
+    }
+    // 숫자로 변환
+    if (candle.t_epoch) {
+      candle.t_epoch = parseInt(candle.t_epoch);
+    }
+    candleCache[symbol] = candle;
+  }
+  
   // 캐시 갱신 (500ms용)
   if (depthJson) depthCache[symbol] = depthJson;
   if (tickerJson) tickerCache[symbol] = tickerJson;
-  if (candle && candle.t) candleCache[symbol] = candle;
   
   return { depthJson, tickerJson, candle };
 }
@@ -111,6 +141,10 @@ function detectCandleClose(symbol, currentCandle) {
   if (prevCandle && prevCandle.t && prevCandle.t !== currentCandle.t) {
     debug(`Candle closed: ${symbol} t=${prevCandle.t} -> ${currentCandle.t}`);
     const closedCandle = { ...prevCandle };  // 복사본 반환
+    // epoch도 포함
+    if (!closedCandle.t_epoch && closedCandle.t) {
+      closedCandle.t_epoch = ymdhmToEpoch(closedCandle.t);
+    }
     prevCandleData[symbol] = { ...currentCandle };  // 현재 캔들 저장
     return closedCandle;
   }
@@ -154,12 +188,37 @@ async function broadcastToSubscribers(symbol, mainSubs, subSubs, data, realtimeO
     }
     
     if (candle && candle.t) {
-      const candleMsg = JSON.stringify({ e: 'candle', tf: '1m', s: symbol, ...candle });
+      // epoch과 ymdhm 둘 다 포함하여 전송 (클라이언트가 epoch 우선 사용)
+      const candleMsg = JSON.stringify({ 
+        e: 'candle', 
+        tf: '1m', 
+        s: symbol,
+        o: candle.o,
+        h: candle.h,
+        l: candle.l,
+        c: candle.c,
+        v: candle.v,
+        t: candle.t,           // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
+        t_epoch: candle.t_epoch || ymdhmToEpoch(candle.t)  // epoch (초, UTC 기준)
+      });
       tasks.push(...filteredMainSubs.map(id => sendToConnection(id, candleMsg)));
     }
     
     if (closedCandle) {
-      const closeMsg = JSON.stringify({ e: 'candle_close', tf: '1m', s: symbol, ...closedCandle });
+      // 마감된 캔들도 epoch 포함
+      const closedEpoch = closedCandle.t_epoch || ymdhmToEpoch(closedCandle.t);
+      const closeMsg = JSON.stringify({ 
+        e: 'candle_close', 
+        tf: '1m', 
+        s: symbol,
+        o: closedCandle.o,
+        h: closedCandle.h,
+        l: closedCandle.l,
+        c: closedCandle.c,
+        v: closedCandle.v,
+        t: closedCandle.t,
+        t_epoch: closedEpoch
+      });
       tasks.push(...filteredMainSubs.map(id => sendToConnection(id, closeMsg)));
     }
     

@@ -12,6 +12,8 @@ namespace aggregator {
 
 // YYYYMMDDHHmm → epoch 초 변환 (KST 기준)
 int64_t Candle::epoch() const {
+    if (time.empty() || time.length() < 12) return 0;
+    
     struct tm tm = {};
     tm.tm_year = std::stoi(time.substr(0, 4)) - 1900;
     tm.tm_mon = std::stoi(time.substr(4, 2)) - 1;
@@ -19,15 +21,17 @@ int64_t Candle::epoch() const {
     tm.tm_hour = std::stoi(time.substr(8, 2));
     tm.tm_min = std::stoi(time.substr(10, 2));
     tm.tm_sec = 0;
+    tm.tm_isdst = -1;  // DST 정보 없음
     
-    // timegm 대신 mktime 사용 + KST offset 적용
-    // time 문자열이 KST이므로 UTC로 변환 필요: KST = UTC + 9h
+    // mktime()은 시스템 로컬 타임존을 사용하므로,
+    // 서버가 UTC라면 KST 시간을 UTC로 잘못 해석함
+    // 따라서 9시간을 빼서 올바른 UTC epoch를 얻음
+    // 예: KST "202512171700" → mktime()은 UTC 17:00로 해석 → 9시간 빼면 UTC 08:00 (정확)
     time_t local_epoch = mktime(&tm);
     
-    // 시스템이 UTC라면 KST 시간을 그대로 사용
-    // time 문자열 자체가 KST 시간이므로 9시간을 빼서 UTC epoch로 변환
-    const int64_t KST_OFFSET = 9 * 3600;  // 9시간
-    return local_epoch - KST_OFFSET;
+    // KST = UTC + 9시간이므로, KST 시간에서 9시간을 빼야 UTC epoch가 됨
+    const int64_t KST_OFFSET = 9 * 3600;  // 9시간 (초)
+    return static_cast<int64_t>(local_epoch) - KST_OFFSET;
 }
 
 ValkeyClient::ValkeyClient(const std::string& host, int port)
@@ -106,6 +110,11 @@ std::vector<Candle> ValkeyClient::get_closed_candles(const std::string& symbol) 
                 c.close = std::stod(j.value("c", "0"));
                 c.volume = std::stod(j.value("v", "0"));
                 
+                // t_epoch 필드가 있으면 사용 (성능 최적화)
+                // 없으면 epoch() 메서드로 변환 (하위 호환성)
+                // 현재는 epoch() 메서드 사용하므로 t_epoch는 무시해도 됨
+                // 하지만 나중에 Candle 구조체에 epoch 필드 추가 시 활용 가능
+                
                 if (!c.time.empty()) {
                     candles.push_back(c);
                 }
@@ -126,9 +135,12 @@ Candle ValkeyClient::get_active_candle(const std::string& symbol) {
     redisReply* reply = (redisReply*)redisCommand(ctx_, "HGETALL %s", key.c_str());
     if (!reply) return c;
     
-    if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2 && reply->elements % 2 == 0) {
         c.symbol = symbol;
         for (size_t i = 0; i < reply->elements; i += 2) {
+            // 배열 인덱스 범위 체크
+            if (i + 1 >= reply->elements) break;
+            
             std::string field = reply->element[i]->str;
             std::string value = reply->element[i+1]->str;
             
@@ -138,6 +150,8 @@ Candle ValkeyClient::get_active_candle(const std::string& symbol) {
             else if (field == "l") c.low = std::stod(value);
             else if (field == "c") c.close = std::stod(value);
             else if (field == "v") c.volume = std::stod(value);
+            // t_epoch 필드는 현재 Candle 구조체에 없으므로 무시
+            // 나중에 구조체에 epoch 필드 추가 시 활용 가능
         }
     }
     freeReplyObject(reply);

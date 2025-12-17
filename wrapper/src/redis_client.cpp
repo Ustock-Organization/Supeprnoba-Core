@@ -313,17 +313,33 @@ std::string RedisClient::eval(const std::string& script, int numKeys,
 
 // === Unix epoch → YYYYMMDDHHmm 형식 변환 (KST 기준: UTC+9) ===
 std::string epochToYMDHM(int64_t epoch) {
+    // epoch은 UTC 기준이므로, KST로 변환하려면 +9시간
+    // mktime()을 사용하여 올바른 날짜 계산 보장
+    time_t utc_time = static_cast<time_t>(epoch);
+    
+    // UTC 시간 구조체 얻기
+    struct tm* tm_utc = gmtime(&utc_time);
+    if (!tm_utc) {
+        Logger::warn("gmtime() failed for epoch:", epoch);
+        return "000000000000";
+    }
+    
     // KST = UTC + 9시간
-    time_t kst_time = static_cast<time_t>(epoch + (9 * 3600));
-    struct tm* tm_info = gmtime(&kst_time); // gmtime을 사용하여 UTC(여기서는 KST 시간값) 구조체 얻기
+    // time_t에 9시간(32400초) 추가 후 다시 구조체로 변환
+    time_t kst_time = utc_time + (9 * 3600);
+    struct tm* tm_kst = gmtime(&kst_time);
+    if (!tm_kst) {
+        Logger::warn("gmtime() failed for KST epoch:", kst_time);
+        return "000000000000";
+    }
     
     char buffer[13];  // YYYYMMDDHHmm + null
     snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d",
-        tm_info->tm_year + 1900,
-        tm_info->tm_mon + 1,
-        tm_info->tm_mday,
-        tm_info->tm_hour,
-        tm_info->tm_min);
+        tm_kst->tm_year + 1900,
+        tm_kst->tm_mon + 1,
+        tm_kst->tm_mday,
+        tm_kst->tm_hour,
+        tm_kst->tm_min);
     
     return std::string(buffer);
 }
@@ -333,14 +349,14 @@ std::string epochToYMDHM(int64_t epoch) {
 bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64_t qty, int64_t timestamp) {
     if (!context_) return false;
     
-    // Lua Script: 원자적 캔들 업데이트 (YYYYMMDDHHmm 형식 사용)
+    // Lua Script: 원자적 캔들 업데이트 (YYYYMMDDHHmm + epoch 둘 다 저장)
     static const std::string luaScript = R"(
         local key = KEYS[1]
         local closedKey = KEYS[2]
         local price = tonumber(ARGV[1])
         local qty = tonumber(ARGV[2])
-        local ts = ARGV[3]      -- Unix epoch (참조용)
-        local minute = ARGV[4]  -- YYYYMMDDHHmm 형식 (C++에서 변환됨)
+        local ts = ARGV[3]      -- Unix epoch (초, UTC 기준)
+        local minute = ARGV[4]  -- YYYYMMDDHHmm 형식 (KST 기준, 사람이 읽기 쉬운 형식)
         
         local current_t = redis.call("HGET", key, "t")
         
@@ -359,11 +375,11 @@ bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64
                 redis.call("LPUSH", closedKey, json)
                 redis.call("LTRIM", closedKey, 0, 999)  -- 닫힌 캔들은 최대 1000개 유지
             end
-            -- 이전 캔들을 덮어쓰기 (DEL 없이 바로 HMSET으로 새 캔들 생성)
-            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute)
+            -- 새 캔들 생성: epoch(t_epoch)와 ymdhm(t) 둘 다 저장
+            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute, "t_epoch", ts)
         elseif not current_t then
             -- 새 캔들 생성 (처음 또는 만료 후)
-            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute)
+            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute, "t_epoch", ts)
         else
             -- 기존 캔들 데이터 갱신 (같은 분 내)
             local h = tonumber(redis.call("HGET", key, "h")) -- 현재 고가
@@ -372,6 +388,8 @@ bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64
             if price < l then redis.call("HSET", key, "l", price) end -- 저가 갱신
             redis.call("HSET", key, "c", price) -- 종가 갱신
             redis.call("HINCRBY", key, "v", qty) -- 거래량 증가 (정수 사용)
+            -- epoch도 업데이트 (같은 분 내에서도 최신 시간으로 갱신)
+            redis.call("HSET", key, "t_epoch", ts)
         end
         
         -- 현재 캔들과 닫힌 캔들 버퍼에 만료 시간 설정

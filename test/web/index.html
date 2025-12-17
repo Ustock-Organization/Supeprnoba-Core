@@ -1702,22 +1702,51 @@
             '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
         };
         
-        // === YYYYMMDDHHmm → epoch 변환 (KST 시간 문자열 → UTC epoch) ===
+        // === 타임스탬프 변환 유틸리티 (하위 호환성 유지) ===
         const KST_OFFSET_SEC = 9 * 60 * 60;  // 9시간 (초)
         
         function ymdhmToEpoch(ymdhm) {
-            // "202512161404" → Unix epoch seconds
-            // ymdhm은 KST 시간이므로 UTC로 변환 필요
-            if (typeof ymdhm === 'number') return ymdhm;  // 이미 epoch인 경우
-            if (!ymdhm || ymdhm.length < 12) return 0;
-            const y = parseInt(ymdhm.slice(0, 4));
-            const m = parseInt(ymdhm.slice(4, 6)) - 1;
-            const d = parseInt(ymdhm.slice(6, 8));
-            const h = parseInt(ymdhm.slice(8, 10));
-            const min = parseInt(ymdhm.slice(10, 12));
-            // Date.UTC로 UTC 시간 생성 후 KST 오프셋 빼기
+            // 하위 호환성: YYYYMMDDHHmm 문자열을 epoch으로 변환
+            // 하지만 이제는 백엔드에서 epoch을 제공하므로 이 함수는 레거시 지원용
+            if (typeof ymdhm === 'undefined' || ymdhm === null) return 0;
+
+            // 숫자이고 10자리 이하면 epoch으로 간주
+            let str = ymdhm.toString();
+            if (typeof ymdhm === 'number' && str.length <= 10) return ymdhm;
+            
+            // 12자리 문자열이면 YYYYMMDDHHmm 형식으로 간주
+            if (str.length < 12) return 0;
+            const y = parseInt(str.slice(0, 4));
+            const m = parseInt(str.slice(4, 6)) - 1;
+            const d = parseInt(str.slice(6, 8));
+            const h = parseInt(str.slice(8, 10));
+            const min = parseInt(str.slice(10, 12));
+            // KST → UTC 변환
             const utcMs = Date.UTC(y, m, d, h, min, 0, 0) - (KST_OFFSET_SEC * 1000);
             return Math.floor(utcMs / 1000);
+        }
+        
+        // === 타임스탬프 추출 (epoch 우선, ymdhm 폴백) ===
+        function extractTimestamp(msg) {
+            // 우선순위: t_epoch > time > t (ymdhm 변환)
+            if (msg.t_epoch !== undefined && msg.t_epoch !== null) {
+                return parseInt(msg.t_epoch);
+            }
+            if (msg.time !== undefined && msg.time !== null) {
+                // time이 이미 epoch인지 확인
+                const time = typeof msg.time === 'number' ? msg.time : parseInt(msg.time);
+                // 10자리 이하면 epoch으로 간주
+                if (time.toString().length <= 10) {
+                    return time;
+                }
+                // 12자리면 ymdhm으로 간주하고 변환
+                return ymdhmToEpoch(time);
+            }
+            // t 필드가 있으면 ymdhm으로 간주
+            if (msg.t !== undefined && msg.t !== null) {
+                return ymdhmToEpoch(msg.t);
+            }
+            return 0;
         }
         
         // 타임프레임 선택 함수 (버튼 클릭 시)
@@ -1781,22 +1810,28 @@
                 const result = await response.json();
                 
                 if (response.ok && result.data && result.data.length > 0) {
-                    apiCandles = result.data.map(c => ({
-                        time: ymdhmToEpoch(c.time),
-                        open: parseFloat(c.open),
-                        high: parseFloat(c.high),
-                        low: parseFloat(c.low),
-                        close: parseFloat(c.close),
-                        volume: parseFloat(c.volume) || 0,
-                        active: c.active || false
-                    }));
+                    apiCandles = result.data.map(c => {
+                        // time 필드는 epoch (백엔드에서 제공)
+                        // time_ymdhm은 표시용 (사람이 읽기 쉬운 형식)
+                        const time = typeof c.time === 'number' ? c.time : parseInt(c.time);
+                        return {
+                            time: time,  // epoch (초, UTC 기준)
+                            open: parseFloat(c.open),
+                            high: parseFloat(c.high),
+                            low: parseFloat(c.low),
+                            close: parseFloat(c.close),
+                            volume: parseFloat(c.volume) || 0,
+                            active: c.active || false
+                        };
+                    });
                     addLog('INFO', `[CHART] API에서 ${apiCandles.length}개 캔들 로드`);
                     
                     // 활성 캔들 추적
                     const lastCandle = result.data[result.data.length - 1];
                     if (lastCandle && lastCandle.active) {
+                        const time = typeof lastCandle.time === 'number' ? lastCandle.time : parseInt(lastCandle.time);
                         apiActiveCandle = {
-                            time: ymdhmToEpoch(lastCandle.time),
+                            time: time,  // epoch (초, UTC 기준)
                             open: parseFloat(lastCandle.open),
                             high: parseFloat(lastCandle.high),
                             low: parseFloat(lastCandle.low),
@@ -2099,7 +2134,18 @@
             const l = parseFloat(msg.l);
             const c = parseFloat(msg.c);
             const v = parseFloat(msg.v) || 0;
-            const t = ymdhmToEpoch(msg.t);  // YYYYMMDDHHmm → epoch 변환
+            
+            // epoch 우선 사용 (백엔드에서 제공)
+            // t_epoch가 있으면 사용, 없으면 time 또는 t에서 추출
+            let t = extractTimestamp(msg);
+            
+            // 타임스탬프 검증: 현재 시간보다 너무 미래면 오류로 간주
+            const nowSec = Math.floor(Date.now() / 1000);
+            if (t > nowSec + 3600) { // 1시간 이상 미래면 오류
+                console.warn('[CHART] Invalid timestamp:', t, 'current:', nowSec, 'msg:', msg);
+                // 최대 1시간 미래로 제한
+                t = nowSec + 3600;
+            }
             
             // 심볼 저장 (타임프레임 전환에 사용)
             if (msg.s && msg.s !== chartSymbol) {
@@ -2532,7 +2578,8 @@
 
         // 초기화
         addLog('INFO', 'Supernoba API Test Console 시작');
-        initOrderbookPlaceholder();
+        // initOrderbookPlaceholder(); // 제거됨 (uiState 사용)
+        console.log('Test Console Script Loaded. Waiting for window load...');
     </script>
 </body>
 </html>

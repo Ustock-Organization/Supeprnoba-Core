@@ -186,6 +186,7 @@
   },
   "active": "2df01f10dcd40573",
   "lastOpenFiles": [
+    "docs/TECHNICAL_HANDOVER.md",
     "aggregator/README.md",
     "aggregator/src/s3_client.cpp",
     "aggregator/src/dynamodb_client.cpp",
@@ -230,7 +231,6 @@
     "doc/settAug2013/images/Right.png",
     "doc/settAug2013/images/Middle.png",
     "doc/settAug2013/images/Left.png",
-    "doc/KINESIS_ARCHITECTURE.md",
     "doc/AWS-MSK-DOC/자습서_ Amazon MSK 이벤트 소스 매핑을 사용하여 간접적으로 Lambda 함수 간접 호출 - AWS Lambda_files/aws_logo_dark.svg"
   ]
 }
