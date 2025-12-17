@@ -1260,89 +1260,7 @@
             selectTimeframe(currentTf);
         }
         
-        // 차트 히스토리 로드 (Chart API)
-        async function loadChartHistory(symbol) {
-            const chartApiEndpoint = document.getElementById('chartApiEndpoint').value;
-            const interval = document.getElementById('chartTimeframe').value;
-            
-            if (!chartApiEndpoint) {
-                document.getElementById('chartLoadStatus').innerHTML = '⚠️ Chart API 엔드포인트 필요';
-                return;
-            }
-            
-            document.getElementById('chartLoadStatus').innerHTML = `⏳ ${symbol} ${interval} 차트 로딩 중...`;
-            
-            try {
-                const url = `${chartApiEndpoint}?symbol=${symbol}&interval=${interval}&limit=100`;
-                const response = await fetch(url);
-                const result = await response.json();
-                
-                if (response.ok && result.data && result.data.length > 0) {
-                    // 차트 데이터 초기화 및 로드
-                    candleData = [];
-                    volumeData = [];
-                    
-                    for (const candle of result.data) {
-                        const t = candle.time;
-                        const o = parseFloat(candle.open);
-                        const h = parseFloat(candle.high);
-                        const l = parseFloat(candle.low);
-                        const c = parseFloat(candle.close);
-                        const v = parseFloat(candle.volume) || 0;
-                        const isBullish = c >= o;
-                        const isActive = candle.active === true;
-                        
-                        candleData.push({ time: t, open: o, high: h, low: l, close: c });
-                        // 활성 캔들은 다른 색상으로 표시 (진한 색)
-                        const upColor = isActive ? 'rgba(63, 185, 80, 0.8)' : 'rgba(63, 185, 80, 0.5)';
-                        const downColor = isActive ? 'rgba(248, 81, 73, 0.8)' : 'rgba(248, 81, 73, 0.5)';
-                        volumeData.push({ time: t, value: v, color: isBullish ? upColor : downColor });
-                    }
-                    
-                    // TradingView 차트에 반영
-                    if (!tvChart) initTradingViewChart();
-                    if (candleSeries) {
-                        candleSeries.setData(candleData);
-                        volumeSeries.setData(volumeData);
-                        
-                        // [Fix] 버퍼 리플레이: setData로 사라진 '최신 실시간 데이터' 복구
-                        if (oneMinCandleBuffer.length > 0) {
-                            const currentTf = document.getElementById('chartTimeframe').value || '1m';
-                            const intervalSeconds = TIMEFRAME_SECONDS[currentTf] || 60;
-                            // 버퍼를 현재 타임프레임으로 집계
-                            const bufferAggregated = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
-                            // 마지막 로드된 히스토리보다 같거나 최신인 데이터만 업데이트
-                            const lastTime = candleData.length > 0 ? candleData[candleData.length - 1].time : 0;
-                            
-                            bufferAggregated.forEach(c => {
-                                if (c.time >= lastTime) {
-                                    candleSeries.update(c);
-                                    const volColor = c.close >= c.open ? 'rgba(63, 185, 80, 0.5)' : 'rgba(248, 81, 73, 0.5)';
-                                    volumeSeries.update({ time: c.time, value: c.volume, color: volColor });
-                                }
-                            });
-                        }
-                    }
-                    
-                    // 활성 캔들 여부 확인
-                    const hasActive = result.data.some(c => c.active);
-                    const activeLabel = hasActive ? ' 🟢 실시간' : '';
-                    
-                    document.getElementById('chartCandleTotal').textContent = candleData.length;
-                    document.getElementById('chartSymbolDisplay').textContent = `${symbol} (${interval})`;
-                    document.getElementById('chartLoadStatus').innerHTML = `✅ ${symbol} ${interval} 로드 완료 (${result.data.length}개)${activeLabel}`;
-                    addLog('INFO', `[CHART] ${symbol} ${interval} 히스토리 로드: ${result.data.length}개 캔들${hasActive ? ' (활성 캔들 포함)' : ''}`);
-                    
-                } else {
-                    document.getElementById('chartLoadStatus').innerHTML = `📊 ${symbol} 차트 데이터 없음`;
-                    addLog('WARN', `[CHART] ${symbol} 차트 데이터 없음`);
-                }
-                
-            } catch (error) {
-                document.getElementById('chartLoadStatus').innerHTML = `❌ 차트 로드 실패: ${error.message}`;
-                addLog('ERROR', `[CHART] 로드 실패: ${error.message}`);
-            }
-        }
+
         
         // Sub 구독 (전광판 - 무제한)
         function subscribeSub() {
@@ -1904,6 +1822,23 @@
             // 버퍼 데이터로 덮어쓰기 (최신 데이터 우선)
             for (const c of bufferCandles) {
                 mergedMap.set(c.time, c);
+            }
+
+            // [CRITICAL FIX] Fetch 도중 수신된 실시간 데이터 추가 병합 (Race Condition 해결)
+            // loadChartDataForTimeframe이 실행되는 동안 oneMinCandleBuffer에 새로운 데이터가 들어왔을 수 있음
+            if (oneMinCandleBuffer.length > 0) {
+                 const currentAgg = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
+                 for (const c of currentAgg) {
+                     mergedMap.set(c.time, {
+                         time: c.time,
+                         open: c.open,
+                         high: c.high,
+                         low: c.low,
+                         close: c.close,
+                         volume: c.volume || 0,
+                         active: true // Mark as active
+                     });
+                 }
             }
             
             const allCandles = Array.from(mergedMap.values()).sort((a, b) => a.time - b.time);
