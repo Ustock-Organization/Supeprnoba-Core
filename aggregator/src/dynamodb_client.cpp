@@ -40,8 +40,8 @@ bool DynamoDBClient::put_candle(const std::string& symbol, const std::string& in
         std::string pk = "CANDLE#" + symbol + "#" + interval;
         request.AddItem("pk", Aws::DynamoDB::Model::AttributeValue(pk));
         
-        // sk: YYYYMMDDHHmm (String)
-        request.AddItem("sk", Aws::DynamoDB::Model::AttributeValue(candle.time));
+        // sk: epoch seconds (Number)
+        request.AddItem("sk", Aws::DynamoDB::Model::AttributeValue().SetN(std::to_string(candle.epoch())));
         
         // OHLCV 데이터
         request.AddItem("time", Aws::DynamoDB::Model::AttributeValue(candle.time));
@@ -87,7 +87,7 @@ int DynamoDBClient::batch_put_candles(const std::string& symbol, const std::stri
             
             std::string pk = "CANDLE#" + symbol + "#" + interval;
             put.AddItem("pk", Aws::DynamoDB::Model::AttributeValue(pk));
-            put.AddItem("sk", Aws::DynamoDB::Model::AttributeValue(candle.time));
+            put.AddItem("sk", Aws::DynamoDB::Model::AttributeValue().SetN(std::to_string(candle.epoch())));
             put.AddItem("time", Aws::DynamoDB::Model::AttributeValue(candle.time));
             put.AddItem("open", Aws::DynamoDB::Model::AttributeValue().SetN(std::to_string(candle.open)));
             put.AddItem("high", Aws::DynamoDB::Model::AttributeValue().SetN(std::to_string(candle.high)));

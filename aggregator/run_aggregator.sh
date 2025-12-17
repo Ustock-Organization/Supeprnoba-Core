@@ -54,7 +54,7 @@ export DYNAMODB_CANDLE_TABLE="candle_history"
 export S3_BUCKET="supernoba-market-data"
 
 # 폴링 간격 (ms)
-export POLL_INTERVAL_MS="100"
+export POLL_INTERVAL_MS="10"
 
 # 로그 레벨
 if [ "$DEBUG_MODE" == "true" ]; then
