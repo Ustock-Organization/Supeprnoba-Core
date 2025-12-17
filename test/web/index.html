@@ -6,6 +6,14 @@
     <title>Supernoba API Test Console</title>
     <!-- TradingView Lightweight Charts -->
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <!--
+    =============================================================================
+    [SECTION 1] CSS STYLES & LAYOUT
+    - Dark Theme Variables
+    - Flex/Grid Layouts
+    - Component Styles (Card, Orderbook, Chart)
+    =============================================================================
+    -->
     <style>
         :root {
             --bg-dark: #0d1117;
@@ -54,6 +62,7 @@
         header h1 {
             font-size: 2rem;
             background: linear-gradient(135deg, var(--accent), #a371f7);
+            background-clip: text;
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
@@ -409,6 +418,13 @@
         }
     </style>
 </head>
+<!--
+=============================================================================
+[SECTION 2] HTML STRUCTURE
+- Left Panel: Orderbook, Order Form, Admin Controls
+- Right Panel: Chart, Realtime Ticker, Logs
+=============================================================================
+-->
 <body>
     <div class="container">
         <header>
@@ -838,6 +854,11 @@
     </div>
 
     <script>
+        // =============================================================================
+        // [SECTION 3] JAVASCRIPT LOGIC
+        // =============================================================================
+        
+        // 1. GLOBAL CONFIGURATION
         let ws = null;
         let orderbooks = {};
         let subscribedSymbols = [];
@@ -1068,8 +1089,7 @@
             }
         }
         
-        // 초기 placeholder (initDOMCache에서 처리하므로 비워둠)
-        function initOrderbookPlaceholder() {}
+
 
         function renderOrderbookOptimized() {
             const data = uiState.orderbook;
@@ -1155,7 +1175,9 @@
             activeOrderbookSymbol = symbol;
             updateOrderbookTabs();
             if (orderbooks[symbol]) {
-                renderOrderbook(symbol, orderbooks[symbol]);
+                // UI State 업데이트 (Render Loop가 처리)
+                uiState.orderbook = orderbooks[symbol];
+                uiState.orderbookDirty = true;
             }
         }
         
@@ -1224,12 +1246,18 @@
             activeOrderbookSymbol = symbol;
             updateOrderbookTabs();
             
+            // 캔들 분석 버퍼 초기화 (중요: 이전 심볼 데이터 제거)
+            oneMinCandleBuffer = [];
+            
             document.getElementById('mainSubscribedInfo').innerHTML = `호가창: <strong style="color: var(--accent);">${symbol}</strong>`;
             document.getElementById('mainSymbol').value = '';
             addLog('INFO', `[MAIN] 구독: ${symbol}`);
             
             // ✅ 차트 히스토리 로드 (Chart API에서 과거 데이터 가져오기)
-            loadChartHistory(symbol);
+            // 전역 심볼 업데이트 및 타임프레임 로드 함수 사용 (일관성 유지)
+            chartSymbol = symbol;
+            const currentTf = document.getElementById('chartTimeframe').value || '1m';
+            selectTimeframe(currentTf);
         }
         
         // 차트 히스토리 로드 (Chart API)
@@ -1276,6 +1304,24 @@
                     if (candleSeries) {
                         candleSeries.setData(candleData);
                         volumeSeries.setData(volumeData);
+                        
+                        // [Fix] 버퍼 리플레이: setData로 사라진 '최신 실시간 데이터' 복구
+                        if (oneMinCandleBuffer.length > 0) {
+                            const currentTf = document.getElementById('chartTimeframe').value || '1m';
+                            const intervalSeconds = TIMEFRAME_SECONDS[currentTf] || 60;
+                            // 버퍼를 현재 타임프레임으로 집계
+                            const bufferAggregated = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
+                            // 마지막 로드된 히스토리보다 같거나 최신인 데이터만 업데이트
+                            const lastTime = candleData.length > 0 ? candleData[candleData.length - 1].time : 0;
+                            
+                            bufferAggregated.forEach(c => {
+                                if (c.time >= lastTime) {
+                                    candleSeries.update(c);
+                                    const volColor = c.close >= c.open ? 'rgba(63, 185, 80, 0.5)' : 'rgba(248, 81, 73, 0.5)';
+                                    volumeSeries.update({ time: c.time, value: c.volume, color: volColor });
+                                }
+                            });
+                        }
                     }
                     
                     // 활성 캔들 여부 확인
@@ -2000,7 +2046,11 @@
             tickerDirty: false,
             // 최근 캔들 차트 데이터
             lastChartCandle: null,
-            chartDirty: false
+            chartDirty: false,
+            // 차트 스로틀링용 상태
+            pendingChartData: null,
+            pendingVolumeData: null,
+            chartUpdatePending: false
         };
 
         const domCache = {};
@@ -2086,6 +2136,14 @@
                 if (uiState.chartDirty) {
                     renderChartInfoOptimized();
                     uiState.chartDirty = false;
+                }
+                // 실시간 차트 그리기 (스로틀링 적용)
+                if (uiState.chartUpdatePending && candleSeries && uiState.pendingChartData) {
+                    candleSeries.update(uiState.pendingChartData);
+                    if (volumeSeries && uiState.pendingVolumeData) {
+                        volumeSeries.update(uiState.pendingVolumeData);
+                    }
+                    uiState.chartUpdatePending = false;
                 }
                 requestAnimationFrame(loop);
             }
@@ -2207,9 +2265,11 @@
                         }
                     }
                     
-                    // TradingView 권장: update()로 마지막 캔들만 업데이트
-                    candleSeries.update(candlePoint);
-                    volumeSeries.update(volumePoint);
+                    // TradingView 권장: update()로 마지막 캔들만 업데이트 (스로틀링 적용)
+                    // UI 루프에서 처리하도록 상태 저장
+                    uiState.pendingChartData = candlePoint;
+                    uiState.pendingVolumeData = volumePoint;
+                    uiState.chartUpdatePending = true;
                     
                     document.getElementById('chartCandleTotal').textContent = `${candleData.length} (${selectedTimeframe})`;
                 }
