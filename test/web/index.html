@@ -2157,10 +2157,20 @@
             uiState.chartDirty = true;
             
             // 1분봉 버퍼에 저장 (실시간 집계용)
-            const oneMinCandle = { time: t, open: o, high: h, low: l, close: c, volume: v };
-            const existingIdx = oneMinCandleBuffer.findIndex(d => d.time === t);
+            // Server sends exact trade time in t_epoch, so we MUST align to minute boundary
+            const oneMinAlignedTime = Math.floor(t / 60) * 60;
+            const oneMinCandle = { time: oneMinAlignedTime, open: o, high: h, low: l, close: c, volume: v };
+            
+            // 같은 분 경계의 캔들 찾기
+            const existingIdx = oneMinCandleBuffer.findIndex(d => d.time === oneMinAlignedTime);
             if (existingIdx >= 0) {
-                oneMinCandleBuffer[existingIdx] = oneMinCandle;
+                // 기존 캔들 업데이트: OHLC 집계
+                const existing = oneMinCandleBuffer[existingIdx];
+                existing.high = Math.max(existing.high, h);
+                existing.low = Math.min(existing.low, l);
+                existing.close = c;  // 최신 종가
+                existing.volume = Math.max(existing.volume, v);  // 거래량은 누적값 (Engine에서 누적해서 보냄)
+                // 시가는 유지 (msg.o는 Engine이 관리하므로 항상 해당 분의 시가임)
             } else {
                 oneMinCandleBuffer.push(oneMinCandle);
                 // 최대 120개 유지 (2시간치 1분봉)
@@ -2186,17 +2196,31 @@
                     let aggregated;
                     let aggregatedVolume;
 
-                    // 1분봉(1m)인 경우: 서버에서 이미 완벽한 집계 데이터를 보내주므로 그대로 사용
+                    // 1분봉(1m)인 경우: 서버에서 이미 완벽한 집계 데이터를 보내주지만,
+                    // 클라이언트에서도 같은 분 내 여러 업데이트를 집계해야 함
                     if (selectedTimeframe === '1m') {
-                        const latest = periodCandles[periodCandles.length - 1]; // 가장 최신 데이터
-                        aggregated = {
-                            time: alignedTime,
-                            open: latest.open,
-                            high: latest.high,
-                            low: latest.low,
-                            close: latest.close
-                        };
-                        aggregatedVolume = latest.volume;
+                        // 같은 분 내 여러 캔들이 있을 수 있으므로 집계 필요 (안정성 강화)
+                        if (periodCandles.length === 1) {
+                            // 하나만 있으면 그대로 사용
+                            aggregated = {
+                                time: alignedTime,
+                                open: periodCandles[0].open,
+                                high: periodCandles[0].high,
+                                low: periodCandles[0].low,
+                                close: periodCandles[0].close
+                            };
+                            aggregatedVolume = periodCandles[0].volume;
+                        } else {
+                            // 여러 개면 집계 (만약의 경우 대비)
+                            aggregated = {
+                                time: alignedTime,
+                                open: periodCandles[0].open,  // 첫 캔들의 시가
+                                high: Math.max(...periodCandles.map(c => c.high)),
+                                low: Math.min(...periodCandles.map(c => c.low)),
+                                close: periodCandles[periodCandles.length - 1].close  // 마지막 캔들의 종가
+                            };
+                            aggregatedVolume = periodCandles.reduce((sum, c) => sum + (c.volume || 0), 0);
+                        }
                     } else {
                         // 타임프레임이 1분보다 큰 경우 (3m, 5m 등): 여러 1분봉을 합쳐야 함
                         aggregated = {
