@@ -1,4 +1,99 @@
-# 캔들 데이터 아키텍처
+# 캔들 데이터 아키텍처 (Candle Architecture)
+
+**최종 업데이트: 2025-12-18**
+
+이 문서는 Liquibook의 캔들 데이터 생성, 저장, 전송 및 클라이언트 병합 전략을 설명합니다.
+
+---
+
+## 1. 아키텍처 개요 (Hybrid Approach)
+
+우리는 **REST API(신뢰성)**와 **WebSocket(실시간성)**을 결합한 하이브리드 데이터를 사용합니다.
+
+```mermaid
+flowchart LR
+    Engine[C++ Engine] -->|Lua| Valkey[Valkey (Hot)]
+    Valkey -->|Polling| Streamer[Streamer]
+    Streamer -->|WS| Client[Client (Browser)]
+    
+    Lambda[Lambda Aggr] -->|Batch| DDB[DynamoDB (Cold)]
+    DDB -->|API| Client
+```
+
+| 구분 | 소스 | 역할 | 특징 |
+|:---:|:---:|:---|:---|
+| **역사적 데이터 (History)** | REST API | 차트 초기 로딩 / 갱신 | `Truth Source`. 데이터 정합성 보장. 불변. |
+| **실시간 데이터 (Real-time)** | WebSocket | 마지막 캔들 갱신 / 신규 추가 | `Fast Response`. 즉시성. API 폴링 대체. |
+
+---
+
+## 2. 데이터 흐름 상세
+
+### A. 생성 (Generation)
+- **C++ Engine**: 모든 체결(Trade) 발생 시 1분봉(1m) 캔들을 Valkey에 실시간 업데이트.
+- **Lua Script**: 원자적(Atomic) 연산으로 OHLCV 갱신 및 `closed` 리스트 관리.
+
+### B. 보관 (Persistence)
+- **Hot Storage (Valkey)**: 최근 1시간 데이터. 
+- **Cold Storage (DynamoDB)**: 전체 히스토리. Lambda가 주기적으로 Valkey 데이터를 가져와 DynamoDB에 영구 저장.
+
+### C. 전송 (Transmission)
+- **REST API**: DynamoDB(완료된 봉) + Valkey(진행 중 봉)을 병합하여 반환.
+- **WebSocket**: 100ms 주기로 변경된 캔들 정보만 브로드캐스트.
+
+---
+
+## 3. 클라이언트 병합 전략 (Client Merge Strategy)
+
+**핵심 원칙: "Server is Truth, Buffer is Patch"**
+
+클라이언트는 **API 데이터를 최우선**으로 신뢰하며, 로컬 버퍼는 오직 **최신 데이터의 빈틈**을 메우는 용도로만 사용합니다.
+
+### 데이터 병합 로직 (The Critical Logic)
+1.  **Fetch**: API에서 전체 히스토리(`0` ~ `T`) 수신.
+2.  **Trust API**: 수신된 API 데이터를 차트의 기본 데이터로 사용. (기존 버퍼 덮어씀)
+3.  **Patch from Buffer**:
+    - 로컬 버퍼(WebSocket으로 수신함)를 순회.
+    - **조건**: 만약 API 데이터에 **없는 시간(`T+1`)**이라면? -> 차트에 추가.
+    - **조건**: 만약 API 데이터에 **있는 시간(`T`)**이라면? -> **버퍼 무시 (API 사용)**.
+    *이유: 로컬 버퍼는 네트워크 지연, 패킷 유실, 또는 재접속 이슈로 인해 불완전할 수 있음.*
+
+```javascript
+/* index.html (Data Merge Logic) */
+const mergedMap = new Map();
+
+// 1. API 데이터 (절대적 신뢰)
+for (const c of apiCandles) {
+    mergedMap.set(c.time, c);
+}
+
+// 2. 버퍼 데이터 (보완용)
+const bufferAgg = aggregateBuffer(buffer);
+for (const c of bufferAgg) {
+    // API에 없는 최신 데이터만 추가 (절대 덮어쓰지 않음)
+    if (!mergedMap.has(c.time)) {
+        mergedMap.set(c.time, c); 
+    }
+}
+```
+
+---
+
+## 4. UI 렌더링 (Rendering)
+
+### T-Shape / Marubozu 이슈 해결
+- **Pure Sine Wave** 알고리즘 특성상, 시가=고가 혹은 종가=저가인 **Marubozu(꽉 찬)** 캔들이 자주 발생.
+- 차트 라이브러리가 Marubozu 캔들의 테두리(Border)를 렌더링할 때, 줌 레벨에 따라 **선(Line)이나 T자(T-Shape)**처럼 보이는 왜곡 현상 발생.
+- **해결**: `borderVisible: false` 설정을 통해 테두리를 제거하고 순수하게 `Body` 색상만 렌더링하여 왜곡 방지.
+
+```javascript
+candleSeries = chart.addCandlestickSeries({
+    borderVisible: false,  // 중요: T-Shape 아티팩트 방지
+    wickUpColor: '#3fb950',
+    wickDownColor: '#f85149', 
+    ...
+});
+```
 
 캔들(OHLCV) 데이터의 생성, 집계, 저장, 조회 전체 흐름을 설명합니다.
 

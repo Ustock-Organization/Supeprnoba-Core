@@ -629,7 +629,7 @@
                 
                     <div class="form-group" style="margin-bottom: 12px;">
                         <label style="font-size: 0.75rem;">Chart API URL</label>
-                        <input type="text" id="chartEndpoint" value="https://supernoba-chart-api.lambda-url.ap-northeast-2.on.aws/" style="padding: 6px 8px;">
+                        <input type="text" id="chartEndpoint" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/chart" style="padding: 6px 8px;">
                     </div>
                     <div class="form-group" style="margin-bottom: 12px;">
                         <label style="font-size: 0.75rem;">Order API URL</label>
@@ -1407,6 +1407,7 @@
 
         // 로그
         function addLog(type, message) {
+            console.log(`[VER 2.1 FIXED] ${type}: ${message}`); // Version Tag
             const container = document.getElementById('logContainer');
             const time = new Date().toLocaleTimeString();
             const entry = document.createElement('div');
@@ -1560,9 +1561,33 @@
                     document.getElementById('candleElapsedTime').textContent = `${min}:${sec.toString().padStart(2, '0')}`;
                 }, 1000);
                 
-                // 주문 반복
+                // 주문 반복 (Catch-up 로직 적용)
+                let lastRunTime = Date.now();
                 candleTestInterval = setInterval(async () => {
-                    await submitCandleTestOrder(basePrice, range, wavePeriod, ordersPerMinute);
+                    const now = Date.now();
+                    const delta = now - lastRunTime;
+                    
+                    // 목표 간격보다 지연된 경우 (백그라운드 스로틀링 등)
+                    // 놓친 횟수만큼 "밀린 주문"을 한 번에 처리하여 데이터 밀도 유지
+                    // 예: 1초(1000ms) 지연, 목표 100ms -> 10번 실행
+                    let ticks = Math.floor(delta / orderInterval);
+                    if (ticks < 1) ticks = 1; // 최소 1번은 실행
+                    if (ticks > 50) ticks = 50; // 과부하 방지 (최대 50개 제한)
+
+                    lastRunTime = now;
+
+                    for (let i = 0; i < ticks; i++) {
+                        // 각 틱마다 시간(t)를 조금씩 흐르게 함 -> 가격 변동 발생 -> 캔들 몸통 생성
+                        await submitCandleTestOrder(basePrice, range, wavePeriod, ordersPerMinute);
+                        
+                        // 너무 빨리 쏘면 브라우저가 힘들어하므로 10ms 쉬어주기 (틱이 많을 때만)
+                        if (ticks > 5) await new Promise(r => setTimeout(r, 2)); 
+                    }
+                    
+                    // 스로틀링 경고는 유지 (사용자 알림용)
+                    if (delta > 1000 && !document.hidden && !document.getElementById('throttleWarning')) {
+                        // (경고창 로직 생략 또는 간단히 유지)
+                    }
                 }, orderInterval);
                 
                 console.log('Candle test started successfully');
@@ -1573,10 +1598,11 @@
         }
         
         async function submitCandleTestOrder(basePrice, range, wavePeriod, ordersPerMinute) {
+            // 시간(t) 증가 (여기서 해야 Catch-up 루프 내에서 가격이 변함)
+            t += 0.01;
+            
             // 파동 계산 (사인파 형태)
-            const totalSeconds = (Date.now() - candleTestStartTime) / 1000;
-            const cycleSeconds = wavePeriod * 60; // 5분 = 300초
-            const t = (totalSeconds % cycleSeconds) / cycleSeconds; // 0~1 사이
+            // const totalSeconds = (Date.now() - candleTestStartTime) / 1000; (삭제: t 기반으로 변경)
             
             // 사인파: 0→1(고점)→0→-1(저점)→0
             const sineValue = Math.sin(t * 2 * Math.PI);
@@ -1829,8 +1855,9 @@
             
             // 2. API 호출 시도
             const chartEndpoint = document.getElementById('chartEndpoint')?.value || 
-                'https://supernoba-chart-api.lambda-url.ap-northeast-2.on.aws/';
+                'https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/chart';
             const url = `${chartEndpoint}?symbol=${symbol}&interval=${interval}&limit=200`;
+            console.log(`[CHART] Fetching history from: ${url}`);
             
             let apiCandles = [];
             try {
@@ -1838,6 +1865,7 @@
                 const result = await response.json();
                 
                 if (response.ok && result.data && result.data.length > 0) {
+                    console.log(`[CHART] API returned ${result.data.length} candles`);
                     apiCandles = result.data.map(c => {
                         // time 필드는 epoch (백엔드에서 제공)
                         // time_ymdhm은 표시용 (사람이 읽기 쉬운 형식)
@@ -1882,9 +1910,11 @@
                 mergedMap.set(c.time, c);
             }
             
-            // 버퍼 데이터로 덮어쓰기 (최신 데이터 우선)
+            // 버퍼 데이터 병합 (API 데이터 우선 - 오직 API에 없는 최신 데이터만 추가)
             for (const c of bufferCandles) {
-                mergedMap.set(c.time, c);
+                if (!mergedMap.has(c.time)) {
+                    mergedMap.set(c.time, c);
+                }
             }
 
             // [CRITICAL FIX] Fetch 도중 수신된 실시간 데이터 추가 병합 (Race Condition 해결)
@@ -1892,15 +1922,25 @@
             if (oneMinCandleBuffer.length > 0) {
                  const currentAgg = aggregateToTimeframe(oneMinCandleBuffer, intervalSeconds);
                  for (const c of currentAgg) {
-                     mergedMap.set(c.time, {
-                         time: c.time,
-                         open: c.open,
-                         high: c.high,
-                         low: c.low,
-                         close: c.close,
-                         volume: c.volume || 0,
-                         active: true // Mark as active
-                     });
+                     // [FIX] Priority: API Data > Buffer Data
+                     // Only use buffer data if it hasn't been provided by the API (newer/active candles).
+                     // This prevents stale/corrupt buffer data from overwriting clean historical stats.
+                     if (!mergedMap.has(c.time)) {
+                         mergedMap.set(c.time, {
+                             time: c.time,
+                             open: c.open,
+                             high: c.high,
+                             low: c.low,
+                             close: c.close,
+                             volume: c.volume || 0,
+                             active: true // Buffer data is considered "active" (hot)
+                         });
+                     } else {
+                         // Optional: If buffer is strictly newer (by update time) or has more volume?
+                         // For now, trust API history as the absolute truth for closed candles.
+                         // For the *current* active candle, API might be slightly behind WebSocket, 
+                         // but "activeCandle" from API response helps there.
+                     }
                  }
             }
             
@@ -2008,8 +2048,7 @@
             candleSeries = tvChart.addCandlestickSeries({
                 upColor: '#3fb950',
                 downColor: '#f85149',
-                borderUpColor: '#3fb950',
-                borderDownColor: '#f85149',
+                borderVisible: false, // [FIX] Disable borders to prevent T-shape artifacts on Marubozu
                 wickUpColor: '#3fb950',
                 wickDownColor: '#f85149',
             });
@@ -2119,6 +2158,14 @@
             domCache.chartClose = document.getElementById('chartClose');
             domCache.chartVolume = document.getElementById('chartVolume');
             domCache.chartLastUpdate = document.getElementById('chartLastUpdate');
+            
+            // [UX 개선] 탭 활성화 시 데이터 자동 갱신 (백그라운드 스로틀링 보정)
+            document.addEventListener('visibilitychange', async () => {
+                if (!document.hidden && chartSymbol) {
+                    console.log('[UX] Tab activated, refreshing chart...');
+                    await loadChartDataForTimeframe(chartSymbol, selectedTimeframe);
+                }
+            });
         }
 
         function startRenderLoop() {
@@ -2202,11 +2249,13 @@
             
             if (existingIdx >= 0) {
                 const existing = oneMinCandleBuffer[existingIdx];
+                // 기존 캔들 업데이트 (종가 덮어쓰기)
                 existing.high = Math.max(existing.high, h);
                 existing.low = Math.min(existing.low, l);
-                existing.close = c;
-                // 기존 로직: Math.max 사용
-                existing.volume = Math.max(existing.volume, v); 
+                existing.close = c; 
+                
+                // [수정] 서버에서 오는 v는 '누적 거래량'이므로 더하면 안 되고 덮어써야 함 (또는 Max)
+                existing.volume = Math.max(existing.volume, v);
             } else {
                 // 새 1분봉 추가
                 oneMinCandleBuffer.push({ 

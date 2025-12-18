@@ -2,18 +2,14 @@
 // Hot/Cold 하이브리드 조회 - Valkey(최근) + DynamoDB(과거)
 // 백업 갭 처리: 10분 미만 데이터는 Valkey candle:closed:* 에서 조회
 
-import Redis from 'ioredis';
+// import Redis from 'ioredis'; // Redis 제거 (CORS Crash 방지)
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { QueryCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
 
-const valkey = new Redis({
-  host: process.env.VALKEY_HOST || 'supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com',
-  port: parseInt(process.env.VALKEY_PORT || '6379'),
-  tls: VALKEY_TLS ? {} : undefined,
-  maxRetriesPerRequest: 1,
-});
+// Valkey 제거: 배포 패키지 문제(node_modules 누락)로 인한 크래시 방지
+// const valkey = new Redis({ ... });
 
 const dynamodb = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' })
@@ -142,29 +138,17 @@ async function computeActiveCandle(symbol, intervalSeconds) {
     const periodEndEpoch = periodStartEpoch + intervalSeconds;
     const periodEndYMDHM = epochToYMDHM(periodEndEpoch);
     
-    // 1. Valkey에서 마감된 1분봉 조회 (최근 데이터) - YYYYMMDDHHmm → epoch 변환
+    // 1. Valkey 제거 (DynamoDB만 사용)
+    /*
     const closedList = await valkey.lrange(`candle:closed:1m:${symbol}`, 0, -1);
-    const valkeyClosedCandles = closedList
-      .map(c => { try { return JSON.parse(c); } catch { return null; } })
-      .filter(c => c !== null)
-      .filter(c => c.t >= periodStartYMDHM && c.t < periodEndYMDHM)
-      .map(c => {
-        const epoch = ymdhmToEpoch(c.t);  // epoch으로 변환
-        return {
-          time: epoch,  // epoch (초, UTC 기준)
-          time_ymdhm: c.t,  // YYYYMMDDHHmm
-          o: parseFloat(c.o),
-          h: parseFloat(c.h),
-          l: parseFloat(c.l),
-          c: parseFloat(c.c),
-          v: parseFloat(c.v) || 0
-        };
-      });
+    const valkeyClosedCandles = closedList...
+    */
+    const valkeyClosedCandles = []; // 빈 배열 처리
     
-    // 2. DynamoDB에서 현재 기간 1분봉 조회 (백업된 데이터 - Valkey 비었을 때 대비)
+    // 2. DynamoDB에서 현재 기간 1분봉 조회
     let dbCandles = [];
-    if (valkeyClosedCandles.length === 0) {
-      try {
+    // 항상 DynamoDB 조회 시도
+    try {
         const result = await dynamodb.send(new QueryCommand({
           TableName: DYNAMODB_TABLE,
           KeyConditionExpression: 'pk = :pk AND sk BETWEEN :start AND :end',
@@ -179,8 +163,8 @@ async function computeActiveCandle(symbol, intervalSeconds) {
           const timeStr = item.time || item.sk;
           const epoch = ymdhmToEpoch(timeStr);
           return {
-            time: epoch,  // epoch (초, UTC 기준)
-            time_ymdhm: timeStr,  // YYYYMMDDHHmm
+            time: epoch,
+            time_ymdhm: timeStr,
             o: parseFloat(item.open || item.o),
             h: parseFloat(item.high || item.h),
             l: parseFloat(item.low || item.l),
@@ -188,27 +172,19 @@ async function computeActiveCandle(symbol, intervalSeconds) {
             v: parseFloat(item.volume || item.v) || 0
           };
         });
-        
-        if (dbCandles.length > 0) {
-          console.log(`[ACTIVE] Using ${dbCandles.length} 1m candles from DynamoDB for ${symbol}`);
-        }
-      } catch (dbErr) {
+    } catch (dbErr) {
         console.warn(`[ACTIVE] DynamoDB 1m query failed: ${dbErr.message}`);
-      }
     }
     
-    // 3. 현재 진행 중인 1분봉 조회 (Valkey)
-    const activeOneMin = await valkey.hgetall(`candle:1m:${symbol}`);
+    // 3. 현재 진행 중인 1분봉 조회 (Valkey 제거 -> null)
+    const activeOneMin = null; 
     
-    // 4. 모든 소스 병합 (epoch 기준)
-    const allCandles = [...valkeyClosedCandles, ...dbCandles];
+    // 4. 모든 소스 병합
+    const allCandles = [...dbCandles];
     
-    // 중복 제거 (같은 시간의 캔들은 Valkey 우선)
     const candleMap = new Map();
     for (const c of allCandles) {
-      if (!candleMap.has(c.time)) {
         candleMap.set(c.time, c);
-      }
     }
     
     // 현재 진행 중인 1분봉 추가

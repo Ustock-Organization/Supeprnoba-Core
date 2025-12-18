@@ -1,0 +1,14 @@
+{
+  "name": "market-maker-cli",
+  "version": "1.0.0",
+  "description": "CLI Market Maker for Supernoba Candle Testing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chalk": "^4.1.2",
+    "keypress": "^0.2.1"
+  }
+}
