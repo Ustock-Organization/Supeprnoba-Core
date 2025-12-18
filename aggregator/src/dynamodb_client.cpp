@@ -100,6 +100,11 @@ int DynamoDBClient::batch_put_candles(const std::string& symbol, const std::stri
             Aws::DynamoDB::Model::WriteRequest wr;
             wr.SetPutRequest(put);
             write_requests.push_back(wr);
+
+            // 디버그: 첫 번째 아이템의 PK/SK 출력 확인
+            if (i == 0 && j == i) {
+                Logger::debug("[DDB-DEBUG] Writing -> PK:", pk, "SK:", std::to_string(candle.epoch()), "Time:", candle.time);
+            }
         }
         
         Aws::DynamoDB::Model::BatchWriteItemRequest batch_request;
