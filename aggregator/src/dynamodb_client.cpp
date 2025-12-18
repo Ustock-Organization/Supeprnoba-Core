@@ -108,7 +108,17 @@ int DynamoDBClient::batch_put_candles(const std::string& symbol, const std::stri
         auto outcome = client_->BatchWriteItem(batch_request);
         
         if (outcome.IsSuccess()) {
-            total_saved += (end - i);
+            const auto& unprocessed = outcome.GetResult().GetUnprocessedItems();
+            if (!unprocessed.empty()) {
+                size_t failed_count = 0;
+                for (const auto& item : unprocessed) {
+                    failed_count += item.second.size();
+                }
+                Logger::error("DynamoDB BatchWrite partial failure:", failed_count, "items unprocessed");
+                total_saved += (end - i) - failed_count;
+            } else {
+                total_saved += (end - i);
+            }
         } else {
             Logger::error("DynamoDB batch put failed:", outcome.GetError().GetMessage());
         }
