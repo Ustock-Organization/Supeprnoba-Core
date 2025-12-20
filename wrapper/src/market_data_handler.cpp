@@ -129,11 +129,13 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     // Ticker 캐시 업데이트 (Sub 데이터용)
     updateTickerCache(symbol, fill_price);
     
-    // Kinesis 발행 유지 (체결 알림용)
+    // order-status 스트림으로 체결 알림 발행 (fills 스트림 삭제됨)
     if (producer_) {
-        producer_->publishFill(order->symbol(), order->order_id(),
-                                matched_order->order_id(), buyer_id, seller_id,
-                                fill_qty, fill_price);
+        // 양쪽 사용자에게 FILLED 알림
+        producer_->publishOrderStatus(symbol, order->order_id(), 
+                                       order->user_id(), "FILLED");
+        producer_->publishOrderStatus(symbol, matched_order->order_id(), 
+                                       matched_order->user_id(), "FILLED");
     }
 }
 
