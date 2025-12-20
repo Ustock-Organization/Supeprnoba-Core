@@ -62,6 +62,9 @@ export KINESIS_STATUS_STREAM="supernoba-order-status"
 # DynamoDB
 export DYNAMODB_TRADE_TABLE="trade_history"
 
+# WebSocket 직접 알림 (API Gateway)
+export WEBSOCKET_ENDPOINT="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/"
+
 # 기타 설정
 export GRPC_PORT="50051"
 if [ "$DEBUG_MODE" == "true" ]; then
