@@ -188,38 +188,57 @@ async function broadcastToSubscribers(symbol, mainSubs, subSubs, data, realtimeO
     }
     
     if (candle && candle.t) {
-      // epoch과 ymdhm 둘 다 포함하여 전송 (클라이언트가 epoch 우선 사용)
-      const candleMsg = JSON.stringify({ 
-        e: 'candle', 
-        tf: '1m', 
-        s: symbol,
-        o: candle.o,
-        h: candle.h,
-        l: candle.l,
-        c: candle.c,
-        v: candle.v,
-        t: candle.t,           // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
-        t_epoch: candle.t_epoch || ymdhmToEpoch(candle.t)  // epoch (초, UTC 기준)
-      });
-      tasks.push(...filteredMainSubs.map(id => sendToConnection(id, candleMsg)));
+      // Convert Redis string values to numbers and validate
+      const o = parseFloat(candle.o);
+      const h = parseFloat(candle.h);
+      const l = parseFloat(candle.l);
+      const c = parseFloat(candle.c);
+      const v = parseInt(candle.v) || 0;
+      
+      // Only send if all OHLC values are valid numbers (not NaN)
+      if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(c) && o > 0) {
+        const candleMsg = JSON.stringify({ 
+          e: 'candle', 
+          tf: '1m', 
+          s: symbol,
+          o: o,
+          h: h,
+          l: l,
+          c: c,
+          v: v,
+          t: candle.t,           // YYYYMMDDHHmm (사람이 읽기 쉬운 형식)
+          t_epoch: candle.t_epoch || ymdhmToEpoch(candle.t)  // epoch (초, UTC 기준)
+        });
+        tasks.push(...filteredMainSubs.map(id => sendToConnection(id, candleMsg)));
+      } else {
+        debug(`Skipping invalid candle for ${symbol}: o=${candle.o} h=${candle.h} l=${candle.l} c=${candle.c}`);
+      }
     }
     
     if (closedCandle) {
-      // 마감된 캔들도 epoch 포함
-      const closedEpoch = closedCandle.t_epoch || ymdhmToEpoch(closedCandle.t);
-      const closeMsg = JSON.stringify({ 
-        e: 'candle_close', 
-        tf: '1m', 
-        s: symbol,
-        o: closedCandle.o,
-        h: closedCandle.h,
-        l: closedCandle.l,
-        c: closedCandle.c,
-        v: closedCandle.v,
-        t: closedCandle.t,
-        t_epoch: closedEpoch
-      });
-      tasks.push(...filteredMainSubs.map(id => sendToConnection(id, closeMsg)));
+      // Convert Redis string values to numbers and validate
+      const o = parseFloat(closedCandle.o);
+      const h = parseFloat(closedCandle.h);
+      const l = parseFloat(closedCandle.l);
+      const c = parseFloat(closedCandle.c);
+      const v = parseInt(closedCandle.v) || 0;
+      
+      if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(c) && o > 0) {
+        const closedEpoch = closedCandle.t_epoch || ymdhmToEpoch(closedCandle.t);
+        const closeMsg = JSON.stringify({ 
+          e: 'candle_close', 
+          tf: '1m', 
+          s: symbol,
+          o: o,
+          h: h,
+          l: l,
+          c: c,
+          v: v,
+          t: closedCandle.t,
+          t_epoch: closedEpoch
+        });
+        tasks.push(...filteredMainSubs.map(id => sendToConnection(id, closeMsg)));
+      }
     }
     
     await Promise.allSettled(tasks);
