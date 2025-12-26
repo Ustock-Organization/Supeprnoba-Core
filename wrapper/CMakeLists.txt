@@ -1,4 +1,4 @@
-# Liquibook AWS Wrapper - Kinesis + DynamoDB
+# Liquibook AWS Wrapper - Kinesis + Valkey
 cmake_minimum_required(VERSION 3.20)
 project(liquibook_aws_wrapper VERSION 1.0.0 LANGUAGES CXX)
 
@@ -22,8 +22,8 @@ find_package(hiredis CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
 # AWS SDK (vcpkg 통해 설치)
-find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis dynamodb apigatewaymanagementapi)
-message(STATUS "Building with Kinesis + DynamoDB + API Gateway Management support")
+find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis apigatewaymanagementapi)
+message(STATUS "Building with Kinesis + API Gateway Management support")
 
 # Proto 파일 컴파일
 set(PROTO_FILES proto/snapshot.proto)
@@ -61,7 +61,6 @@ set(SOURCES
     src/logger.cpp
     src/kinesis_consumer.cpp
     src/kinesis_producer.cpp
-    src/dynamodb_client.cpp
     src/notification_client.cpp
 )
 
