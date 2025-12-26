@@ -1,31 +1,125 @@
-// symbol-manager Lambda
-// 종목 관리 API (공개: 조회, Admin: 추가/삭제/데이터 초기화)
+// symbol-manager Lambda (Supernoba-admin)
+// Source of Truth: Supabase (symbols table)
+// Cache: Redis (active:symbols, depth:*)
 
 import Redis from 'ioredis';
+import { createClient } from '@supabase/supabase-js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { ScanCommand, DeleteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { S3Client, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import pg from 'pg';
+const { Pool } = pg;
+
+// === Configuration (ALL FROM ENVIRONMENT VARIABLES) ===
+// Required
+const VALKEY_HOST = process.env.VALKEY_HOST;
+const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;                    // Anon Key (Read)
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role (Write)
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+
+// RDS Config
+const DB_SECRET_ARN = process.env.DB_SECRET_ARN;
+const RDS_ENDPOINT = process.env.RDS_ENDPOINT;
+const DB_NAME = process.env.DB_NAME || 'postgres';
+const secretsManager = new SecretsManagerClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+
+// Helper: Create Partition on RDS
+async function ensureRdsPartition(symbol) {
+    if (!DB_SECRET_ARN || !RDS_ENDPOINT) { 
+        console.warn('Skipping RDS Partition creation (Missing Config)');
+        return;
+    }
+    
+    let client = null;
+    try {
+        // 1. Get Secret
+        const secretRes = await secretsManager.send(new GetSecretValueCommand({ SecretId: DB_SECRET_ARN }));
+        const creds = JSON.parse(secretRes.SecretString);
+        
+        // 2. Connect
+        client = new pg.Client({
+             host: RDS_ENDPOINT,
+             user: creds.username,
+             password: creds.password,
+             database: DB_NAME,
+             port: 5432,
+             ssl: { rejectUnauthorized: false },
+             connectionTimeoutMillis: 3000
+        });
+        await client.connect();
+        
+        // 3. Create Partition
+        const cleanSymbol = symbol.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const tableName = `trade_history_${cleanSymbol}`;
+        
+        // Use RPC or Raw SQL. Raw SQL is fine here since we have master access.
+        // Also ensure master table exists (just in case)
+        const sql = `
+            CREATE TABLE IF NOT EXISTS public.trade_history_partitioning_master_dummy (id int); -- Check conn
+            CREATE TABLE IF NOT EXISTS public.trade_history (
+                id UUID DEFAULT gen_random_uuid(),
+                symbol TEXT NOT NULL,
+                price NUMERIC NOT NULL,
+                quantity NUMERIC NOT NULL,
+                buyer_id UUID,
+                seller_id UUID,
+                buyer_order_id UUID,
+                seller_order_id UUID,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                timestamp BIGINT,
+                PRIMARY KEY (symbol, id)
+            ) PARTITION BY LIST (symbol);
+            
+            CREATE TABLE IF NOT EXISTS public.${tableName} 
+            PARTITION OF public.trade_history 
+            FOR VALUES IN ('${symbol.toUpperCase()}');
+        `;
+        
+        await client.query(sql);
+        console.log(`[RDS] Partition created for ${symbol}`);
+        
+    } catch (err) {
+        console.error(`[RDS] Partition creation failed for ${symbol}:`, err);
+        // Do not crash the Lambda, just log.
+    } finally {
+        if (client) await client.end();
+    }
+}
+
+// Optional (with defaults)
+const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
+const DYNAMODB_CANDLE_TABLE = process.env.DYNAMODB_TABLE || 'candle_history';
+const DYNAMODB_TRADE_TABLE = process.env.DYNAMODB_TRADE_TABLE || 'trade_history';
+const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
+
+// Validate Required Config
+if (!VALKEY_HOST || !SUPABASE_URL || !SUPABASE_KEY || !SUPABASE_SERVICE_KEY || !ADMIN_API_KEY) {
+    console.error('Missing required environment variables!');
+    console.error('Required: VALKEY_HOST, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, ADMIN_API_KEY');
+}
 
 const valkey = new Redis({
-  host: process.env.VALKEY_HOST || 'supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com',
-  port: parseInt(process.env.VALKEY_PORT || '6379'),
+  host: VALKEY_HOST,
+  port: VALKEY_PORT,
   connectTimeout: 5000,
   maxRetriesPerRequest: 1,
 });
 
 valkey.on('error', (err) => console.error('Redis error:', err.message));
 
+// Clients
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// DynamoDB & S3 (For Reset Logic)
 const dynamodb = DynamoDBDocumentClient.from(
-  new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' })
+  new DynamoDBClient({ region: AWS_REGION })
 );
+const s3 = new S3Client({ region: AWS_REGION });
 
-const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-northeast-2' });
-
-const DYNAMODB_CANDLE_TABLE = process.env.DYNAMODB_TABLE || 'candle_history';
-const DYNAMODB_TRADE_TABLE = process.env.DYNAMODB_TRADE_TABLE || 'trade_history';
-const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
-
-// CORS 헤더
 const headers = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
@@ -33,244 +127,380 @@ const headers = {
   'Content-Type': 'application/json',
 };
 
-// Admin 권한 확인 (추후 Cognito/API Key로 확장)
+// Admin Check
 function isAdmin(event) {
   const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  // TODO: 실제 권한 검증 로직 (Cognito, API Key 등)
-  return authHeader === process.env.ADMIN_API_KEY;
+  return authHeader === ADMIN_API_KEY; 
 }
 
+// Helper: Detect Platform
+const detectPlatform = (url) => {
+    if (!url) return 'ETC';
+    const lower = url.toLowerCase();
+    if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'YOUTUBE';
+    if (lower.includes('twitter.com') || lower.includes('x.com')) return 'X';
+    if (lower.includes('instagram.com')) return 'INSTAGRAM';
+    if (lower.includes('tiktok.com')) return 'TIKTOK';
+    if (lower.includes('chzzk')) return 'CHZZK';
+    if (lower.includes('afreecatv')) return 'AFREECATV';
+    return 'ETC';
+};
+
 export const handler = async (event) => {
-  // OPTIONS 요청 처리
   if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
     return { statusCode: 200, headers, body: '' };
   }
   
   const method = event.httpMethod || event.requestContext?.http?.method;
+  const path = event.path || event.requestContext?.http?.path || '/';
   const pathParams = event.pathParameters || {};
-  const symbol = pathParams.symbol;
-  
+  const queryParams = event.queryStringParameters || {};
+  const symbolParam = pathParams.symbol;
+
   try {
-    // GET /symbols - 종목 목록 조회 (공개)
-    if (method === 'GET' && !symbol) {
-      const symbols = await valkey.smembers('active:symbols');
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          symbols: symbols.sort(),
-          count: symbols.length,
-        }),
-      };
+    // === GET /symbols (List & Search & Preview) ===
+    if (method === 'GET' && !symbolParam && !path.includes('/sync') && !path.includes('/approve')) {
+       // Check for Preview Action
+       if (queryParams.action === 'preview' && queryParams.url) {
+           const url = queryParams.url;
+           try {
+                console.log(`[PREVIEW] Fetching: ${url}`);
+                if (!url.startsWith('http')) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid URL' }) };
+
+                // Use helper to detect platform
+                const platform = detectPlatform(url);
+                
+                // DEBUG LOGS
+                console.log(`[PREVIEW] Platform: ${platform}`);
+                console.log(`[PREVIEW] Env Check - YouTube: ${!!process.env.YOUTUBE_API_KEY}, X: ${!!process.env.TWITTER_BEARER_TOKEN}`);
+
+                let image = null;
+                let title = null;
+                let errorDetails = null;
+
+                // 1. YouTube Data API
+                if (platform === 'YOUTUBE' && process.env.YOUTUBE_API_KEY) {
+                    console.log('[PREVIEW] Attempting YouTube API...');
+                    try {
+                        let handle = null;
+                        let channelId = null;
+                        if (url.includes('@')) {
+                            const parts = url.split('@');
+                            handle = parts[parts.length - 1].split('/')[0];
+                        } else if (url.includes('channel/')) {
+                             channelId = url.split('channel/')[1].split('/')[0];
+                        }
+
+                        if (handle || channelId) {
+                             const ytKey = process.env.YOUTUBE_API_KEY;
+                             let ytUrl = '';
+                             if (handle) {
+                                 ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet&forHandle=@${handle}&key=${ytKey}`;
+                             } else {
+                                 ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet&id=${channelId}&key=${ytKey}`;
+                             }
+                             
+                             const ytRes = await fetch(ytUrl);
+                             const ytData = await ytRes.json();
+                             if (ytData.items && ytData.items.length > 0) {
+                                 image = ytData.items[0].snippet.thumbnails.high?.url || ytData.items[0].snippet.thumbnails.default?.url;
+                                 title = ytData.items[0].snippet.title;
+                                 console.log('[PREVIEW] YouTube API Success');
+                             } else {
+                                 console.log('[PREVIEW] YouTube API found no items');
+                             }
+                        }
+                    } catch (err) {
+                        console.error('[PREVIEW] YouTube API Error:', err);
+                        errorDetails = err.message;
+                    }
+                }
+
+                // 2. X (Twitter) API v2
+                if (platform === 'X' && process.env.TWITTER_BEARER_TOKEN) {
+                    console.log('[PREVIEW] Attempting X (Twitter) API...');
+                    try {
+                        const parts = url.split('/');
+                        const username = parts[parts.length - 1].split('?')[0]; 
+                        
+                        if (username) {
+                             console.log(`[PREVIEW] X Username extracted: ${username}`);
+                             const xRes = await fetch(`https://api.twitter.com/2/users/by/username/${username}?user.fields=profile_image_url,name`, {
+                                 headers: {
+                                     'Authorization': `Bearer ${process.env.TWITTER_BEARER_TOKEN}`
+                                 }
+                             });
+                             
+                             if (!xRes.ok) {
+                                 const errText = await xRes.text();
+                                 console.error(`[PREVIEW] X API Failed: ${xRes.status} ${errText}`);
+                                 errorDetails = `X API ${xRes.status}: ${errText}`;
+                             } else {
+                                 const xData = await xRes.json();
+                                 if (xData.data) {
+                                     image = xData.data.profile_image_url?.replace('_normal', '_400x400');
+                                     title = xData.data.name;
+                                     console.log('[PREVIEW] X API Success');
+                                 } else {
+                                    console.log('[PREVIEW] X API returned no data');
+                                 }
+                             }
+                        }
+                    } catch (err) {
+                         console.error('[PREVIEW] X API Error:', err);
+                         errorDetails = err.message;
+                    }
+                }
+
+                if (!image) {
+                     console.log('[PREVIEW] No API result or Platform not supported. Skipping scraping (Strict Mode).');
+                }
+                
+                return { 
+                    statusCode: 200, 
+                    headers, 
+                    body: JSON.stringify({ 
+                        url, 
+                        title: title || '', 
+                        image: image || '', 
+                        debug_error: errorDetails,
+                        debug_logs: `PF:${platform}, YT:${!!process.env.YOUTUBE_API_KEY}, X:${!!process.env.TWITTER_BEARER_TOKEN}`
+                    }) 
+                };
+           } catch (e) {
+               console.error('[PREVIEW] Error:', e.message);
+               return { statusCode: 200, headers, body: JSON.stringify({ url, image: '' }) };
+           }
+       }
+    
+       const q = queryParams.q;
+       let query = supabase.from('symbols').select('*');
+       if (q) query = query.or(`symbol.ilike.%${q}%,name.ilike.%${q}%`);
+       
+
+       
+       const { data: symbols, error } = await query;
+       if (error) throw error;
+       
+       return {
+           statusCode: 200, headers,
+           body: JSON.stringify({ symbols, count: symbols?.length || 0, source: 'supabase' })
+       };
+    }
+
+    // === GET /symbols/{symbol} ===
+    if (method === 'GET' && symbolParam) {
+       const { data: symData } = await supabase.from('symbols').select('*').eq('symbol', symbolParam.toUpperCase()).single();
+       const exists = await valkey.sismember('active:symbols', symbolParam.toUpperCase());
+       if (!exists && !symData) {
+           return { statusCode: 404, headers, body: JSON.stringify({ error: 'Symbol not found' }) };
+       }
+       const [ticker, depth] = await Promise.all([
+         valkey.get(`ticker:${symbolParam.toUpperCase()}`),
+         valkey.get(`depth:${symbolParam.toUpperCase()}`),
+       ]);
+       return {
+           statusCode: 200, headers,
+           body: JSON.stringify({
+               symbol: symbolParam.toUpperCase(),
+               meta: symData,
+               active: !!exists,
+               ticker: ticker ? JSON.parse(ticker) : null,
+               depth: depth ? JSON.parse(depth) : null,
+           })
+       };
     }
     
-    // GET /symbols/{symbol} - 종목 상세 조회 (공개)
-    if (method === 'GET' && symbol) {
-      const exists = await valkey.sismember('active:symbols', symbol);
-      if (!exists) {
-        return {
-          statusCode: 404,
-          headers,
-          body: JSON.stringify({ error: 'Symbol not found', symbol }),
+    // === POST /sync (Hydrate Redis) ===
+    if (method === 'POST' && path.includes('sync')) {
+        const { data: allSymbols } = await supabase.from('symbols').select('symbol');
+        let count = 0;
+        if (allSymbols?.length > 0) {
+            const pipeline = valkey.pipeline();
+            allSymbols.forEach(s => pipeline.sadd('active:symbols', s.symbol));
+            await pipeline.exec();
+            count = allSymbols.length;
+        }
+        return { statusCode: 200, headers, body: JSON.stringify({ message: 'Synced', count }) };
+    }
+
+
+
+    // === POST /approve (Admin Approval) ===
+    // Support both path-based (/approve) and query-based (?action=approve)
+    if (method === 'POST' && (path.includes('approve') || queryParams.action === 'approve')) {
+        const body = JSON.parse(event.body || '{}');
+        const { requestId, symbol, name, logo_url } = body;
+        
+        console.log(`[APPROVE] Processing: ${symbol}, ReqID: ${requestId}`);
+        
+        if (!symbol || !name) return { statusCode: 400, headers, body: JSON.stringify({error: 'Missing fields'}) };
+
+        // DEBUG: Check if using Service Role Key
+        const usingServiceKey = !!process.env.SUPABASE_SERVICE_ROLE_KEY;
+        console.log(`[APPROVE] Using Service Role Key: ${usingServiceKey}`);
+        console.log(`[APPROVE] RequestId: ${requestId}, Symbol: ${symbol}, Name: ${name}`);
+
+        // 1. Update Request (Using Admin Client to bypass RLS)
+        if (requestId) {
+             // Fetch Creator URL to detect platform
+             const { data: currentReq } = await supabaseAdmin
+                .from('creator_requests')
+                .select('creator_url')
+                .eq('id', requestId)
+                .single();
+                
+             let detectedPlatform = 'ETC';
+             if (currentReq?.creator_url) {
+                 detectedPlatform = detectPlatform(currentReq.creator_url);
+             }
+
+             const { data: reqData, error: reqErr } = await supabaseAdmin
+                .from('creator_requests')
+                .update({ 
+                    status: 'approved', // Lowercase fixed
+                    platform: detectedPlatform // Update platform
+                })
+                .eq('id', requestId)
+                .select();
+                
+             if (reqErr) {
+                 console.error('[APPROVE] Request Update Error:', reqErr);
+                 return { 
+                     statusCode: 500, 
+                     headers, 
+                     body: JSON.stringify({ 
+                         error: 'Failed to update request status', 
+                         details: reqErr,
+                         debug: { usingServiceKey, requestId }
+                     }) 
+                 };
+             }
+        }
+
+        // 2. Insert Symbol (Using Admin Client)
+        const newSymbol = {
+            symbol: symbol.toUpperCase(),
+            name, 
+            base_asset: symbol.toUpperCase(), 
+            quote_asset: 'BOLT', 
+            logo_url, 
+            status: 'ACTIVE'
         };
-      }
-      
-      // 추가 정보 조회 (ticker, depth 등)
-      const [ticker, depth] = await Promise.all([
-        valkey.get(`ticker:${symbol}`),
-        valkey.get(`depth:${symbol}`),
-      ]);
-      
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          symbol,
-          active: true,
-          ticker: ticker ? JSON.parse(ticker) : null,
-          depth: depth ? JSON.parse(depth) : null,
-        }),
-      };
+        
+        const { error: symErr } = await supabaseAdmin.from('symbols').upsert(newSymbol);
+        
+        if (symErr) {
+            console.error('[APPROVE] Symbol Insert Error:', symErr);
+            return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to insert symbol', details: symErr }) };
+        }
+
+        // 3. Add to Redis
+        await valkey.sadd('active:symbols', newSymbol.symbol);
+        
+        // 4. Create RDS Partition (Async/fire-and-forget to keep latency low, or await if critical)
+        await ensureRdsPartition(newSymbol.symbol);
+        
+        console.log('[APPROVE] Success');
+        
+        return { statusCode: 200, headers, body: JSON.stringify({ message: 'Approved, Symbol Created, Redis Updated', symbol: newSymbol }) };
     }
-    
-    // POST /symbols - 종목 추가 (Admin)
-    // POST with action: 'resetDatabase' - 데이터 초기화 (Admin)
+
+    // === POST /reject (Admin Rejection) ===
+    if (method === 'POST' && (path.includes('reject') || queryParams.action === 'reject')) {
+        if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
+        
+        const body = JSON.parse(event.body || '{}');
+        const { requestId, reason } = body;
+        
+        console.log(`[REJECT] Processing: RequestId: ${requestId}, Reason: ${reason}`);
+        
+        if (!requestId) return { statusCode: 400, headers, body: JSON.stringify({ error: 'requestId is required' }) };
+        
+        const { data, error } = await supabaseAdmin
+            .from('creator_requests')
+            .update({ 
+                status: 'rejected',
+                processed_at: new Date().toISOString(),
+                admin_note: reason || 'Rejected by admin'
+            })
+            .eq('id', requestId)
+            .select();
+        
+        if (error) {
+            console.error('[REJECT] Update Error:', error);
+            return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to reject request', details: error }) };
+        }
+        
+        console.log('[REJECT] Success');
+        return { statusCode: 200, headers, body: JSON.stringify({ message: 'Request rejected', data }) };
+    }
+
+
+    // === POST /symbols (Manual Add or Reset or Request) ===
     if (method === 'POST') {
-      if (!isAdmin(event)) {
-        return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
-      }
-      
       const body = JSON.parse(event.body || '{}');
       
-      // === 데이터베이스 초기화 액션 ===
-      if (body.action === 'resetDatabase') {
-        if (!body.confirm) {
-          return { statusCode: 400, headers, body: JSON.stringify({ error: 'confirm: true required' }) };
-        }
-        
-        console.log('[ADMIN] Starting database reset...');
-        
-        const results = {
-          candle_history: { deleted: 0, errors: 0 },
-          trade_history: { deleted: 0, errors: 0 },
-          s3: { deleted: 0, errors: 0 },
-          valkey: { deleted: 0 }
-        };
-        
-        // 헬퍼 함수: DynamoDB 테이블 삭제
-        async function clearDynamoTable(tableName, resultKey) {
-          let lastEvaluatedKey = undefined;
-          let scanCount = 0;
+      // 1. Public Request Submission
+      const action = body.action || queryParams.action;
+      if (action === 'request') {
+          const { creator_name, creator_url, platform, logo_url } = body;
+          if (!creator_url) return { statusCode: 400, headers, body: JSON.stringify({ error: 'URL is required' }) };
           
-          do {
-            const scanResult = await dynamodb.send(new ScanCommand({
-              TableName: tableName,
-              ProjectionExpression: 'pk, sk',
-              Limit: 100,
-              ExclusiveStartKey: lastEvaluatedKey
-            }));
-            
-            scanCount++;
-            lastEvaluatedKey = scanResult.LastEvaluatedKey;
-            
-            if (scanResult.Items && scanResult.Items.length > 0) {
-              for (const item of scanResult.Items) {
-                try {
-                  await dynamodb.send(new DeleteCommand({
-                    TableName: tableName,
-                    Key: { pk: item.pk, sk: item.sk }
-                  }));
-                  results[resultKey].deleted++;
-                } catch (e) {
-                  results[resultKey].errors++;
-                }
-              }
-            }
-            
-            console.log(`[ADMIN] ${tableName} scan ${scanCount}: deleted ${results[resultKey].deleted}`);
-            
-            // 최대 10 스캔으로 제한 (Lambda 타임아웃 방지)
-            if (scanCount >= 10) {
-              console.log(`[ADMIN] ${tableName} scan limit reached`);
-              break;
-            }
-          } while (lastEvaluatedKey);
-        }
-        
-        // 1. DynamoDB candle_history 테이블 삭제
-        try {
-          await clearDynamoTable(DYNAMODB_CANDLE_TABLE, 'candle_history');
-        } catch (e) {
-          console.error('[ADMIN] candle_history error:', e.message);
-        }
-        
-        // 2. DynamoDB trade_history 테이블 삭제
-        try {
-          await clearDynamoTable(DYNAMODB_TRADE_TABLE, 'trade_history');
-        } catch (e) {
-          console.error('[ADMIN] trade_history error:', e.message);
-        }
-        
-        // 2. S3 candles 폴더 삭제
-        try {
-          let continuationToken = undefined;
+          console.log(`[REQUEST] New submission: ${creator_name} (${creator_url})`);
           
-          do {
-            const listResult = await s3.send(new ListObjectsV2Command({
-              Bucket: S3_BUCKET,
-              Prefix: 'candles/',
-              MaxKeys: 1000,
-              ContinuationToken: continuationToken
-            }));
+          const { data, error } = await supabaseAdmin
+            .from('creator_requests')
+            .insert({ creator_name, creator_url, platform, logo_url, status: 'pending' })
+            .select().single();
             
-            continuationToken = listResult.NextContinuationToken;
-            
-            if (listResult.Contents && listResult.Contents.length > 0) {
-              const deleteParams = {
-                Bucket: S3_BUCKET,
-                Delete: {
-                  Objects: listResult.Contents.map(obj => ({ Key: obj.Key }))
-                }
-              };
-              
-              await s3.send(new DeleteObjectsCommand(deleteParams));
-              results.s3.deleted += listResult.Contents.length;
-              console.log(`[ADMIN] S3 deleted ${results.s3.deleted} objects`);
-            }
-          } while (continuationToken);
-          
-        } catch (e) {
-          console.error('[ADMIN] S3 error:', e.message);
-          results.s3.errors++;
-        }
-        
-        // 3. Valkey candle:closed:* 삭제
-        try {
-          const candleKeys = await valkey.keys('candle:closed:*');
-          if (candleKeys.length > 0) {
-            await valkey.del(...candleKeys);
-            results.valkey.deleted += candleKeys.length;
+          if (error) {
+              console.error('[REQUEST] Insert Error:', error);
+              return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
           }
-          console.log(`[ADMIN] Valkey deleted ${results.valkey.deleted} candle keys`);
-        } catch (e) {
-          console.error('[ADMIN] Valkey error:', e.message);
-        }
-        
-        console.log('[ADMIN] Database reset complete:', results);
-        
-        return {
-          statusCode: 200,
-          headers,
-          body: JSON.stringify({
-            message: 'Database reset complete',
-            results
-          })
-        };
+          return { statusCode: 200, headers, body: JSON.stringify({ message: 'Request submitted', data }) };
+      }
+
+      // 2. Admin Actions (Reset / Add)
+      if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
+      
+      if (body.action === 'resetDatabase') {
+          return { statusCode: 200, headers, body: JSON.stringify({ message: 'Reset functionality is temporarily disabled during migration check.' }) };
       }
       
-      // === 기존 종목 추가 로직 ===
-      const newSymbol = body.symbol?.toUpperCase();
+      const { symbol, name, logo_url } = body;
+      if (!symbol) return { statusCode: 400, headers, body: JSON.stringify({error: 'symbol required'}) };
       
-      if (!newSymbol) {
-        return { statusCode: 400, headers, body: JSON.stringify({ error: 'symbol is required' }) };
-      }
-      
-      const added = await valkey.sadd('active:symbols', newSymbol);
-      console.log(`Symbol added: ${newSymbol}, new=${added > 0}`);
-      
-      return {
-        statusCode: added > 0 ? 201 : 200,
-        headers,
-        body: JSON.stringify({
-          message: added > 0 ? 'Symbol added' : 'Symbol already exists',
-          symbol: newSymbol,
-        }),
+      const newSymbol = {
+          symbol: symbol.toUpperCase(),
+          name: name || symbol, base_asset: symbol.toUpperCase(), quote_asset: 'BOLT', logo_url, status: 'ACTIVE'
       };
+      
+      const { error } = await supabaseAdmin.from('symbols').upsert(newSymbol);
+      if (error) throw error;
+      
+      
+      await valkey.sadd('active:symbols', newSymbol.symbol);
+      
+      // Create RDS Partition
+      await ensureRdsPartition(newSymbol.symbol);
+      
+      return { statusCode: 201, headers, body: JSON.stringify({ message: 'Symbol added', symbol: newSymbol }) };
+
+    }
+
+    // === DELETE /symbols/{symbol} ===
+    if (method === 'DELETE' && symbolParam) {
+        if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
+        await supabaseAdmin.from('symbols').delete().eq('symbol', symbolParam.toUpperCase());
+        await valkey.srem('active:symbols', symbolParam.toUpperCase());
+        return { statusCode: 200, headers, body: JSON.stringify({ message: 'Deleted' }) };
     }
     
-    // DELETE /symbols/{symbol} - 종목 삭제 (Admin)
-    if (method === 'DELETE' && symbol) {
-      if (!isAdmin(event)) {
-        return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
-      }
-      
-      const removed = await valkey.srem('active:symbols', symbol);
-      console.log(`Symbol removed: ${symbol}, existed=${removed > 0}`);
-      
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          message: removed > 0 ? 'Symbol removed' : 'Symbol not found',
-          symbol,
-        }),
-      };
-    }
-    
-    return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
-    
+    return { statusCode: 404, headers, body: JSON.stringify({ error: 'Not Found' }) };
+
   } catch (error) {
-    console.error('Error:', error);
-    return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
+    console.error('Admin/Symbol Error:', error);
+    return { statusCode: 500, headers, body: JSON.stringify({ error: error.message, details: error }) };
   }
 };

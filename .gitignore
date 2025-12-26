@@ -52,3 +52,19 @@ Release
 #a place to hide documents that should not go into the repo:
 doc/NotGitWorthy/
 node_modules/
+
+# Lambda Artifacts
+**/lambda/**/function.zip
+**/lambda/**/lambda_only.zip
+**/lambda/**/*.cjs
+**/lambda/**/dist/
+
+# Cache/Debug Data
+cache_*.json
+
+# Deployment Artifacts
+*.zip
+engine_pkg.zip
+func_*.zip
+lambda/**/node_modules/
+lambda/**/*.zip

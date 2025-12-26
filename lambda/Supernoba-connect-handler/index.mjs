@@ -82,6 +82,36 @@ export const handler = async (event) => {
   // 사용자별 연결 목록에 추가
   await valkey.sadd(`user:${userId}:connections`, connectionId);
   
+  // === [Optimized] Stale Connection Cleanup ===
+  // 연결 시점에도 만료된 연결 정리 (Disconnect 이벤트 누락 대비)
+  const allConns = await valkey.smembers(`user:${userId}:connections`);
+  if (allConns.length > 5) { // 너무 자주 체크하지 않도록 5개 이상일 때만
+    const pipeline = valkey.pipeline();
+    for (const connId of allConns) {
+      if (connId !== connectionId) {
+        pipeline.exists(`ws:${connId}`);
+      }
+    }
+    const results = await pipeline.exec();
+    
+    // 결과 확인 및 삭제
+    const staleConns = [];
+    let resultIdx = 0;
+    for (const connId of allConns) {
+      if (connId !== connectionId) {
+        const [err, exists] = results[resultIdx++];
+        if (!err && exists === 0) {
+          staleConns.push(connId);
+        }
+      }
+    }
+    
+    if (staleConns.length > 0) {
+      await valkey.srem(`user:${userId}:connections`, ...staleConns);
+      console.log(`Cleaned ${staleConns.length} stale connections for ${userId}`);
+    }
+  }
+
   // 로그인 사용자는 별도 Set에 추가 (Streamer가 빠르게 조회)
   if (isLoggedIn) {
     await valkey.sadd('realtime:connections', connectionId);

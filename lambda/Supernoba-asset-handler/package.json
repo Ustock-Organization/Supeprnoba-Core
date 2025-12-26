@@ -1,0 +1,12 @@
+{
+  "name": "supernoba-asset-handler",
+  "version": "1.0.0",
+  "description": "Lambda for fetching user assets and history",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@supabase/supabase-js": "^2.89.0"
+  }
+}

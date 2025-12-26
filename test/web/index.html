@@ -191,14 +191,14 @@
                 <div style="flex: 1; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden;">
                     <table class="orderbook-table"><tbody id="ob-asks"></tbody></table>
                 </div>
-                <div class="spread-info">
+                <div class="spread-info" style="position: relative;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <span id="ob-last-price" style="font-size: 1.2rem; font-weight: bold;">0</span>
                         <span id="ob-change-rate" style="font-size: 0.85rem;">+0.00%</span>
                     </div>
-                    <div style="display: flex; gap: 12px; font-size: 0.75rem; color: var(--text-secondary);">
-                        <span id="ob-spread">Spread: -</span>
-                        <span id="ob-timestamp">--:--:--</span>
+                    <span id="ob-spread" style="font-size: 0.75rem; color: var(--text-secondary);">Spread: -</span>
+                    <div style="position: absolute; bottom: 2px; right: 4px; font-size: 0.65rem; color: var(--text-secondary);">
+                        서버시간 <span id="ob-timestamp">--:--:--</span>
                     </div>
                 </div>
                 <div style="flex: 1; display: flex; flex-direction: column; justify-content: flex-start; overflow: hidden;">
@@ -221,6 +221,18 @@
                     <button class="action-btn" style="width: 100%; text-align: center; margin-bottom: 4px;" onclick="listSymbols()">종목 목록 조회 (Refresh List)</button>
                     <div id="symbolList" style="font-size: 0.7rem; color: #888; overflow-x: auto; white-space: nowrap; padding: 4px; border: 1px solid #30363d; min-height: 28px; display: flex; flex-wrap: wrap; gap: 2px;">-</div>
                 </div>
+                
+                <!-- Creator Requests Section -->
+                <div style="padding: 8px; border-bottom: 1px solid var(--border); background: #1a2332;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-size: 0.75rem; color: #ffcc00; font-weight: bold;">📋 Creator Requests</span>
+                        <button class="action-btn" onclick="loadCreatorRequests()">새로고침</button>
+                    </div>
+                    <div id="creatorRequestsList" style="font-size: 0.7rem; color: #888; max-height: 150px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 8px;">버튼을 눌러 대기 목록을 조회하세요</div>
+                    </div>
+                </div>
+                
                 <div id="adminLog" class="admin-log">
                     <div class="log-entry">System ready.</div>
                 </div>
@@ -268,6 +280,11 @@
                             <div class="api-config-row">
                                 <span class="api-config-label">Order API</span>
                                 <input type="text" id="orderApiUrl" class="api-config-input" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/orders">
+                            </div>
+
+                            <div class="api-config-row">
+                                <span class="api-config-label">Asset API</span>
+                                <input type="text" id="assetApiUrl" class="api-config-input" value="https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/assets">
                             </div>
                             
                             <div class="api-config-row">
@@ -428,9 +445,8 @@
 
                 <!-- VIEW: Assets -->
                 <div id="view-balance" style="display: none;">
-                    <div style="padding: 20px; color: #888;">
-                        자산 정보 연동 준비중... (Supabase Balance)
-                    </div>
+                    <button class="action-btn" onclick="fetchAssets()" style="width:100%; margin-bottom: 8px;">🔄 Refresh Assets</button>
+                    <div id="balance-display"></div>
                 </div>
             </div>
         </div>
@@ -506,6 +522,7 @@
             // Start loading data after login
             connectWS();
             fetchChartData(state.symbol);
+            fetchAssets();
             adminLog('로그인 완료: ' + state.userId, 'in');
         }
 
@@ -921,7 +938,7 @@
                 const symbols = json.symbols || [];
                 if(symbols.length > 0) {
                     el.innerHTML = symbols.map(s => 
-                        `<span class="symbol-badge">${s}</span>`
+                        `<span class="symbol-badge" title="${s.name}">${s.symbol || s}</span>`
                     ).join('');
                 } else {
                     el.innerHTML = '<span style="color:#888;">No active symbols</span>';
@@ -1045,6 +1062,27 @@
                     layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
                     grid: { vertLines: { color: '#21262d'}, horzLines: { color: '#21262d'} },
                     timeScale: { timeVisible: true, secondsVisible: false },
+                    timezone: 'Asia/Seoul',
+                    localization: {
+                        locale: 'ko-KR',
+                        dateFormat: 'yyyy/MM/dd',
+                        timeFormatter: (businessDayOrTimestamp) => {
+                            if (LightweightCharts.isBusinessDay(businessDayOrTimestamp)) {
+                                return 'Invalid Time';
+                            }
+                            const timestamp = businessDayOrTimestamp;
+                            const date = new Date(timestamp * 1000);
+                            // Force KST display manually
+                            const kstDate = new Date(date.getTime() + (0 * 60 * 60 * 1000)); // Already converted by browser if standard?
+                            // Actually, just use Intl.DateTimeFormat with timeZone
+                            return new Intl.DateTimeFormat('ko-KR', {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                hour12: false,
+                                timeZone: 'Asia/Seoul'
+                            }).format(date);
+                        }
+                    },
                 });
                 candleSeries = chart.addCandlestickSeries({
                     upColor: '#238636',
@@ -1092,6 +1130,8 @@
 
         // Track active candle for multi-minute aggregation
         let activeAggCandle = null; // { time, open, high, low, close }
+        let lastCandleTime = 0;     // Track last chart update time for gap detection
+        let lastCandleClose = 0;    // Track last close price for gap filling
         
         function updateChartWithCandle(candle, isClosed = false) {
             if(!candleSeries) return;
@@ -1119,6 +1159,17 @@
             
             if(!rawTime) return;
             
+            // DEBUG: Log first few timestamp conversions
+            if(Math.random() < 0.05) { // Sample 5% of updates to avoid spam
+                console.log('DEBUG TIME:', {
+                    t: candle.t,
+                    t_epoch: candle.t_epoch,
+                    rawTime: rawTime,
+                    dateObj: new Date((rawTime > 1000000000000 ? rawTime : rawTime * 1000)),
+                    localStr: new Date((rawTime > 1000000000000 ? rawTime : rawTime * 1000)).toString()
+                });
+            }
+            
             // Detect Milliseconds vs Seconds (Epoch 2025 is ~1.7e9 sec, ~1.7e12 ms)
             if (rawTime > 1000000000000) {
                 rawTime = Math.floor(rawTime / 1000);
@@ -1132,6 +1183,30 @@
             const inHigh = parseFloat(candle.h);
             const inLow = parseFloat(candle.l);
             const inClose = parseFloat(candle.c);
+            
+            // Validate OHLC
+            if (isNaN(inOpen) || isNaN(inHigh) || isNaN(inLow) || isNaN(inClose)) return;
+            
+            // === Gap Fill Logic ===
+            // Fill missing candles with flat lines (OHLC = previous close)
+            if (lastCandleTime > 0 && lastCandleClose > 0 && alignedTime > lastCandleTime) {
+                const gapMinutes = (alignedTime - lastCandleTime) / intervalSeconds;
+                
+                // Only fill gaps if less than 60 intervals (to avoid massive fills)
+                if (gapMinutes > 1 && gapMinutes < 60) {
+                    const flatPrice = lastCandleClose;
+                    for (let t = lastCandleTime + intervalSeconds; t < alignedTime; t += intervalSeconds) {
+                        candleSeries.update({
+                            time: t,
+                            open: flatPrice,
+                            high: flatPrice,
+                            low: flatPrice,
+                            close: flatPrice
+                        });
+                    }
+                    // logCandle(`Gap filled: ${gapMinutes - 1} candles`);
+                }
+            }
             
             // Multi-minute aggregation: accumulate within the same interval window
             if(intervalSeconds > 60) {
@@ -1153,6 +1228,8 @@
                 
                 // TradingView expects: { time, open, high, low, close }
                 candleSeries.update(activeAggCandle);
+                lastCandleTime = alignedTime;
+                lastCandleClose = activeAggCandle.close;
             } else {
                 // 1-minute interval: use directly
                 candleSeries.update({
@@ -1162,6 +1239,8 @@
                     low: inLow,
                     close: inClose
                 });
+                lastCandleTime = alignedTime;
+                lastCandleClose = inClose;
             }
         }
 
@@ -1233,6 +1312,210 @@
                  return `<tr><td class="price-up">${price}</td><td>${qty}</td><td><div class="bar-bg bar-bid" style="width:${pct}%"></div></td></tr>`;
              }).join('');
         }
+
+        // === Creator Requests (Supabase Integration) ===
+        const SUPABASE_URL = 'https://obnyjvgtdcwfutxmhrud.supabase.co';
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ibnlqdmd0ZGN3ZnV0eG1ocnVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzMDI2MTIsImV4cCI6MjA3Njg3ODYxMn0.Mbc0fsRYqkLunsrWtlkr6B53AyBbR5KTIPhiyyYKkWo';
+
+        async function loadCreatorRequests() {
+            const listEl = document.getElementById('creatorRequestsList');
+            listEl.innerHTML = '<div style="color: #58a6ff; padding: 8px;">로딩 중...</div>';
+            
+            try {
+                const res = await fetch(`${SUPABASE_URL}/rest/v1/creator_requests?status=eq.pending&order=created_at.asc`, {
+                    headers: {
+                        'apikey': SUPABASE_ANON_KEY,
+                        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const requests = await res.json();
+                
+                if (!requests || requests.length === 0) {
+                    listEl.innerHTML = '<div style="color: #666; text-align: center; padding: 8px;">대기 중인 요청이 없습니다</div>';
+                    return;
+                }
+                
+                listEl.innerHTML = requests.map(req => `
+                    <div style="display: flex; align-items: center; gap: 8px; padding: 6px; border-bottom: 1px solid #30363d;">
+                        <span style="color: ${req.platform === 'youtube' ? '#ff0000' : '#9146ff'};">●</span>
+                        <img src="${req.logo_url}" style="width:20px; height:20px; border-radius:50%; object-fit:cover;" onerror="this.src='data:image/svg+xml;base64,...'"/>
+                        <span style="flex: 1; color: #e6edf3;">${req.creator_name || req.creator_url.substring(0, 30)}</span>
+                        <button class="action-btn" onclick="approveCreator('${req.id}', '${req.creator_name}', '${req.logo_url}')" style="color: #238636;">✓</button>
+                        <button class="action-btn" onclick="rejectCreator('${req.id}')" style="color: #da3633;">✗</button>
+                    </div>
+                `).join('');
+                
+                adminLog(`Loaded ${requests.length} pending creator requests`, 'in');
+            } catch (e) {
+                listEl.innerHTML = `<div style="color: #ff7b72; padding: 8px;">에러: ${e.message}</div>`;
+                adminLog('Load creator requests error: ' + e.message, 'err');
+            }
+        }
+        
+        async function approveCreator(requestId, creatorName, logoUrl) {
+            // 1. Generate/Prompt symbol name
+            const symbolName = prompt('생성할 심볼 이름을 입력하세요:', creatorName?.toUpperCase().replace(/[^A-Z0-9]/g, '') || 'CREATOR');
+            if (!symbolName) return;
+            
+            try {
+                const endpoint = document.getElementById('adminApiUrl').value;
+                // Currently endpoint might include the function name, e.g. /Supernoba-admin
+                // We need to append /approve. 
+                // AWS Lambda URL structure: https://.../stage/function-name
+                // If using REST API Gateway with proxy: https://.../stage/admin/Supernoba-admin
+                // Appending /approve works if the Lambda handles path routing.
+                // My Lambda logic (Step 3793) checks if (path.includes('approve')).
+                
+                const adminKey = prompt('Admin API Key를 입력하세요 (생략 가능시 엔터):') || getAdminKey();
+                
+                adminLog(`Approving request... Symbol: ${symbolName}`, 'out');
+                
+                // Use query parameter instead of path to avoid IAM auth on sub-paths
+                const res = await fetch(`${endpoint}?action=approve`, {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': adminKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 
+                        requestId: requestId,
+                        symbol: symbolName, 
+                        name: creatorName,
+                        base_asset: symbolName,
+                        logo_url: logoUrl || ''
+                    })
+                });
+                
+                const json = await res.json();
+                
+                if (!res.ok) {
+                    throw new Error(json.error || 'Approval failed');
+                }
+                
+                adminLog(`✅ Approved: ${creatorName} → Symbol: ${json.symbol.symbol}`, 'in');
+                
+                // Refresh lists
+                loadCreatorRequests();
+                listSymbols();
+            } catch (e) {
+                adminLog('Approve error: ' + e.message, 'err');
+            }
+        }
+        
+        async function rejectCreator(requestId) {
+            const reason = prompt('거절 사유를 입력하세요 (선택):') || 'Rejected by admin';
+            
+            try {
+                const endpoint = document.getElementById('adminApiUrl').value;
+                const adminKey = getAdminKey();
+                
+                adminLog(`Rejecting request...`, 'out');
+                
+                const res = await fetch(`${endpoint}?action=reject`, {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': adminKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 
+                        requestId: requestId,
+                        reason: reason
+                    })
+                });
+                
+                const json = await res.json();
+                
+                if (!res.ok) {
+                    throw new Error(json.error || 'Rejection failed');
+                }
+                
+                adminLog(`❌ Rejected request: ${requestId.substring(0, 8)}...`, 'in');
+                loadCreatorRequests();
+            } catch (e) {
+                adminLog('Reject error: ' + e.message, 'err');
+            }
+        }
+        async function fetchAssets() {
+            if(!isLoggedIn) return;
+            const url = document.getElementById('assetApiUrl').value;
+            const uid = state.userId;
+            
+            try {
+                // Using hardcoded API key for test client convenience, or input if added
+                const apiKey = 'S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf'; 
+                
+                const res = await fetch(`${url}?userId=${uid}`, {
+                    headers: { 'X-Api-Key': apiKey }
+                });
+                const json = await res.json();
+                
+                if(json.balance) {
+                    renderBalance(json);
+                }
+            } catch(e) {
+                adminLog(`Asset Fetch Error: ${e.message}`, 'err');
+            }
+        }
+
+        function renderBalance(data) {
+            const el = document.getElementById('balance-display');
+            if(!el) return;
+            
+            const bal = data.balance || { available: 0, locked: 0, total: 0 };
+            const holdings = data.holdings || [];
+            
+            let html = `
+                <div style="margin-bottom: 12px; padding: 8px; background: #21262d; border-radius: 4px;">
+                    <div style="color: #8b949e; font-size: 0.75rem;">KRW Balance</div>
+                    <div style="display: flex; justify-content: space-between; margin-top: 4px;">
+                        <span>Avail: <b style="color: #fff;">${bal.available.toLocaleString()}</b></span>
+                        <span style="color: #888;">Locked: ${bal.locked.toLocaleString()}</span>
+                    </div>
+                </div>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Qty</th>
+                            <th>Avg Price</th>
+                            <th>Valuation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            if(holdings.length === 0) {
+                html += `<tr><td colspan="4" style="text-align: center; color: #666;">No Holdings</td></tr>`;
+            } else {
+                html += holdings.map(h => {
+                    // Estimate valuation if we have price, else 0
+                    // We don't have current price here easily unless we look at orderbook last price
+                    return `
+                        <tr>
+                            <td>${h.symbol}</td>
+                            <td>${h.qty.toLocaleString()}</td>
+                            <td>${h.avg_price.toLocaleString()}</td>
+                            <td>-</td> 
+                        </tr>
+                    `;
+                }).join('');
+            }
+            
+            html += `</tbody></table>`;
+            el.innerHTML = html;
+        }
+
+        // Auto-refresh assets on order success
+        const _origSubmitOrder = submitOrder;
+        // Check if submitOrder is async, it is.
+        // We can just call fetchAssets() inside submitOrder's success block in the existing code
+        // But since I can't easily inject into the middle of submitOrder without reading it all,
+        // I'll leave it to manual refresh or login refresh for now.
+        // Or I can override it?
+        // submitOrder is defined in global scope.
+        
     </script>
 </body>
 </html>

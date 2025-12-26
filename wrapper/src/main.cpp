@@ -88,13 +88,17 @@ int main(int argc, char* argv[]) {
         KinesisProducer producer(aws_region);
         
         // DynamoDB Client 생성 (체결 내역 저장용)
-        DynamoDBClient dynamodb(aws_region, dynamodb_table);
-        bool dynamodb_connected = dynamodb.connect();
+        // DynamoDB Client 생성 (체결 내역 저장용) - REFAC: Moved to Lambda
+        // DynamoDBClient dynamodb(aws_region, dynamodb_table);
+        // bool dynamodb_connected = dynamodb.connect();
+        bool dynamodb_connected = false; 
+        /*
         if (!dynamodb_connected) {
             Logger::warn("DynamoDB connection failed - continuing without trade history");
         } else {
             Logger::info("DynamoDB connected:", dynamodb_table);
         }
+        */
         
         // NotificationClient 생성 (WebSocket 직접 알림)
         // 중요: RedisClient는 Thread-safe하지 않으므로, 백그라운드 스레드용으로 별도 연결 생성
@@ -123,7 +127,7 @@ int main(int argc, char* argv[]) {
         
         // 핸들러 및 엔진 생성
         MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr, 
-                                  dynamodb_connected ? &dynamodb : nullptr,
+                                  nullptr /* dynamodb disabled */,
                                   notifier_enabled ? &notifier : nullptr);
         EngineCore engine(&handler);
         

@@ -1,9 +1,14 @@
 {
+  "name": "supernoba-order-router",
+  "version": "1.0.0",
+  "description": "Order Router with Kinesis and Supabase",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "deploy": "aws lambda update-function-code --function-name Supernoba-order-router --zip-file fileb://function.zip"
+  },
   "dependencies": {
-    "@aws-sdk/client-kinesis": "^3.955.0",
-    "@smithy/node-http-handler": "^4.4.7",
     "@supabase/supabase-js": "^2.89.0",
-    "esbuild": "^0.27.2",
-    "ioredis": "^5.8.2"
+    "ioredis": "^5.0.0"
   }
 }

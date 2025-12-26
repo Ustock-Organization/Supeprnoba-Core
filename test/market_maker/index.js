@@ -7,19 +7,24 @@ const keypress = require('keypress');
 const CONFIG = {
     symbol: 'TEST',
     basePrice: 3000,
-    range: 2000, // Price fluctuation range (+/-)
+    range: 2000, // Price fluctuation range (+/-) for Sine Wave
     wavePeriod: 60, // Minutes for full sine wave cycle
     ordersPerMinute: 60, // 1 orders per second
     endpoint: 'https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/orders',
     userId: 'cli-market-maker',
-    apiKey: 'S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf'
+    apiKey: 'S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf',
+    
+    // New Parameters
+    mode: 'RANDOM', // SINE or RANDOM
+    volatility: 5,   // Price change per tick in Random Mode
+    trend: 0         // Bias (-1 to 1) for upward/downward trend
 };
 
 // === State ===
 let isRunning = false; // Manual start
 let t = 0; // Sine wave time factor
 let totalOrders = 0;
-let lastPrice = 0;
+let lastPrice = CONFIG.basePrice; // Initialize with base price
 let intervalId = null;
 let lastError = '';
 let lastOrderInfo = null; // { side, price, quantity, time }
@@ -36,17 +41,32 @@ function printStatus() {
     
     console.log(chalk.bold('🎮  Controls'));
     console.log(chalk.gray('  [Space]   ') + 'Start / Stop');
+    console.log(chalk.gray('  [M]       ') + 'Switch Mode (SINE / RANDOM)');
     console.log(chalk.gray('  [Q]       ') + 'Quit');
-    console.log(chalk.gray('  [↑ / ↓]   ') + 'Base Price  (±10)');
+    console.log('');
+    console.log(chalk.bold('  Common:'));
+    console.log(chalk.gray('  [↑ / ↓]   ') + 'Base Price  (±10) / Reset Price');
     console.log(chalk.gray('  [← / →]   ') + 'Speed       (±60 opm)');
-    console.log(chalk.gray('  [ [ / ] ] ') + 'Wave Cycle  (±1 min)');
-    console.log(chalk.gray('  [ - / = ] ') + 'Range       (±10)');
+    console.log('');
+    
+    if (CONFIG.mode === 'SINE') {
+        console.log(chalk.bold('  Sine Mode:'));
+        console.log(chalk.gray('  [ [ / ] ] ') + 'Wave Cycle  (±1 min)');
+        console.log(chalk.gray('  [ - / = ] ') + 'Range       (±10)');
+    } else {
+        console.log(chalk.bold('  Random Mode:'));
+        console.log(chalk.gray('  [ , / . ] ') + 'Volatility  (±1)');
+        console.log(chalk.gray('  [ 9 / 0 ] ') + 'Trend       (Down/Up)');
+    }
     console.log('');
     
     console.log(chalk.bold('📊  Status'));
     console.log(`  State     : ${isRunning ? chalk.green.bold('RUNNING ▶') : chalk.red.bold('STOPPED ⏸')}`);
     console.log(`  Symbol    : ${chalk.yellow(CONFIG.symbol)}`);
+    console.log(`  Mode      : ${CONFIG.mode === 'SINE' ? chalk.magenta('Sine Wave 🌊') : chalk.blue('Random Walk 🎲')}`);
+    console.log(`  Price     : ${chalk.yellow(lastPrice)}`); 
     console.log(`  Orders    : ${totalOrders}`);
+    
     if (lastError) {
         console.log(`  Error     : ${chalk.red.bold(lastError)}`);
     }
@@ -66,10 +86,16 @@ function printStatus() {
     console.log('');
     
     console.log(chalk.bold('⚙️   Parameters'));
-    console.log(`  Price     : ${chalk.magenta.bold(CONFIG.basePrice)}`);
-    console.log(`  Range     : ± ${chalk.cyan(CONFIG.range)}`);
     console.log(`  Speed     : ${chalk.blue(CONFIG.ordersPerMinute)} orders/min`);
-    console.log(`  Wave Cycle: ${chalk.green(CONFIG.wavePeriod)} min`);
+    
+    if (CONFIG.mode === 'SINE') {
+        console.log(`  BasePrice : ${chalk.magenta(CONFIG.basePrice)}`);
+        console.log(`  Range     : ± ${chalk.cyan(CONFIG.range)}`);
+        console.log(`  Cycle     : ${chalk.green(CONFIG.wavePeriod)} min`);
+    } else {
+         console.log(`  Volatility: ${chalk.cyan(CONFIG.volatility)}`);
+         console.log(`  Trend     : ${CONFIG.trend > 0 ? chalk.green('UP (+' + CONFIG.trend + ')') : (CONFIG.trend < 0 ? chalk.red('DOWN (' + CONFIG.trend + ')') : chalk.gray('NEUTRAL'))}`);
+    }
     
     console.log('');
 }
@@ -78,22 +104,30 @@ function printStatus() {
 async function placeOrder() {
     if (!isRunning) return;
 
-    // Calculate Sine Wave Price
-    // t increments by 0.01 per tick
-    const minutesPerTick = 1 / CONFIG.ordersPerMinute;
-    t += minutesPerTick; // t is now in "minutes"
+    let price = 0;
+
+    if (CONFIG.mode === 'SINE') {
+        const minutesPerTick = 1 / CONFIG.ordersPerMinute;
+        t += minutesPerTick; 
+        const sineValue = Math.sin((t / CONFIG.wavePeriod) * 2 * Math.PI);
+        price = Math.round(CONFIG.basePrice + (CONFIG.range * sineValue));
+    } else {
+        // RANDOM WALK
+        // Change = (Random(-1 to 1) * Volatility) + Trend
+        // More realistic: Normal distribution approximation
+        const rand = (Math.random() - 0.5) * 2; // -1 to 1
+        const delta = Math.round((rand * CONFIG.volatility) + CONFIG.trend);
+        
+        // Ensure price doesn't go below 1
+        lastPrice = Math.max(1, lastPrice + delta);
+        price = lastPrice;
+    }
     
-    const sineValue = Math.sin((t / CONFIG.wavePeriod) * 2 * Math.PI);
-    
-    // Pure Sine Wave (No Noise) as requested by user
-    // This will produce monotonic candles (Marubozu).
-    const price = Math.round(CONFIG.basePrice + (CONFIG.range * sineValue));
-    
-    lastPrice = price;
+    lastPrice = price; // Sync for display
     
     const quantity = Math.floor(Math.random() * 50) + 1;
 
-    // Send order
+    // Send order (Self-Match)
     const buyOrder = {
         user_id: CONFIG.userId + '-buy',
         symbol: CONFIG.symbol,
@@ -172,13 +206,22 @@ process.stdin.on('keypress', function (ch, key) {
         printStatus();
     }
     
+    if ((key && key.name == 'm') || ch === 'm') {
+        CONFIG.mode = (CONFIG.mode === 'SINE') ? 'RANDOM' : 'SINE';
+        // Reset lastPrice to basePrice when switching to Random for stability
+        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice;
+        printStatus();
+    }
+    
     if (key && key.name == 'up') {
         CONFIG.basePrice += 10;
+        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice; // Reset current price
         printStatus();
     }
     
     if (key && key.name == 'down') {
-        CONFIG.basePrice -= 10;
+        CONFIG.basePrice = Math.max(10, CONFIG.basePrice - 10);
+        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice; // Reset current price
         printStatus();
     }
     
@@ -194,25 +237,43 @@ process.stdin.on('keypress', function (ch, key) {
         printStatus();
     }
     
-    // Wave Cycle Adjustment
+    // Wave Cycle Adjustment (Sine Mode)
     if ((key && key.sequence === '[') || ch === '[') {
         CONFIG.wavePeriod = Math.max(1, CONFIG.wavePeriod - 1);
         printStatus();
     }
-    
     if ((key && key.sequence === ']') || ch === ']') {
         CONFIG.wavePeriod += 1;
         printStatus();
     }
 
-    // Range Adjustment
+    // Range Adjustment (Sine Mode)
     if (ch === '-' || ch === '_') {
         CONFIG.range = Math.max(0, CONFIG.range - 10);
         printStatus();
     }
-    
     if (ch === '=' || ch === '+') {
         CONFIG.range += 10;
+        printStatus();
+    }
+    
+    // Volatility Adjustment (Random Mode)
+    if (ch === ',' || ch === '<') {
+        CONFIG.volatility = Math.max(1, CONFIG.volatility - 1);
+        printStatus();
+    }
+    if (ch === '.' || ch === '>') {
+        CONFIG.volatility += 1;
+        printStatus();
+    }
+    
+    // Trend Adjustment (Random Mode)
+    if (ch === '9' || ch === '(') {
+        CONFIG.trend -= 0.5;
+        printStatus();
+    }
+    if (ch === '0' || ch === ')') {
+        CONFIG.trend += 0.5;
         printStatus();
     }
 });

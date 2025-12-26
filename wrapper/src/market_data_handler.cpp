@@ -111,56 +111,26 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     }
     
     // buyer/seller ID 추출
+    // buyer/seller ID 추출
     const std::string& buyer_id = order->is_buy() ? 
         order->user_id() : matched_order->user_id();
     const std::string& seller_id = order->is_buy() ? 
         matched_order->user_id() : order->user_id();
     
-    // === DynamoDB 체결 내역 직접 저장 ===
-    // 참고: trades:* Valkey 캐시는 제거됨 (API 조회는 DynamoDB에서, 실시간 알림은 WebSocket으로)
-#ifdef USE_KINESIS
-    if (dynamodb_ && dynamodb_->isConnected()) {
+    // === Kinesis Fan-Out Publishing ===
+    // Engine -> Kinesis -> [DB, Notifier, Balance]
+    if (producer_) {
         const std::string& bo = order->is_buy() ? order->order_id() : matched_order->order_id();
         const std::string& so = order->is_buy() ? matched_order->order_id() : order->order_id();
         
-        bool db_saved = dynamodb_->putTrade(symbol, epoch_sec, fill_price, fill_qty,
-                                             buyer_id, seller_id, bo, so);
-        if (db_saved) {
-            Logger::info("DB_SAVE_OK:", symbol, fill_price, "x", fill_qty, "ts:", epoch_sec);
-        } else {
-            Logger::error("DB_SAVE_FAIL:", symbol, fill_price, "x", fill_qty, "- check DynamoDB connection");
-        }
-    } else {
-        Logger::warn("DB_NOT_CONNECTED:", symbol, "- trade not saved to DynamoDB");
+        producer_->publishFill(symbol, bo, so, buyer_id, seller_id, fill_qty, fill_price);
+        Logger::info("PUBLISHED_FILL:", symbol, fill_price, "x", fill_qty);
     }
-#endif
-    
+
     // Ticker 캐시 업데이트 (Sub 데이터용)
     updateTickerCache(symbol, fill_price);
     
-    // Direct WebSocket notification for both parties
-    if (notifier_) {
-        // Notification for both maker and taker
-        if (order->is_buy()) {
-             // order is BUY
-             notifier_->sendOrderStatus(order->user_id(), order->order_id(), symbol, "BUY", 
-                                        order->price(), order->order_qty(), (order->price()==0?"MARKET":"LIMIT"), 
-                                        fill_qty, fill_price, "FILLED");
-             // matched is SELL
-             notifier_->sendOrderStatus(matched_order->user_id(), matched_order->order_id(), symbol, "SELL", 
-                                        matched_order->price(), matched_order->order_qty(), (matched_order->price()==0?"MARKET":"LIMIT"), 
-                                        fill_qty, fill_price, "FILLED");
-        } else {
-             // order is SELL
-             notifier_->sendOrderStatus(order->user_id(), order->order_id(), symbol, "SELL", 
-                                        order->price(), order->order_qty(), (order->price()==0?"MARKET":"LIMIT"), 
-                                        fill_qty, fill_price, "FILLED");
-             // matched is BUY
-             notifier_->sendOrderStatus(matched_order->user_id(), matched_order->order_id(), symbol, "BUY", 
-                                        matched_order->price(), matched_order->order_qty(), (matched_order->price()==0?"MARKET":"LIMIT"), 
-                                        fill_qty, fill_price, "FILLED");
-        }
-    }
+    // Legacy Notification & DynamoDB Removed for Fan-Out Architecture
 }
 
 

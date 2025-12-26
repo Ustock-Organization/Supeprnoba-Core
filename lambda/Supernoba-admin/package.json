@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.958.0",
+    "@aws-sdk/client-lambda": "^3.957.0",
+    "@supabase/supabase-js": "^2.89.0"
+  }
+}

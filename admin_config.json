@@ -1,0 +1,69 @@
+{
+    "FunctionName": "Supernoba-admin",
+    "FunctionArn": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-admin",
+    "Runtime": "nodejs24.x",
+    "Role": "arn:aws:iam::264520158196:role/Supernoba-lambda-role",
+    "Handler": "index.handler",
+    "CodeSize": 8570841,
+    "Description": "관리자용 API함수 (MSK파이프 토픽 생성/삭제/조회)",
+    "Timeout": 60,
+    "MemorySize": 256,
+    "LastModified": "2025-12-24T14:23:24.000+0000",
+    "CodeSha256": "ss2/vfF5Ceeqi0sqrn6OMbTLg5EE1GjMvy+D1bVlAvk=",
+    "Version": "$LATEST",
+    "VpcConfig": {
+        "SubnetIds": [
+            "subnet-9e23bee5"
+        ],
+        "SecurityGroupIds": [
+            "sg-0bdd86538bbc9558e"
+        ],
+        "VpcId": "vpc-314afc5a",
+        "Ipv6AllowedForDualStack": false
+    },
+    "Environment": {
+        "Variables": {
+            "S3_BUCKET": "supernoba-market-data",
+            "YOUTUBE_API_KEY": "AIzaSyCJZO6pdChSbVVqcFfSNKJkvBZk4G051E0",
+            "TWITTER_BEARER_TOKEN": "AAAAAAAAAAAAAAAAAAAAAHs65gEAAAAAsel6zJ3PLy%2FKwg%2FRDgK9hrgcf0Q%3DPpvFj5olwMBiYVsukbcfwcghprHR6ygwD1rNDboAMGAh07fd6G",
+            "VALKEY_PORT": "6379",
+            "DYNAMODB_TRADE_TABEL": "trade_history",
+            "SUPABASE_SERVICE_ROLE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ibnlqdmd0ZGN3ZnV0eG1ocnVkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwMjYxMiwiZXhwIjoyMDc2ODc4NjEyfQ.2VsCHTmlqXn4ngFAo4v07-hlf8ni47oy_1d7qYLkui4",
+            "DYNAMODB_TABLE": "candle_history",
+            "VALKEY_HOST": "supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com",
+            "ADMIN_API_KEY": "7194",
+            "SUPABASE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ibnlqdmd0ZGN3ZnV0eG1ocnVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzMDI2MTIsImV4cCI6MjA3Njg3ODYxMn0.Mbc0fsRYqkLunsrWtlkr6B53AyBbR5KTIPhiyyYKkWo",
+            "SUPABASE_URL": "https://obnyjvgtdcwfutxmhrud.supabase.co"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "5962816f-105d-4e18-a47c-50cbd4f8054e",
+    "Layers": [
+        {
+            "Arn": "arn:aws:lambda:ap-northeast-2:264520158196:layer:Supernoba-router-dependencies:6",
+            "CodeSize": 6289009
+        }
+    ],
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "arm64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:ap-northeast-2::runtime:0bc82ce04038968a71a6237f018cf92c34977461e956ba25e0127f3d6cf4c36a"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/Supernoba-admin"
+    }
+}

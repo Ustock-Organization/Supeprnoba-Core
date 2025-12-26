@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-fill-processor",
+  "version": "1.0.0",
+  "description": "Processes Kinesis fills and updates Supabase",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.89.0"
+  }
+}
