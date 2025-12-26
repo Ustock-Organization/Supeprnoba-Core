@@ -1,14 +1,17 @@
 {
   "name": "market-maker-cli",
-  "version": "1.0.0",
-  "description": "CLI Market Maker for Supernoba Candle Testing",
+  "version": "2.0.0",
+  "description": "CLI Market Maker for Supernoba - Direct Kinesis",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:kinesis": "node kinesis_mode.js"
   },
   "dependencies": {
+    "@aws-sdk/client-kinesis": "^3.0.0",
     "axios": "^1.6.0",
     "chalk": "^4.1.2",
-    "keypress": "^0.2.1"
+    "keypress": "^0.2.1",
+    "uuid": "^9.0.0"
   }
 }

@@ -12,8 +12,13 @@ struct Config {
     
     // AWS 설정
     std::string aws_region;
-    std::string dynamodb_table;
-    std::string s3_bucket;
+    
+    // RDS 설정
+    std::string rds_host;
+    int rds_port;
+    std::string rds_dbname;
+    std::string rds_user;
+    std::string rds_password;
     
     // 폴링 설정
     int poll_interval_ms;

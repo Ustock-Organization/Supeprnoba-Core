@@ -1,5 +1,5 @@
 #!/bin/bash
-# Candle Aggregator - EC2 실행 스크립트
+# Candle Aggregator - EC2 실행 스크립트 (RDS PostgreSQL)
 # 사용법: 
 #   ./run_aggregator.sh           # 기본 실행
 #   ./run_aggregator.sh --dev     # Valkey 캐시 초기화 후 시작
@@ -25,7 +25,7 @@ for arg in "$@"; do
 done
 
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║     Candle Aggregator - Real-time Timeframe Processor     ║"
+echo "║     Candle Aggregator - RDS PostgreSQL                    ║"
 if [ "$DEV_MODE" == "true" ]; then
     echo "║                    [DEV MODE - Cache Clear]               ║"
 fi
@@ -47,11 +47,14 @@ export AWS_REGION="ap-northeast-2"
 export VALKEY_HOST="supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com"
 export VALKEY_PORT="6379"
 
-# DynamoDB
-export DYNAMODB_CANDLE_TABLE="candle_history"
-
-# S3
-export S3_BUCKET="supernoba-market-data"
+# RDS PostgreSQL
+export RDS_HOST="supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com"
+export RDS_PORT="5432"
+export RDS_DBNAME="postgres"
+# RDS 자격 증명 (Secrets Manager에서 가져오거나 환경변수로 설정)
+# 실제 배포 시 aws secretsmanager get-secret-value 사용 권장
+export RDS_USER="${RDS_USER:-postgres}"
+export RDS_PASSWORD="${RDS_PASSWORD:-}"
 
 # 폴링 간격 (ms)
 export POLL_INTERVAL_MS="10"
@@ -78,6 +81,12 @@ echo ""
 echo "[1/3] 빌드 중..."
 cd "$AGGREGATOR_DIR"
 
+# 기존 빌드 디렉토리가 AWS SDK 기반이면 삭제
+if [ -d "$BUILD_DIR" ] && grep -q "AWSSDK" "$BUILD_DIR/CMakeCache.txt" 2>/dev/null; then
+    echo "  -> 이전 AWS SDK 빌드 제거 중..."
+    rm -rf "$BUILD_DIR"
+fi
+
 if [ ! -d "$BUILD_DIR" ]; then
     echo "  -> CMake 설정..."
     cmake -B "$BUILD_DIR" -S . \
@@ -94,8 +103,8 @@ cmake --build "$BUILD_DIR" -j$(nproc)
 echo ""
 echo "[2/3] 현재 설정:"
 echo "  - VALKEY_HOST: $VALKEY_HOST"
-echo "  - DYNAMODB_TABLE: $DYNAMODB_CANDLE_TABLE"
-echo "  - S3_BUCKET: $S3_BUCKET"
+echo "  - RDS_HOST: $RDS_HOST"
+echo "  - RDS_DBNAME: $RDS_DBNAME"
 echo "  - POLL_INTERVAL: ${POLL_INTERVAL_MS}ms"
 echo "  - LOG_LEVEL: $LOG_LEVEL"
 echo "  - DEV_MODE: $DEV_MODE"

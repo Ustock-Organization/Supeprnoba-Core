@@ -59,8 +59,6 @@ export KINESIS_TRADES_STREAM="supernoba-trades"
 export KINESIS_DEPTH_STREAM="supernoba-depth"
 export KINESIS_STATUS_STREAM="supernoba-order-status"
 
-# DynamoDB
-export DYNAMODB_TRADE_TABLE="trade_history"
 
 # WebSocket 직접 알림 (API Gateway)
 export WEBSOCKET_ENDPOINT="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/"
@@ -105,7 +103,6 @@ echo ""
 echo "[2/3] 현재 설정:"
 echo "  - KINESIS_ORDERS: $KINESIS_ORDERS_STREAM"
 echo "  - KINESIS_FILLS: $KINESIS_FILLS_STREAM"
-echo "  - DYNAMODB_TABLE: $DYNAMODB_TRADE_TABLE"
 echo "  - REDIS_HOST: $REDIS_HOST"
 echo "  - DEPTH_CACHE: $DEPTH_CACHE_HOST"
 echo "  - LOG_LEVEL: $LOG_LEVEL"

@@ -7,9 +7,6 @@
     "hiredis",
     "curl",
     "openssl",
-    {
-      "name": "aws-sdk-cpp",
-      "features": ["dynamodb", "s3"]
-    }
+    "libpq"
   ]
 }

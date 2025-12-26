@@ -12,8 +12,13 @@ Config Config::from_env() {
     
     // AWS 설정
     cfg.aws_region = std::getenv("AWS_REGION") ? std::getenv("AWS_REGION") : "ap-northeast-2";
-    cfg.dynamodb_table = std::getenv("DYNAMODB_CANDLE_TABLE") ? std::getenv("DYNAMODB_CANDLE_TABLE") : "candle_history";
-    cfg.s3_bucket = std::getenv("S3_BUCKET") ? std::getenv("S3_BUCKET") : "supernoba-market-data";
+    
+    // RDS 설정
+    cfg.rds_host = std::getenv("RDS_HOST") ? std::getenv("RDS_HOST") : "localhost";
+    cfg.rds_port = std::getenv("RDS_PORT") ? std::atoi(std::getenv("RDS_PORT")) : 5432;
+    cfg.rds_dbname = std::getenv("RDS_DBNAME") ? std::getenv("RDS_DBNAME") : "postgres";
+    cfg.rds_user = std::getenv("RDS_USER") ? std::getenv("RDS_USER") : "postgres";
+    cfg.rds_password = std::getenv("RDS_PASSWORD") ? std::getenv("RDS_PASSWORD") : "";
     
     // 폴링 설정
     cfg.poll_interval_ms = std::getenv("POLL_INTERVAL_MS") ? std::atoi(std::getenv("POLL_INTERVAL_MS")) : 100;

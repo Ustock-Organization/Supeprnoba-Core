@@ -1,0 +1,11 @@
+{
+  "name": "supernoba-chart-data-handler",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Chart data handler - RDS PostgreSQL",
+  "main": "index.mjs",
+  "dependencies": {
+    "pg": "^8.11.3",
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}

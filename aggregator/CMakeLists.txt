@@ -1,4 +1,4 @@
-# Candle Aggregator - Real-time Timeframe Processor
+# Candle Aggregator - Real-time Timeframe Processor (RDS PostgreSQL)
 cmake_minimum_required(VERSION 3.20)
 project(candle_aggregator VERSION 1.0.0 LANGUAGES CXX)
 
@@ -14,9 +14,9 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
-# AWS SDK (vcpkg 통해 설치)
-find_package(AWSSDK CONFIG REQUIRED COMPONENTS dynamodb s3)
-message(STATUS "Building Candle Aggregator with DynamoDB + S3 support")
+# PostgreSQL (libpq)
+find_package(PostgreSQL REQUIRED)
+message(STATUS "Building Candle Aggregator with RDS PostgreSQL support")
 
 # 소스 파일
 set(SOURCES
@@ -25,8 +25,7 @@ set(SOURCES
     src/logger.cpp
     src/valkey_client.cpp
     src/aggregator.cpp
-    src/dynamodb_client.cpp
-    src/s3_client.cpp
+    src/rds_client.cpp
 )
 
 # 메인 실행파일
@@ -39,5 +38,5 @@ target_link_libraries(candle_aggregator PRIVATE
     OpenSSL::SSL
     OpenSSL::Crypto
     CURL::libcurl
-    ${AWSSDK_LINK_LIBRARIES}
+    PostgreSQL::PostgreSQL
 )

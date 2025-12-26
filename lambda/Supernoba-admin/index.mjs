@@ -26,7 +26,7 @@ const RDS_ENDPOINT = process.env.RDS_ENDPOINT;
 const DB_NAME = process.env.DB_NAME || 'postgres';
 const secretsManager = new SecretsManagerClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 
-// Helper: Create Partition on RDS
+// Helper: Create Partitions on RDS (trade_history + candle_history)
 async function ensureRdsPartition(symbol) {
     if (!DB_SECRET_ARN || !RDS_ENDPOINT) { 
         console.warn('Skipping RDS Partition creation (Missing Config)');
@@ -47,18 +47,15 @@ async function ensureRdsPartition(symbol) {
              database: DB_NAME,
              port: 5432,
              ssl: { rejectUnauthorized: false },
-             connectionTimeoutMillis: 3000
+             connectionTimeoutMillis: 5000
         });
         await client.connect();
         
-        // 3. Create Partition
+        // 3. Create Partitions (trade_history + candle_history)
         const cleanSymbol = symbol.toUpperCase().replace(/[^A-Z0-9]/g, '');
-        const tableName = `trade_history_${cleanSymbol}`;
         
-        // Use RPC or Raw SQL. Raw SQL is fine here since we have master access.
-        // Also ensure master table exists (just in case)
         const sql = `
-            CREATE TABLE IF NOT EXISTS public.trade_history_partitioning_master_dummy (id int); -- Check conn
+            -- Trade History 마스터 테이블
             CREATE TABLE IF NOT EXISTS public.trade_history (
                 id UUID DEFAULT gen_random_uuid(),
                 symbol TEXT NOT NULL,
@@ -73,13 +70,35 @@ async function ensureRdsPartition(symbol) {
                 PRIMARY KEY (symbol, id)
             ) PARTITION BY LIST (symbol);
             
-            CREATE TABLE IF NOT EXISTS public.${tableName} 
+            -- Trade History 파티션
+            CREATE TABLE IF NOT EXISTS public.trade_history_${cleanSymbol} 
             PARTITION OF public.trade_history 
-            FOR VALUES IN ('${symbol.toUpperCase()}');
+            FOR VALUES IN ('${cleanSymbol}');
+            
+            -- Candle History 마스터 테이블
+            CREATE TABLE IF NOT EXISTS public.candle_history (
+                id SERIAL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                time_epoch BIGINT NOT NULL,
+                time_ymdhm TEXT NOT NULL,
+                open NUMERIC NOT NULL,
+                high NUMERIC NOT NULL,
+                low NUMERIC NOT NULL,
+                close NUMERIC NOT NULL,
+                volume NUMERIC DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (symbol, interval, time_epoch)
+            ) PARTITION BY LIST (symbol);
+            
+            -- Candle History 파티션
+            CREATE TABLE IF NOT EXISTS public.candle_history_${cleanSymbol} 
+            PARTITION OF public.candle_history 
+            FOR VALUES IN ('${cleanSymbol}');
         `;
         
         await client.query(sql);
-        console.log(`[RDS] Partition created for ${symbol}`);
+        console.log(`[RDS] Partitions created for ${cleanSymbol} (trade_history + candle_history)`);
         
     } catch (err) {
         console.error(`[RDS] Partition creation failed for ${symbol}:`, err);
@@ -92,7 +111,6 @@ async function ensureRdsPartition(symbol) {
 // Optional (with defaults)
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const DYNAMODB_CANDLE_TABLE = process.env.DYNAMODB_TABLE || 'candle_history';
-const DYNAMODB_TRADE_TABLE = process.env.DYNAMODB_TRADE_TABLE || 'trade_history';
 const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
 
 // Validate Required Config
@@ -104,8 +122,10 @@ if (!VALKEY_HOST || !SUPABASE_URL || !SUPABASE_KEY || !SUPABASE_SERVICE_KEY || !
 const valkey = new Redis({
   host: VALKEY_HOST,
   port: VALKEY_PORT,
+  tls: {}, // Enable TLS for ElastiCache (TransitEncryptionEnabled=true)
   connectTimeout: 5000,
-  maxRetriesPerRequest: 1,
+  maxRetriesPerRequest: 3,
+  retryStrategy: (times) => Math.min(times * 50, 2000),
 });
 
 valkey.on('error', (err) => console.error('Redis error:', err.message));
@@ -130,7 +150,12 @@ const headers = {
 // Admin Check
 function isAdmin(event) {
   const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  return authHeader === ADMIN_API_KEY; 
+  if (authHeader !== ADMIN_API_KEY) {
+      console.log(`[AUTH FAIL] Expected: '${ADMIN_API_KEY}', Got: '${authHeader}'`);
+      console.log('[AUTH FAIL] All Headers:', JSON.stringify(event.headers));
+      return false;
+  }
+  return true; 
 }
 
 // Helper: Detect Platform
@@ -490,11 +515,23 @@ export const handler = async (event) => {
     }
 
     // === DELETE /symbols/{symbol} ===
-    if (method === 'DELETE' && symbolParam) {
+    // === DELETE /symbols (Support both Path and Body) ===
+    if (method === 'DELETE') {
         if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Admin access required' }) };
-        await supabaseAdmin.from('symbols').delete().eq('symbol', symbolParam.toUpperCase());
-        await valkey.srem('active:symbols', symbolParam.toUpperCase());
-        return { statusCode: 200, headers, body: JSON.stringify({ message: 'Deleted' }) };
+        
+        let targetSymbol = symbolParam;
+        if (!targetSymbol) {
+            try {
+                const body = JSON.parse(event.body || '{}');
+                targetSymbol = body.symbol;
+            } catch (e) {}
+        }
+
+        if (targetSymbol) {
+             await supabaseAdmin.from('symbols').delete().eq('symbol', targetSymbol.toUpperCase());
+             await valkey.srem('active:symbols', targetSymbol.toUpperCase());
+             return { statusCode: 200, headers, body: JSON.stringify({ message: 'Deleted', symbol: targetSymbol }) };
+        }
     }
     
     return { statusCode: 404, headers, body: JSON.stringify({ error: 'Not Found' }) };
