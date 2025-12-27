@@ -60,7 +60,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: '${{ matrix.function.path }}/package.json'
+          cache-dependency-path: '${{ matrix.function.path }}/package-lock.json'
         continue-on-error: true
       
       - name: Setup Node.js (without cache)
@@ -142,27 +142,50 @@ jobs:
         if: steps.filter.outputs.should_deploy == 'true'
         working-directory: ${{ matrix.function.path }}
         run: |
-          aws lambda update-function-code \
+          echo "=== Deploying ${{ matrix.function.name }} ==="
+          echo "ZIP file size: $(ls -lh function.zip | awk '{print $5}')"
+          
+          DEPLOY_RESULT=$(aws lambda update-function-code \
             --function-name ${{ matrix.function.name }} \
             --zip-file fileb://function.zip \
-            --region ap-northeast-2
+            --region ap-northeast-2 \
+            --output json)
+          
+          echo "Deployment response:"
+          echo "$DEPLOY_RESULT" | jq -r '. | "FunctionArn: \(.FunctionArn)\nLastModified: \(.LastModified)\nCodeSize: \(.CodeSize) bytes\nCodeSha256: \(.CodeSha256)"'
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Successfully deployed ${{ matrix.function.name }}"
+          else
+            echo "❌ Failed to deploy ${{ matrix.function.name }}"
+            exit 1
+          fi
       
       - name: Verify deployment
         if: steps.filter.outputs.should_deploy == 'true'
         run: |
           echo "=== Verifying deployment for ${{ matrix.function.name }} ==="
+          sleep 2  # Lambda 업데이트 반영 대기
+          
           FUNCTION_INFO=$(aws lambda get-function \
             --function-name ${{ matrix.function.name }} \
             --region ap-northeast-2 \
-            --query 'Configuration.[FunctionName,LastModified,CodeSize,CodeSha256]' \
-            --output json)
+            --query 'Configuration.[FunctionName,LastModified,CodeSize,CodeSha256,State,LastUpdateStatus]' \
+            --output json 2>/dev/null)
           
-          echo "$FUNCTION_INFO" | jq -r '.[] | "Function: \(.[0])\nLastModified: \(.[1])\nCodeSize: \(.[2]) bytes\nCodeSha256: \(.[3])"'
+          if [ -z "$FUNCTION_INFO" ] || [ "$FUNCTION_INFO" == "null" ]; then
+            echo "❌ Failed to retrieve function information for ${{ matrix.function.name }}"
+            exit 1
+          fi
           
-          # 배포 성공 여부 확인
-          if [ -n "$FUNCTION_INFO" ]; then
+          echo "$FUNCTION_INFO" | jq -r '. | "Function: \(.[0])\nLastModified: \(.[1])\nCodeSize: \(.[2]) bytes\nCodeSha256: \(.[3])\nState: \(.[4])\nLastUpdateStatus: \(.[5])"'
+          
+          STATE=$(echo "$FUNCTION_INFO" | jq -r '.[4]')
+          UPDATE_STATUS=$(echo "$FUNCTION_INFO" | jq -r '.[5]')
+          
+          if [ "$STATE" == "Active" ] && [ "$UPDATE_STATUS" == "Successful" ]; then
             echo "✅ Deployment verified successfully for ${{ matrix.function.name }}"
           else
-            echo "❌ Failed to verify deployment for ${{ matrix.function.name }}"
-            exit 1
+            echo "⚠️ Function state: $STATE, Update status: $UPDATE_STATUS"
+            echo "✅ Deployment completed (status may still be updating)"
           fi
