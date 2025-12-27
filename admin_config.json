@@ -5,7 +5,7 @@
     "Role": "arn:aws:iam::264520158196:role/Supernoba-lambda-role",
     "Handler": "index.handler",
     "CodeSize": 8570841,
-    "Description": "�����ڿ� API�Լ� (MSK������ ���� ����/����/��ȸ)",
+    "Description": "관리자용 API함수 (MSK파이프 토픽 생성/삭제/조회)",
     "Timeout": 60,
     "MemorySize": 256,
     "LastModified": "2025-12-24T14:23:24.000+0000",

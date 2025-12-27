@@ -1,0 +1,14 @@
+{
+  "name": "supernoba-order-status-processor",
+  "version": "1.0.0",
+  "description": "Processes order status events from Kinesis order-status stream",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.0.0",
+    "@supabase/supabase-js": "^2.89.0",
+    "ioredis": "^5.3.2"
+  }
+}

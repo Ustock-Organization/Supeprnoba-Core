@@ -125,8 +125,9 @@ void KinesisProducer::publishOrderStatus(const std::string& symbol,
     j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
+    // 모든 ORDER_STATUS 이벤트는 order-status 스트림으로 발행
     produce(status_stream_, symbol, j.dump());
-    Logger::debug("Published order status:", order_id, status, "user:", user_id);
+    Logger::debug("Published ORDER_STATUS to order-status stream:", order_id, status, "user:", user_id);
 }
 
 void KinesisProducer::flush(int timeout_ms) {

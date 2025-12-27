@@ -24,7 +24,7 @@ flowchart TD
     
     Streamer[Streamer EC2<br/>50ms/500ms 폴링<br/>WebSocket 푸시]
     
-    Storage[영구 저장소<br/>DynamoDB Orders<br/>Aurora PostgreSQL<br/>DynamoDB Candles]
+    Storage[영구 저장소<br/>DynamoDB Orders<br/>Aurora PostgreSQL<br/>S3 + DynamoDB Candles]
     
     Supabase[Supabase<br/>wallets + auth]
     
@@ -693,11 +693,11 @@ flowchart TD
     FillProc --> Supabase
     HistSaver --> RDS
     
-    Handler -->|부분 체결<br/>PARTIALLY_FILLED| DirectNotif
+    Handler -->|주문 상태| DirectNotif
     DirectNotif --> Gateway
     Gateway --> Client
     
-    Notifier -->|전량 체결<br/>FILLED만| Gateway
+    Notifier -.->|레거시| Gateway
     
     style Kinesis fill:#FF9900,color:#000
     style DirectNotif fill:#2196F3,color:#fff
@@ -707,13 +707,10 @@ flowchart TD
 
 ### Fan-Out 아키텍처 설명
 
-1. **단일 발행**: Engine에서 `KinesisProducer::publishFill()` 한 번 호출 (전량 체결 여부 포함)
+1. **단일 발행**: Engine에서 `KinesisProducer::publishFill()` 한 번 호출
 2. **다중 소비**: Kinesis Stream이 자동으로 여러 Lambda에 전달 (Fan-Out)
 3. **병렬 처리**: 각 Lambda가 독립적으로 처리 (실패 시 재시도)
-4. **체결 알림 분리**:
-   - **부분 체결**: 엔진 `NotificationClient`에서 직접 WebSocket 알림 (실시간 상태 업데이트)
-   - **전량 체결**: `notifier Lambda`에서 WebSocket 알림 (Kinesis를 통한 Fan-Out)
-5. **역할 분리**: 부분 체결은 실시간성, 전량 체결은 안정성/재시도 보장
+4. **직접 알림**: 주문 상태는 Kinesis 거치지 않고 `NotificationClient`로 직접 전송 (지연시간 최소화)
 
 ---
 

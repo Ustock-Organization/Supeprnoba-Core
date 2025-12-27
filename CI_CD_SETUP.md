@@ -375,3 +375,4 @@ Slack에 배포 알림을 받으려면:
 - 프로젝트 내 문서:
   - `liquibook/DEPLOYMENT_GUIDE.md` - 배포 가이드
   - `liquibook/AWS_ARCHITECTURE.md` - 아키텍처 개요
+

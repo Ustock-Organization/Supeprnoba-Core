@@ -38,6 +38,8 @@ export const handler = async (event) => {
   const legacyUserId = event.queryStringParameters?.userId;
   const testMode = event.queryStringParameters?.testMode === 'true';
   
+  console.log(`[connect] Connection: ${connectionId}, token: ${token ? 'present' : 'missing'}, userId param: ${legacyUserId}`);
+  
   let userId = legacyUserId || generateAnonymousId();
   let isLoggedIn = false;
   let userEmail = null;
@@ -51,25 +53,28 @@ export const handler = async (event) => {
   // === JWT 토큰 검증 (운영 환경) ===
   else if (token && getSupabase()) {
     try {
+      console.log(`[connect] Validating JWT token...`);
       const { data: { user }, error } = await getSupabase().auth.getUser(token);
       
       if (user && !error) {
         userId = user.id;
         userEmail = user.email;
         isLoggedIn = true;
-        console.log(`Authenticated user: ${userId} (${userEmail})`);
+        console.log(`[connect] Authenticated user: ${userId} (${userEmail})`);
       } else {
-        console.warn('JWT validation failed:', error?.message || 'Unknown error');
+        console.warn(`[connect] JWT validation failed:`, error?.message || 'Unknown error');
       }
     } catch (e) {
-      console.warn('JWT validation error:', e.message);
+      console.warn(`[connect] JWT validation error:`, e.message);
     }
   } else if (legacyUserId && !legacyUserId.startsWith('anonymous')) {
     // 레거시 호환: userId가 명시적으로 주어진 경우 (테스트용)
-    console.log(`Legacy userId provided: ${legacyUserId} (not authenticated)`);
+    console.log(`[connect] Legacy userId provided: ${legacyUserId} (not authenticated)`);
+  } else {
+    console.log(`[connect] No token provided, using anonymous userId: ${userId}`);
   }
   
-  console.log(`New connection: ${connectionId}, userId: ${userId}, isLoggedIn: ${isLoggedIn}`);
+  console.log(`[connect] New connection: ${connectionId}, userId: ${userId}, isLoggedIn: ${isLoggedIn}`);
   
   // 연결 정보 저장 (24시간 TTL)
   await valkey.setex(`ws:${connectionId}`, 86400, JSON.stringify({

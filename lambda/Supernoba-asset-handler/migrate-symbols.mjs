@@ -47,3 +47,4 @@ async function migrate() {
 }
 
 migrate().catch(console.error);
+

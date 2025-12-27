@@ -95,3 +95,4 @@ Write-Host "Cleanup Complete" -ForegroundColor Cyan
 Write-Host "Functions cleaned: $cleaned" -ForegroundColor Green
 Write-Host "Total space freed: $([math]::Round($totalSize / 1MB, 2)) MB" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
+

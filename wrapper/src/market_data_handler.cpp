@@ -30,18 +30,33 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    0, 0, "ACCEPTED");
     }
+    
+    // Kinesis로 ACCEPTED 이벤트 발행 (order-status 스트림)
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "ACCEPTED", "");
+        Logger::info("Published ACCEPTED event to Kinesis:", order->order_id());
+    }
 }
 
 void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Order REJECTED:", order->order_id(), "reason:", reason);
     Metrics::instance().incrementOrdersRejected();
     
+    // WebSocket 알림 전송
     if (notifier_) {
         std::string side = order->is_buy() ? "BUY" : "SELL";
         std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
         notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    0, 0, "REJECTED", reason);
+    }
+    
+    // Kinesis로 REJECTED 이벤트 발행 (order-status 스트림)
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "REJECTED", reason ? reason : "");
+        Logger::info("Published REJECTED event to Kinesis:", order->order_id());
     }
 }
 
@@ -141,8 +156,8 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     }
     
     // === Kinesis Fan-Out Publishing ===
-    // Engine -> Kinesis -> [DB, Notifier (전량 체결만), Balance]
-    // 전량 체결된 주문만 Lambda가 알림 처리
+    // Engine -> Kinesis -> [DB, Balance]
+    // FILL 이벤트는 fills 스트림으로 발행 (부분/전량 모두)
     if (producer_) {
         const std::string& bo = order->is_buy() ? order->order_id() : matched_order->order_id();
         const std::string& so = order->is_buy() ? matched_order->order_id() : order->order_id();
@@ -155,6 +170,21 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
                                buyer_fully_filled, seller_fully_filled);
         Logger::info("PUBLISHED_FILL:", symbol, fill_price, "x", fill_qty, 
                      "buyer_filled:", buyer_fully_filled, "seller_filled:", seller_fully_filled);
+        
+        // 전량 체결된 주문은 ORDER_STATUS (FILLED)를 order-status 스트림으로 발행
+        if (buyer_fully_filled) {
+            std::string buyer_side = order->is_buy() ? "BUY" : "SELL";
+            std::string buyer_type = (order->is_buy() ? order->price() : matched_order->price()) == 0 ? "MARKET" : "LIMIT";
+            producer_->publishOrderStatus(symbol, bo, buyer_id, "FILLED", "");
+            Logger::info("Published FILLED status for buyer:", bo);
+        }
+        
+        if (seller_fully_filled) {
+            std::string seller_side = order->is_buy() ? "SELL" : "BUY";
+            std::string seller_type = (order->is_buy() ? matched_order->price() : order->price()) == 0 ? "MARKET" : "LIMIT";
+            producer_->publishOrderStatus(symbol, so, seller_id, "FILLED", "");
+            Logger::info("Published FILLED status for seller:", so);
+        }
     }
 
     // Ticker 캐시 업데이트 (Sub 데이터용)
@@ -165,6 +195,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
     
+    // WebSocket 알림 전송
     if (notifier_) {
         std::string side = order->is_buy() ? "BUY" : "SELL";
         std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
@@ -172,17 +203,32 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    order->filled_qty(), 0, "CANCELLED");
     }
+    
+    // Kinesis로 CANCEL 이벤트 발행 (DynamoDB 업데이트를 위해)
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "CANCELLED", "");
+        Logger::info("Published CANCEL event to Kinesis:", order->order_id());
+    }
 }
 
 void MarketDataHandler::on_cancel_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Cancel REJECTED:", order->order_id(), "reason:", reason);
     
+    // WebSocket 알림 전송
     if (notifier_) {
         std::string side = order->is_buy() ? "BUY" : "SELL";
         std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
         notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    order->filled_qty(), 0, "CANCEL_REJECTED", reason);
+    }
+    
+    // Kinesis로 CANCEL_REJECTED 이벤트 발행
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "CANCEL_REJECTED", reason ? reason : "");
+        Logger::info("Published CANCEL_REJECTED event to Kinesis:", order->order_id());
     }
 }
 
@@ -192,6 +238,7 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
     Logger::info("Order REPLACED:", order->order_id(), 
                  "delta:", size_delta, "new_price:", new_price);
     
+    // WebSocket 알림 전송
     if (notifier_) {
         std::string side = order->is_buy() ? "BUY" : "SELL";
         std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
@@ -199,17 +246,32 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    order->filled_qty(), 0, "REPLACED");
     }
+    
+    // Kinesis로 REPLACED 이벤트 발행
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "REPLACED", "");
+        Logger::info("Published REPLACED event to Kinesis:", order->order_id());
+    }
 }
 
 void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Replace REJECTED:", order->order_id(), "reason:", reason);
     
+    // WebSocket 알림 전송
     if (notifier_) {
         std::string side = order->is_buy() ? "BUY" : "SELL";
         std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
         notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
                                    order->symbol(), side, order->price(), order->order_qty(), type, 
                                    order->filled_qty(), 0, "REPLACE_REJECTED", reason);
+    }
+    
+    // Kinesis로 REPLACE_REJECTED 이벤트 발행
+    if (producer_) {
+        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+                                      order->user_id(), "REPLACE_REJECTED", reason ? reason : "");
+        Logger::info("Published REPLACE_REJECTED event to Kinesis:", order->order_id());
     }
 }
 

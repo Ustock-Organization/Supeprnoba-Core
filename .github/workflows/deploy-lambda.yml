@@ -37,6 +37,9 @@ jobs:
           - name: Supernoba-notifier
             path: liquibook/lambda/Supernoba-notifier
             has_package_json: 'true'
+          - name: Supernoba-order-status-processor
+            path: liquibook/lambda/Supernoba-order-status-processor
+            has_package_json: 'true'
           - name: Supernoba-chart-data-handler
             path: liquibook/lambda/Supernoba-chart-data-handler
             has_package_json: 'true'
@@ -191,3 +194,4 @@ jobs:
             echo "⚠️ Function state: $STATE, Update status: $UPDATE_STATUS"
             echo "✅ Deployment completed (status may still be updating)"
           fi
+

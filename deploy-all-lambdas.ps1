@@ -149,3 +149,4 @@ Write-Host "==========================================" -ForegroundColor Cyan
 if ($failed -gt 0) {
     exit 1
 }
+

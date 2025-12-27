@@ -2,9 +2,8 @@
 // Trigger: Kinesis Stream (supernoba-fills)
 // Logic: 
 //   1. Update DynamoDB orders (filled_qty, status)
-//   2. Update Supabase wallets via process_fill_wallets RPC
+//   2. Update Supabase wallets via process_fill_wallets RPC (optional)
 
-import { createClient } from '@supabase/supabase-js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 
@@ -18,15 +17,30 @@ const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 const ddb = DynamoDBDocumentClient.from(dynamoClient);
 
-// Supabase Client (for wallets only)
-let supabase = null;
-function getSupabase() {
-    if (!supabase && SUPABASE_URL && SUPABASE_SERVICE_KEY) {
-        supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-            auth: { persistSession: false }
-        });
+// Supabase Client (for wallets only) - lazy import to avoid import errors
+let supabaseClient = null;
+let createSupabaseClient = null;
+
+async function getSupabase() {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+        return null;
     }
-    return supabase;
+    
+    if (!supabaseClient && !createSupabaseClient) {
+        try {
+            // Dynamic import to avoid import errors if package is missing
+            const supabaseModule = await import('@supabase/supabase-js');
+            createSupabaseClient = supabaseModule.createClient;
+            supabaseClient = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+                auth: { persistSession: false }
+            });
+        } catch (err) {
+            console.warn(`[Supabase] Failed to import or initialize Supabase client:`, err.message);
+            return null;
+        }
+    }
+    
+    return supabaseClient;
 }
 
 export const handler = async (event) => {
@@ -39,9 +53,9 @@ export const handler = async (event) => {
             const payload = Buffer.from(record.kinesis.data, 'base64').toString('utf-8');
             const data = JSON.parse(payload);
             
-            // Filter only FILL events
+            // Process FILL events only (ORDER_STATUS는 order-status 스트림으로 이동)
             if (data.event !== 'FILL') {
-                return; // Skip TRADE or other events
+                return; // Skip other events
             }
 
             console.log(`Processing FILL: ${data.trade_id} (${data.symbol})`);
@@ -87,22 +101,32 @@ export const handler = async (event) => {
             console.log(`[DynamoDB] Updated seller holdings: ${data.seller.user_id} -${data.quantity} ${data.symbol}`);
 
             // 6. Update Supabase Wallets (balance transfer)
-            const client = getSupabase();
+            // NOTE: Supabase RPC 실패해도 DynamoDB 업데이트는 성공으로 처리
+            // (Supabase는 잔고만 관리, DynamoDB는 주문/보유자산 관리)
+            const client = await getSupabase();
             if (client) {
-                const { data: rpcData, error } = await client.rpc('process_fill_wallets', {
-                    p_symbol: data.symbol,
-                    p_buyer_id: data.buyer.user_id,
-                    p_seller_id: data.seller.user_id,
-                    p_price: data.price,
-                    p_quantity: data.quantity,
-                    p_timestamp: data.timestamp
-                });
+                try {
+                    const { data: rpcData, error } = await client.rpc('process_fill_wallets', {
+                        p_symbol: data.symbol,
+                        p_buyer_id: data.buyer.user_id,
+                        p_seller_id: data.seller.user_id,
+                        p_price: data.price,
+                        p_quantity: data.quantity,
+                        p_timestamp: data.timestamp
+                    });
 
-                if (error) {
-                    console.error(`RPC Fail [${data.trade_id}]:`, error.message);
-                    throw error;
+                    if (error) {
+                        console.error(`[Supabase] RPC Fail [${data.trade_id}]:`, error.message);
+                        // Supabase 실패는 치명적이지 않으므로 throw하지 않음
+                    } else {
+                        console.log(`[Supabase] Wallets updated: ${JSON.stringify(rpcData)}`);
+                    }
+                } catch (rpcErr) {
+                    console.error(`[Supabase] RPC Exception [${data.trade_id}]:`, rpcErr.message);
+                    // Supabase 실패는 치명적이지 않으므로 throw하지 않음
                 }
-                console.log(`[Supabase] Wallets updated: ${JSON.stringify(rpcData)}`);
+            } else {
+                console.warn(`[Supabase] Client not available, skipping wallet update`);
             }
 
         } catch (e) {
@@ -122,10 +146,11 @@ export const handler = async (event) => {
     return { statusCode: 200, body: 'Processed' };
 };
 
+
 // Helper: Update order in DynamoDB
 async function updateOrderInDynamoDB(userId, orderId, fillQuantity, isFullyFilled = false) {
     // DynamoDB: increment filled_qty
-    // 전량 체결 시 status를 FILLED로, 부분 체결 시 PARTIAL로 설정
+    // 부분 체결 시 status를 PARTIAL로 설정 (전량 체결은 order-status-processor가 FILLED로 설정)
     const status = isFullyFilled ? 'FILLED' : 'PARTIAL';
     
     try {

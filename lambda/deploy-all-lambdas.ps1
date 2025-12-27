@@ -17,6 +17,7 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-fill-processor"; Path = "Supernoba-fill-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-history-saver"; Path = "Supernoba-history-saver"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-notifier"; Path = "Supernoba-notifier"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-order-status-processor"; Path = "Supernoba-order-status-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-chart-data-handler"; Path = "Supernoba-chart-data-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-connect-handler"; Path = "Supernoba-connect-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-subscribe-handler"; Path = "Supernoba-subscribe-handler"; HasPackageJson = $false; HasBuild = $false },
