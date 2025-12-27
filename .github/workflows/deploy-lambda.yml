@@ -54,17 +54,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Setup Node.js (with cache)
-        if: matrix.function.has_package_json == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: '${{ matrix.function.path }}/package-lock.json'
-        continue-on-error: true
-      
-      - name: Setup Node.js (without cache)
-        if: matrix.function.has_package_json == 'false'
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
