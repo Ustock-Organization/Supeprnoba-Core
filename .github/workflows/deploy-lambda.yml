@@ -5,6 +5,7 @@ on:
     branches: [main, master, develop]
     paths:
       - 'liquibook/lambda/**'
+      - '.github/workflows/deploy-lambda.yml'
   workflow_dispatch:
     inputs:
       function_name:
