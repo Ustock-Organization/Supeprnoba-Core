@@ -5,7 +5,7 @@
     "Role": "arn:aws:iam::264520158196:role/Supernoba-lambda-role",
     "Handler": "index.handler",
     "CodeSize": 8570841,
-    "Description": "°ü¸®ÀÚ¿ë APIÇÔ¼ö (MSKÆÄÀÌÇÁ ÅäÇÈ »ý¼º/»èÁ¦/Á¶È¸)",
+    "Description": "ï¿½ï¿½ï¿½ï¿½ï¿½Ú¿ï¿½ APIï¿½Ô¼ï¿½ (MSKï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½È¸)",
     "Timeout": 60,
     "MemorySize": 256,
     "LastModified": "2025-12-24T14:23:24.000+0000",
@@ -23,7 +23,6 @@
     },
     "Environment": {
         "Variables": {
-            "S3_BUCKET": "supernoba-market-data",
             "YOUTUBE_API_KEY": "AIzaSyCJZO6pdChSbVVqcFfSNKJkvBZk4G051E0",
             "TWITTER_BEARER_TOKEN": "AAAAAAAAAAAAAAAAAAAAAHs65gEAAAAAsel6zJ3PLy%2FKwg%2FRDgK9hrgcf0Q%3DPpvFj5olwMBiYVsukbcfwcghprHR6ygwD1rNDboAMGAh07fd6G",
             "VALKEY_PORT": "6379",

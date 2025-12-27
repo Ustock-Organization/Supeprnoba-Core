@@ -5,6 +5,7 @@ const REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const WS_ENDPOINT = process.env.WS_ENDPOINT; // e.g. https://xyz.execute-api.ap-northeast-2.amazonaws.com/production
 const REDIS_HOST = process.env.VALKEY_HOST;
 const REDIS_PORT = process.env.VALKEY_PORT || 6379;
+const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
 
 // API Gateway Client (initialized once)
 // Endpoint MUST NOT have wss://, map to https://
@@ -14,15 +15,17 @@ const apiClient = new ApiGatewayManagementApiClient({
     endpoint: endpoint 
 });
 
-// Redis Client
+// Redis Client (match connect-handler pattern)
 const redis = new Redis({
     host: REDIS_HOST,
     port: REDIS_PORT,
-    tls: {}, // Elasticache usually requires TLS if encryption in transit is on. Assuming yes or permissive.
-    connectTimeout: 3000
+    tls: VALKEY_TLS ? {} : undefined,
+    connectTimeout: 5000,
+    maxRetriesPerRequest: 1,
 });
 
-redis.on('error', (err) => console.error('Redis Error:', err));
+redis.on('error', (err) => console.error('Redis Error:', err.message));
+
 
 export const handler = async (event) => {
     console.log(`Received ${event.Records.length} records.`);
@@ -36,12 +39,17 @@ export const handler = async (event) => {
             
             // We only care about FILL events for now (Engine publishes only Fills via publishFill)
             // Format from KinesisProducer::publishFill:
-            // { event: "FILL", symbol, trade_id, buyer: {user_id, order_id}, seller: {...}, quantity, price, timestamp }
+            // { event: "FILL", symbol, trade_id, buyer: {user_id, order_id, fully_filled}, seller: {...}, quantity, price, timestamp }
             
             if (data.event !== 'FILL') return;
 
-            await notifyUser(data.buyer.user_id, data, 'BUY');
-            await notifyUser(data.seller.user_id, data, 'SELL');
+            // 전량 체결된 주문만 알림 전송 (부분 체결은 엔진에서 직접 알림)
+            if (data.buyer?.fully_filled === true) {
+                await notifyUser(data.buyer.user_id, data, 'BUY');
+            }
+            if (data.seller?.fully_filled === true) {
+                await notifyUser(data.seller.user_id, data, 'SELL');
+            }
             
         } catch (err) {
             console.error('Failed to process record:', err);

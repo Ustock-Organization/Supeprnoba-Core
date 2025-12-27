@@ -2,7 +2,6 @@ from diagrams import Diagram, Cluster, Edge
 from diagrams.aws.compute import EC2, Lambda
 from diagrams.aws.database import ElastiCache, RDS
 from diagrams.aws.integration import MSK, APIGateway
-from diagrams.aws.storage import S3
 from diagrams.onprem.client import User
 from diagrams.programming.language import Cpp
 
@@ -49,5 +48,4 @@ with Diagram("Liquibook AWS Architecture", show=False, filename="liquibook_aws_a
         
         msk >> Edge(label="Consume Fills") >> stream_handler
         
-        wrapper >> Edge(label="Snapshot") >> s3
         wrapper >> Edge(label="State Cache") >> redis

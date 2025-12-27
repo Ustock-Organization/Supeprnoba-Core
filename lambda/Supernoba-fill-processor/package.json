@@ -1,10 +1,12 @@
 {
   "name": "supernoba-fill-processor",
   "version": "1.0.0",
-  "description": "Processes Kinesis fills and updates Supabase",
+  "description": "Processes Kinesis fills - updates DynamoDB orders and Supabase wallets",
   "main": "index.mjs",
   "type": "module",
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
     "@supabase/supabase-js": "^2.89.0"
   }
 }

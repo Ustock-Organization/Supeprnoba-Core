@@ -1,4 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
+
+// DynamoDB Client
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+const ddb = DynamoDBDocumentClient.from(dynamoClient);
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 
 // === Configuration ===
 const HEADERS = {
@@ -49,9 +56,9 @@ export const handler = async (event) => {
             if (path.includes('/assets')) {
                 return await getUserAssets(client, userId);
             } else if (path.includes('/orders')) {
-                return await getOrderHistory(client, userId);
+                return await getOrderHistory(userId);
             } else if (path.includes('/trades')) {
-                return await getTradeHistory(client, userId); // Optional/TODO
+                return await getTradeHistory(userId); // DynamoDB에서 FILLED 주문 조회
             } else {
                  return {
                     statusCode: 404,
@@ -154,44 +161,80 @@ async function getUserAssets(supabase, userId) {
     };
 }
 
-async function getOrderHistory(supabase, userId) {
-    const { data: orders, error } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(50); // Limit 50
-
-    if (error) throw error;
+async function getOrderHistory(userId) {
+    // Query DynamoDB for orders
+    const result = await ddb.send(new QueryCommand({
+        TableName: ORDERS_TABLE,
+        KeyConditionExpression: 'user_id = :uid',
+        ExpressionAttributeValues: { ':uid': userId },
+        ScanIndexForward: false, // descending order
+        Limit: 50
+    }));
     
-    // Enhance or map fields if necessary
-    // Supabase has snake_case, JS uses snake_case usually for this project based on prev code
+    const orders = (result.Items || []).map(item => ({
+        id: item.order_id,
+        user_id: item.user_id,
+        symbol: item.symbol,
+        side: item.side,
+        type: item.type,
+        price: item.price,
+        quantity: item.quantity,
+        filled_qty: item.filled_qty || 0,
+        status: item.status,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+    }));
     
     return {
         statusCode: 200,
         headers: HEADERS,
-        body: JSON.stringify({ orders: orders || [] })
+        body: JSON.stringify({ orders })
     };
 }
 
-async function getTradeHistory(supabase, userId) {
-    // Current SQL plan didn't have 'fills' table explicitly separate from ledger, 
-    // but we can query 'ledger' for reason='FILL' or just return empty for now.
-    // Or users might expect executed orders.
-    
-    // Let's return FILLED orders for now (Simple MVP)
-    const { data: trades, error } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('status', 'FILLED')
-        .order('updated_at', { ascending: false });
-
-    if (error) throw error;
-
-    return {
-        statusCode: 200,
-        headers: HEADERS,
-        body: JSON.stringify({ trades: trades || [] })
-    };
+async function getTradeHistory(userId) {
+    // 주문 데이터는 DynamoDB에 저장되어 있음
+    // FILLED 상태의 주문을 조회하여 체결 이력으로 반환
+    try {
+        const result = await ddb.send(new QueryCommand({
+            TableName: ORDERS_TABLE,
+            KeyConditionExpression: 'user_id = :uid',
+            FilterExpression: '#status = :filled',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { 
+                ':uid': userId,
+                ':filled': 'FILLED'
+            },
+            ScanIndexForward: false, // 최신순
+            Limit: 50
+        }));
+        
+        const trades = (result.Items || []).map(item => ({
+            id: item.order_id,
+            order_id: item.order_id,
+            user_id: item.user_id,
+            symbol: item.symbol,
+            side: item.side,
+            type: item.type,
+            price: item.price,
+            quantity: item.quantity,
+            filled_qty: item.filled_qty || item.quantity,
+            status: item.status,
+            created_at: item.created_at,
+            updated_at: item.updated_at
+        }));
+        
+        return {
+            statusCode: 200,
+            headers: HEADERS,
+            body: JSON.stringify({ trades })
+        };
+    } catch (error) {
+        console.error("[asset-handler] getTradeHistory error:", error);
+        return {
+            statusCode: 500,
+            headers: HEADERS,
+            body: JSON.stringify({ error: error.message, trades: [] })
+        };
+    }
 }

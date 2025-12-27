@@ -1,6 +1,5 @@
-// chart-data-handler Lambda v3
-// RDS PostgreSQL에서 캔들 데이터 조회
-// DynamoDB 제거, Valkey 제거
+// chart-data-handler Lambda v3 (Debug)
+// RDS PostgreSQL에서 캔들 데이터 조회 + 타이밍 디버그
 
 import pg from 'pg';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
@@ -21,16 +20,6 @@ const INTERVAL_SECONDS = {
   '1d': 86400, '1w': 604800
 };
 
-// KST 변환 헬퍼
-const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
-
-function epochToYMDHM(epoch) {
-  const kstMs = epoch * 1000 + KST_OFFSET_MS;
-  const d = new Date(kstMs);
-  const pad = n => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
-}
-
 const headers = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
@@ -43,30 +32,58 @@ const secretsManager = new SecretsManagerClient({ region: AWS_REGION });
 // RDS 자격 증명 캐시
 let cachedCredentials = null;
 
+// 타이밍 헬퍼
+function elapsed(start) {
+  return `${(Date.now() - start)}ms`;
+}
+
 async function getDbCredentials() {
-  if (cachedCredentials) return cachedCredentials;
+  const start = Date.now();
+  console.log('[DEBUG] getDbCredentials START');
   
+  // 환경 변수에서 직접 읽기 (우선순위 1)
+  const envUsername = process.env.DB_USERNAME;
+  const envPassword = process.env.DB_PASSWORD;
+  
+  if (envUsername && envPassword) {
+    console.log(`[DEBUG] getDbCredentials FROM_ENV ${elapsed(start)}`);
+    return { username: envUsername, password: envPassword };
+  }
+  
+  // 캐시된 자격 증명 사용 (우선순위 2)
+  if (cachedCredentials) {
+    console.log(`[DEBUG] getDbCredentials CACHED ${elapsed(start)}`);
+    return cachedCredentials;
+  }
+  
+  // Secrets Manager에서 조회 (우선순위 3 - VPC 엔드포인트 필요)
   if (!DB_SECRET_ARN) {
+    console.log(`[DEBUG] getDbCredentials NO_SECRET_ARN, using defaults ${elapsed(start)}`);
     return { username: 'postgres', password: '' };
   }
   
   try {
+    console.log(`[DEBUG] Fetching secret from SecretsManager: ${DB_SECRET_ARN}`);
     const res = await secretsManager.send(new GetSecretValueCommand({ SecretId: DB_SECRET_ARN }));
     cachedCredentials = JSON.parse(res.SecretString);
+    console.log(`[DEBUG] getDbCredentials SECRET_FETCHED ${elapsed(start)}`);
     return cachedCredentials;
   } catch (err) {
-    console.error('Failed to get DB credentials:', err);
+    console.error(`[DEBUG] getDbCredentials ERROR ${elapsed(start)}:`, err.message);
     return { username: 'postgres', password: '' };
   }
 }
 
 export const handler = async (event) => {
+  const handlerStart = Date.now();
+  console.log(`[DEBUG] ===== HANDLER START =====`);
+  
   const params = event.queryStringParameters || {};
-  const symbol = (params.symbol || 'TEST').toUpperCase();
+  const symbol = (params.symbol || 'TEST').toLowerCase();
   const interval = params.interval || '1m';
   const limit = Math.min(parseInt(params.limit || '100'), 500);
   
-  console.log(`Chart request: ${symbol} ${interval} limit=${limit}`);
+  console.log(`[DEBUG] Chart request: ${symbol} ${interval} limit=${limit}`);
   
   try {
     const intervalSeconds = INTERVAL_SECONDS[interval];
@@ -77,7 +94,8 @@ export const handler = async (event) => {
     // RDS에서 캔들 조회
     const candles = await getCandles(symbol, interval, limit);
     
-    console.log(`Data: ${candles.length} candles`);
+    console.log(`[DEBUG] Data: ${candles.length} candles`);
+    console.log(`[DEBUG] ===== HANDLER END (TOTAL: ${elapsed(handlerStart)}) =====`);
     
     return {
       statusCode: 200, headers,
@@ -85,15 +103,23 @@ export const handler = async (event) => {
     };
     
   } catch (error) {
-    console.error('Chart data error:', error);
+    console.error(`[DEBUG] HANDLER ERROR ${elapsed(handlerStart)}:`, error.message);
     return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
   }
 };
 
 // RDS에서 캔들 조회
 async function getCandles(symbol, interval, limit) {
-  const creds = await getDbCredentials();
+  const funcStart = Date.now();
+  console.log(`[DEBUG] getCandles START`);
   
+  // Step 1: Get credentials
+  const credStart = Date.now();
+  const creds = await getDbCredentials();
+  console.log(`[DEBUG] Step 1 - getDbCredentials: ${elapsed(credStart)}`);
+  
+  // Step 2: Create client
+  const clientCreateStart = Date.now();
   const client = new Client({
     host: RDS_HOST,
     port: RDS_PORT,
@@ -101,12 +127,21 @@ async function getCandles(symbol, interval, limit) {
     user: creds.username,
     password: creds.password,
     ssl: { rejectUnauthorized: false },
-    connectionTimeoutMillis: 5000
+    connectionTimeoutMillis: 10000  // 10초로 명시 (기본 무한대 방지)
   });
+  console.log(`[DEBUG] Step 2 - Client created: ${elapsed(clientCreateStart)}`);
+  console.log(`[DEBUG]   -> Host: ${RDS_HOST}`);
+  console.log(`[DEBUG]   -> User: ${creds.username}`);
   
   try {
+    // Step 3: Connect
+    const connectStart = Date.now();
+    console.log(`[DEBUG] Step 3 - Connecting to RDS...`);
     await client.connect();
+    console.log(`[DEBUG] Step 3 - Connected: ${elapsed(connectStart)}`);
     
+    // Step 4: Query
+    const queryStart = Date.now();
     const query = `
       SELECT time_epoch, time_ymdhm, open, high, low, close, volume
       FROM candle_history
@@ -114,10 +149,12 @@ async function getCandles(symbol, interval, limit) {
       ORDER BY time_epoch DESC
       LIMIT $3
     `;
-    
+    console.log(`[DEBUG] Step 4 - Executing query...`);
     const result = await client.query(query, [symbol, interval, limit]);
+    console.log(`[DEBUG] Step 4 - Query done: ${elapsed(queryStart)} (${result.rows.length} rows)`);
     
-    // 오래된 순으로 정렬하여 반환
+    // Step 5: Transform
+    const transformStart = Date.now();
     const candles = result.rows.map(row => ({
       time: parseInt(row.time_epoch),
       time_ymdhm: row.time_ymdhm,
@@ -127,10 +164,15 @@ async function getCandles(symbol, interval, limit) {
       close: parseFloat(row.close),
       volume: parseFloat(row.volume) || 0
     })).sort((a, b) => a.time - b.time);
+    console.log(`[DEBUG] Step 5 - Transform: ${elapsed(transformStart)}`);
     
+    console.log(`[DEBUG] getCandles TOTAL: ${elapsed(funcStart)}`);
     return candles;
     
   } finally {
+    // Step 6: Disconnect
+    const endStart = Date.now();
     await client.end();
+    console.log(`[DEBUG] Step 6 - Disconnect: ${elapsed(endStart)}`);
   }
 }

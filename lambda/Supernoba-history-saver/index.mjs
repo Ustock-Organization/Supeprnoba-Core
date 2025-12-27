@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS public.trade_history (
 `;
 
 async function ensureTableAndPartition(client, symbol) {
-    const cleanSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const cleanSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     const tableName = `trade_history_${cleanSymbol}`;
     
     try {
@@ -87,7 +87,7 @@ async function ensureTableAndPartition(client, symbol) {
         const createPartitionSql = `
             CREATE TABLE IF NOT EXISTS public.${tableName} 
             PARTITION OF public.trade_history 
-            FOR VALUES IN ('${symbol.toUpperCase()}')
+            FOR VALUES IN ('${cleanSymbol}')
         `;
         await client.query(createPartitionSql);
         // console.log(`Partition verified: ${tableName}`);
@@ -129,7 +129,7 @@ export const handler = async (event) => {
                 `;
                 
                 const values = [
-                    symbol.toUpperCase(),
+                    symbol.toLowerCase(),
                     price,
                     quantity,
                     buyer?.user_id || null,

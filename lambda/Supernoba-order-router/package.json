@@ -1,14 +1,15 @@
 {
   "name": "supernoba-order-router",
   "version": "1.0.0",
-  "description": "Order Router with Kinesis and Supabase",
+  "description": "Order Router with Kinesis and DynamoDB",
   "main": "index.mjs",
   "type": "module",
   "scripts": {
     "deploy": "aws lambda update-function-code --function-name Supernoba-order-router --zip-file fileb://function.zip"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.89.0",
-    "ioredis": "^5.0.0"
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@supabase/supabase-js": "^2.89.0"
   }
 }

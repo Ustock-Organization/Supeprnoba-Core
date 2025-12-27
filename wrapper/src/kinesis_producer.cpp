@@ -51,18 +51,22 @@ void KinesisProducer::publishFill(const std::string& symbol,
                                    const std::string& buyer_id,
                                    const std::string& seller_id,
                                    uint64_t qty,
-                                   uint64_t price) {
+                                   uint64_t price,
+                                   bool buyer_fully_filled,
+                                   bool seller_fully_filled) {
     nlohmann::json j;
     j["event"] = "FILL";
     j["symbol"] = symbol;
     j["trade_id"] = order_id + "_" + matched_order_id;
     j["buyer"] = {
         {"order_id", order_id},
-        {"user_id", buyer_id}
+        {"user_id", buyer_id},
+        {"fully_filled", buyer_fully_filled}
     };
     j["seller"] = {
         {"order_id", matched_order_id},
-        {"user_id", seller_id}
+        {"user_id", seller_id},
+        {"fully_filled", seller_fully_filled}
     };
     j["quantity"] = qty;
     j["price"] = price;
@@ -70,7 +74,7 @@ void KinesisProducer::publishFill(const std::string& symbol,
         std::chrono::system_clock::now().time_since_epoch()).count();
     
     produce(fills_stream_, symbol, j.dump());
-    Logger::debug("Published fill:", order_id);
+    Logger::debug("Published fill:", order_id, "buyer_filled:", buyer_fully_filled, "seller_filled:", seller_fully_filled);
 }
 
 void KinesisProducer::publishTrade(const std::string& symbol,

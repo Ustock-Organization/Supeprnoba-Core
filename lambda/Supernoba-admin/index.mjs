@@ -6,7 +6,6 @@ import Redis from 'ioredis';
 import { createClient } from '@supabase/supabase-js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { ScanCommand, DeleteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { S3Client, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import pg from 'pg';
 const { Pool } = pg;
@@ -51,8 +50,8 @@ async function ensureRdsPartition(symbol) {
         });
         await client.connect();
         
-        // 3. Create Partitions (trade_history + candle_history)
-        const cleanSymbol = symbol.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        // 3. Create Partitions (trade_history + candle_history) - 소문자 사용
+        const cleanSymbol = symbol.toLowerCase().replace(/[^a-z0-9]/g, '');
         
         const sql = `
             -- Trade History 마스터 테이블
@@ -111,7 +110,6 @@ async function ensureRdsPartition(symbol) {
 // Optional (with defaults)
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const DYNAMODB_CANDLE_TABLE = process.env.DYNAMODB_TABLE || 'candle_history';
-const S3_BUCKET = process.env.S3_BUCKET || 'supernoba-market-data';
 
 // Validate Required Config
 if (!VALKEY_HOST || !SUPABASE_URL || !SUPABASE_KEY || !SUPABASE_SERVICE_KEY || !ADMIN_API_KEY) {
@@ -134,11 +132,10 @@ valkey.on('error', (err) => console.error('Redis error:', err.message));
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// DynamoDB & S3 (For Reset Logic)
+// DynamoDB
 const dynamodb = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: AWS_REGION })
 );
-const s3 = new S3Client({ region: AWS_REGION });
 
 const headers = {
   'Access-Control-Allow-Origin': '*',

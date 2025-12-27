@@ -84,6 +84,10 @@ int main(int argc, char* argv[]) {
     // 마지막으로 처리한 캔들 개수 (중복 로그/처리 방지)
     std::map<std::string, size_t> last_processed_counts;
     
+    // 마지막 저장된 epoch 추적 (중복 저장 방지)
+    // key: "symbol:interval", value: last saved epoch
+    std::map<std::string, int64_t> last_saved_epochs;
+    
     while (running) {
         try {
             // 1. closed 캔들이 있는 심볼 목록 조회
@@ -126,14 +130,39 @@ int main(int argc, char* argv[]) {
                 auto aggregated = aggregator.aggregate(closed_candles);
                 Logger::info("  Aggregated into", aggregated.size(), "timeframes");
                 
-                // 4. RDS 저장 (모든 캔들 즉시 저장)
+                // 4. RDS 저장 (새 캔들만 저장 - epoch 기반 중복 방지)
                 for (const auto& [interval, candles] : aggregated) {
                     if (candles.empty()) continue;
                     
-                    Logger::info("  Saving", candles.size(), "candles for interval", interval, "to RDS...");
-                    int saved = rds.batch_put_candles(symbol, interval, candles);
+                    // 이미 저장된 캔들 제외 (epoch 기반 필터링)
+                    std::string key = symbol + ":" + interval;
+                    int64_t last_epoch = 0;
+                    if (last_saved_epochs.find(key) != last_saved_epochs.end()) {
+                        last_epoch = last_saved_epochs[key];
+                    }
+                    
+                    std::vector<Candle> new_candles;
+                    int64_t max_epoch = last_epoch;
+                    for (const auto& c : candles) {
+                        if (c.epoch() > last_epoch) {
+                            new_candles.push_back(c);
+                            if (c.epoch() > max_epoch) {
+                                max_epoch = c.epoch();
+                            }
+                        }
+                    }
+                    
+                    if (new_candles.empty()) {
+                        Logger::debug("  [SKIP]", interval, "- no new candles (already saved)");
+                        continue;
+                    }
+                    
+                    Logger::info("  Saving", new_candles.size(), "new candles for interval", interval, "to RDS...");
+                    int saved = rds.batch_put_candles(symbol, interval, new_candles);
                     if (saved > 0) {
                         Logger::info("  [SUCCESS] RDS:", symbol, interval, "-", saved, "candles saved");
+                        // 저장 성공 시 마지막 epoch 업데이트
+                        last_saved_epochs[key] = max_epoch;
                     } else {
                         Logger::error("  [FAILURE] RDS save failed for", symbol, interval);
                     }

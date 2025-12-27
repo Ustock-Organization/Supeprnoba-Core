@@ -7,7 +7,6 @@
 - Valkey에서 마감된 1분봉 감지 (100ms 폴링)
 - 1분봉 → 3m/5m/15m/30m/1h/4h/1d/1w 타임프레임 집계
 - DynamoDB candle_history 테이블 저장
-- S3 supernoba-market-data 버킷 백업
 - 처리 완료 후 Valkey closed 리스트 자동 삭제
 
 ## 구조
@@ -22,16 +21,14 @@ aggregator/
 │   ├── logger.h         # 로깅 유틸
 │   ├── valkey_client.h  # Valkey 클라이언트
 │   ├── aggregator.h     # 집계 로직
-│   ├── dynamodb_client.h
-│   └── s3_client.h
+│   └── dynamodb_client.h
 └── src/
     ├── main.cpp         # 메인 루프
     ├── config.cpp
     ├── logger.cpp
     ├── valkey_client.cpp
     ├── aggregator.cpp
-    ├── dynamodb_client.cpp
-    └── s3_client.cpp
+    └── dynamodb_client.cpp
 ```
 
 ## EC2 배포
@@ -61,6 +58,5 @@ cd aggregator
 | VALKEY_PORT | 6379 | Valkey 포트 |
 | AWS_REGION | ap-northeast-2 | AWS 리전 |
 | DYNAMODB_CANDLE_TABLE | candle_history | DynamoDB 테이블 |
-| S3_BUCKET | supernoba-market-data | S3 버킷 |
 | POLL_INTERVAL_MS | 100 | 폴링 간격 (ms) |
 | LOG_LEVEL | INFO | 로그 레벨 (DEBUG/INFO/WARN/ERROR) |

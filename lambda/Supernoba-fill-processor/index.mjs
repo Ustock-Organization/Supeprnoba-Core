@@ -1,24 +1,34 @@
 // Supernoba-fill-processor
 // Trigger: Kinesis Stream (supernoba-fills)
-// Logic: Call Supabase RPC 'process_fill' for each record.
+// Logic: 
+//   1. Update DynamoDB orders (filled_qty, status)
+//   2. Update Supabase wallets via process_fill_wallets RPC
 
 import { createClient } from '@supabase/supabase-js';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 
 // === Configuration ===
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.error("Missing Supabase Credentials");
+// DynamoDB Client
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+const ddb = DynamoDBDocumentClient.from(dynamoClient);
+
+// Supabase Client (for wallets only)
+let supabase = null;
+function getSupabase() {
+    if (!supabase && SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+        supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+            auth: { persistSession: false }
+        });
+    }
+    return supabase;
 }
 
-// Global Supabase Client (Reuse connection)
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    auth: { persistSession: false }
-});
-
 export const handler = async (event) => {
-    // Kinesis Batch Processing
     const records = event.Records || [];
     console.log(`Processing ${records.length} records...`);
 
@@ -35,27 +45,47 @@ export const handler = async (event) => {
 
             console.log(`Processing FILL: ${data.trade_id} (${data.symbol})`);
 
-            // 2. Call Supabase RPC
-            const { data: rpcData, error } = await supabase.rpc('process_fill', {
-                p_symbol: data.symbol,
-                p_buyer_id: data.buyer.user_id,
-                p_buyer_order_id: data.buyer.order_id,
-                p_seller_id: data.seller.user_id,
-                p_seller_order_id: data.seller.order_id,
-                p_price: data.price,
-                p_quantity: data.quantity,
-                p_timestamp: data.timestamp
-            });
+            // 2. Update DynamoDB Orders (Buyer)
+            const buyerFullyFilled = data.buyer?.fully_filled === true;
+            await updateOrderInDynamoDB(
+                data.buyer.user_id, 
+                data.buyer.order_id, 
+                data.quantity,
+                buyerFullyFilled
+            );
+            console.log(`[DynamoDB] Updated buyer order: ${data.buyer.order_id} (fully_filled: ${buyerFullyFilled})`);
 
-            if (error) {
-                console.error(`RPC Fail [${data.trade_id}]:`, error);
-                throw error;
+            // 3. Update DynamoDB Orders (Seller)
+            const sellerFullyFilled = data.seller?.fully_filled === true;
+            await updateOrderInDynamoDB(
+                data.seller.user_id, 
+                data.seller.order_id, 
+                data.quantity,
+                sellerFullyFilled
+            );
+            console.log(`[DynamoDB] Updated seller order: ${data.seller.order_id} (fully_filled: ${sellerFullyFilled})`);
+
+            // 4. Update Supabase Wallets (balance transfer)
+            const client = getSupabase();
+            if (client) {
+                const { data: rpcData, error } = await client.rpc('process_fill_wallets', {
+                    p_symbol: data.symbol,
+                    p_buyer_id: data.buyer.user_id,
+                    p_seller_id: data.seller.user_id,
+                    p_price: data.price,
+                    p_quantity: data.quantity,
+                    p_timestamp: data.timestamp
+                });
+
+                if (error) {
+                    console.error(`RPC Fail [${data.trade_id}]:`, error.message);
+                    throw error;
+                }
+                console.log(`[Supabase] Wallets updated: ${JSON.stringify(rpcData)}`);
             }
 
-            console.log(`RPC Success [${data.trade_id}]:`, rpcData);
-
         } catch (e) {
-            console.error("Record Processing Error:", e);
+            console.error("Record Processing Error:", e.message);
             throw e; // Kinesis will retry the batch if we throw
         }
     }));
@@ -64,11 +94,35 @@ export const handler = async (event) => {
     const failures = results.filter(r => r.status === 'rejected');
     if (failures.length > 0) {
         console.error(`Batch completed with ${failures.length} errors.`);
-        // Note: Throwing here triggers Kinesis retry for the batch.
-        // For partial failure handling, look into "ReportBatchItemFailures".
     } else {
         console.log("Batch processed successfully.");
     }
 
     return { statusCode: 200, body: 'Processed' };
 };
+
+// Helper: Update order in DynamoDB
+async function updateOrderInDynamoDB(userId, orderId, fillQuantity, isFullyFilled = false) {
+    // DynamoDB: increment filled_qty
+    // 전량 체결 시 status를 FILLED로, 부분 체결 시 PARTIAL로 설정
+    const status = isFullyFilled ? 'FILLED' : 'PARTIAL';
+    
+    try {
+        await ddb.send(new UpdateCommand({
+            TableName: ORDERS_TABLE,
+            Key: { user_id: userId, order_id: orderId },
+            UpdateExpression: 'SET filled_qty = if_not_exists(filled_qty, :zero) + :qty, #status = :status, updated_at = :now',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+                ':qty': fillQuantity,
+                ':zero': 0,
+                ':status': status,
+                ':now': new Date().toISOString()
+            }
+        }));
+    } catch (err) {
+        console.error(`DynamoDB update failed for ${orderId}:`, err.message);
+        throw err;
+    }
+}
+

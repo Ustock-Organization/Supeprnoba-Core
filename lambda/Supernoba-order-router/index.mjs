@@ -1,15 +1,22 @@
-// order-router Lambda - Supabase Migration Version
+// order-router Lambda - DynamoDB Orders Version
 // Logic:
 // 1. Validate Request
-// 2. Lock Balance in Supabase (wallets table) -> Critical for consistency
-// 3. Create Order in Supabase (orders table) as PENDING
+// 2. Lock Balance in Supabase (wallets table)
+// 3. Create Order in DynamoDB (supernoba-orders) as PENDING
 // 4. Publish to Kinesis (Engine)
 // 5. If publish fails, Rollback (Refund + Reject)
 
 import { KinesisClient, PutRecordCommand } from '@aws-sdk/client-kinesis';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import https from 'https';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+
+// DynamoDB Client
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+const ddb = DynamoDBDocumentClient.from(dynamoClient);
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 
 // === Optimization: TCP Keep-Alive for AWS SDK ===
 const agent = new https.Agent({
@@ -223,22 +230,25 @@ export const handler = async (event) => {
             console.log(`[Locked] ${user_id} ${lockAmount} ${lockCurrency}`);
         }
 
-        // 3. Create Order in DB (PENDING)
-        const { error: insertErr } = await db.from('orders').insert({
-            id: finalOrderId, // We generate UUID
+        // 3. Create Order in DynamoDB (PENDING)
+        const orderItem = {
             user_id: user_id,
+            order_id: finalOrderId,
             symbol: symbol,
             side: (side === 'BUY' || side === 'buy') ? 'BUY' : 'SELL',
             type: orderType,
             price: finalPrice,
             quantity: finalQty,
+            filled_qty: 0,
             status: 'PENDING',
-            created_at: new Date()
-        });
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+        };
         
-        if (insertErr) {
+        try {
+            await ddb.send(new PutCommand({ TableName: ORDERS_TABLE, Item: orderItem }));
+        } catch (insertErr) {
             console.error("Order Insert Failed:", insertErr);
-            // Refund
             await refundBalance(db, user_id, lockCurrency, lockAmount);
             return { statusCode: 500, headers, body: JSON.stringify({ error: insertErr.message }) };
         }
@@ -258,18 +268,27 @@ export const handler = async (event) => {
                 PartitionKey: symbol,
             }));
             
-            // 5. Update Status to ACCEPTED (Async? Or do it here?)
-            // We can leave it PENDING, or update. Engine is fast.
-            // Let's update to ACCEPTED to confirm sent.
-             await db.from('orders').update({ status: 'ACCEPTED' }).eq('id', finalOrderId);
+            // 5. Update Status to ACCEPTED in DynamoDB
+            await ddb.send(new UpdateCommand({
+                TableName: ORDERS_TABLE,
+                Key: { user_id, order_id: finalOrderId },
+                UpdateExpression: 'SET #status = :status, updated_at = :updated',
+                ExpressionAttributeNames: { '#status': 'status' },
+                ExpressionAttributeValues: { ':status': 'ACCEPTED', ':updated': new Date().toISOString() }
+            }));
              
-             return { statusCode: 200, headers, body: JSON.stringify({ order_id: finalOrderId, message: 'Order Accepted' }) };
+            return { statusCode: 200, headers, body: JSON.stringify({ order_id: finalOrderId, message: 'Order Accepted' }) };
              
         } catch (kinesisErr) {
             console.error("Kinesis Publish Failed:", kinesisErr);
-            // Refund and Fail
             await refundBalance(db, user_id, lockCurrency, lockAmount);
-            await db.from('orders').update({ status: 'REJECTED' }).eq('id', finalOrderId);
+            await ddb.send(new UpdateCommand({
+                TableName: ORDERS_TABLE,
+                Key: { user_id, order_id: finalOrderId },
+                UpdateExpression: 'SET #status = :status, updated_at = :updated',
+                ExpressionAttributeNames: { '#status': 'status' },
+                ExpressionAttributeValues: { ':status': 'REJECTED', ':updated': new Date().toISOString() }
+            }));
             return { statusCode: 500, headers, body: JSON.stringify({ error: 'Order Placement Failed' }) };
         }
 

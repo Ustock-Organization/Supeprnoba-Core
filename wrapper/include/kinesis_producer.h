@@ -20,7 +20,9 @@ public:
                      const std::string& buyer_id,
                      const std::string& seller_id,
                      uint64_t qty,
-                     uint64_t price) override;
+                     uint64_t price,
+                     bool buyer_fully_filled = false,
+                     bool seller_fully_filled = false) override;
     
     // 거래 이벤트 발행
     void publishTrade(const std::string& symbol,

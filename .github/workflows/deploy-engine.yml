@@ -1,0 +1,283 @@
+name: Deploy Matching Engine
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'liquibook/wrapper/**'
+      - 'liquibook/engine/**'
+      - 'liquibook/aggregator/**'
+  workflow_dispatch:
+    inputs:
+      restart_only:
+        description: 'Restart engine only (skip git pull)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.repository_owner != '' # Prevent running on forks
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+      
+      - name: Parse EC2 hosts
+        id: parse_hosts
+        run: |
+          IFS=',' read -ra HOSTS <<< "${{ secrets.EC2_HOSTS }}"
+          for i in "${!HOSTS[@]}"; do
+            echo "host_$i=${HOSTS[$i]}" >> $GITHUB_OUTPUT
+          done
+          echo "host_count=${#HOSTS[@]}" >> $GITHUB_OUTPUT
+          echo "hosts=${secrets.EC2_HOSTS}" >> $GITHUB_OUTPUT
+      
+      - name: Add EC2 hosts to known_hosts
+        run: |
+          IFS=',' read -ra HOSTS <<< "${{ secrets.EC2_HOSTS }}"
+          for host in "${HOSTS[@]}"; do
+            ssh-keyscan -H "$host" >> ~/.ssh/known_hosts
+          done
+      
+      - name: Deploy to EC2 instances
+        run: |
+          DEPLOYED_HOSTS=""
+          FAILED_HOSTS=""
+          IFS=',' read -ra HOSTS <<< "${{ secrets.EC2_HOSTS }}"
+          for host in "${HOSTS[@]}"; do
+            echo "=========================================="
+            echo "Deploying to: $host"
+            echo "=========================================="
+            
+            ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@$host << 'EOF'
+            set -e
+            
+            echo "=== Matching Engine Deployment ==="
+            
+            # 1. 코드 업데이트 (restart_only가 false인 경우)
+            if [ "${{ github.event.inputs.restart_only }}" != "true" ]; then
+              echo "[1/5] Updating code from repository..."
+              cd ~/Liquibook || cd ~/liquibook
+              REPO_DIR=$(pwd)
+              git fetch origin
+              git reset --hard origin/${{ github.ref_name }}
+              echo "Code updated to commit: $(git rev-parse HEAD)"
+            else
+              echo "[1/5] Skipping code update (restart_only mode)"
+              cd ~/Liquibook || cd ~/liquibook
+              REPO_DIR=$(pwd)
+            fi
+            
+            # 2. vcpkg 설치 및 빌드 (필요한 경우)
+            echo "[2/5] Checking vcpkg installation..."
+            export VCPKG_ROOT=~/vcpkg
+            if [ ! -d "$VCPKG_ROOT" ]; then
+              echo "vcpkg not found, installing..."
+              git clone https://github.com/Microsoft/vcpkg.git "$VCPKG_ROOT"
+              cd "$VCPKG_ROOT"
+              ./bootstrap-vcpkg.sh
+              cd "$REPO_DIR"
+            fi
+            
+            # vcpkg 의존성 설치 확인 및 설치
+            if [ ! -f "$VCPKG_ROOT/vcpkg" ]; then
+              echo "vcpkg binary not found, bootstrapping..."
+              cd "$VCPKG_ROOT"
+              ./bootstrap-vcpkg.sh
+              cd "$REPO_DIR"
+            fi
+            
+            # wrapper 의존성 설치 (vcpkg.json 기반)
+            if [ "${{ github.event.inputs.restart_only }}" != "true" ]; then
+              echo "Installing wrapper dependencies from vcpkg.json..."
+              cd "$REPO_DIR/wrapper"
+              if [ -f vcpkg.json ]; then
+                "$VCPKG_ROOT/vcpkg" install --triplet x64-linux
+              else
+                echo "vcpkg.json not found, skipping dependency installation"
+              fi
+              cd "$REPO_DIR"
+            fi
+            
+            export PATH=$VCPKG_ROOT/downloads/tools/cmake-3.31.10-linux/cmake-3.31.10-linux-x86_64/bin:$PATH
+            
+            # 3. 엔진 프로세스 확인 및 중지
+            echo "[3/5] Stopping existing engine process..."
+            if pgrep -f matching_engine > /dev/null; then
+              pkill -f matching_engine
+              sleep 2
+              echo "Engine process stopped"
+            else
+              echo "No running engine process found"
+            fi
+            
+            # Aggregator 프로세스 중지
+            if pgrep -f candle_aggregator > /dev/null; then
+              pkill -f candle_aggregator
+              sleep 1
+              echo "Aggregator process stopped"
+            fi
+            
+            # Streamer 프로세스 중지
+            if pgrep -f "node.*index.mjs" > /dev/null; then
+              pkill -f "node.*index.mjs"
+              sleep 1
+              echo "Streamer process stopped"
+            fi
+            
+            # 4. 빌드 (필요한 경우)
+            echo "[4/5] Building engine (if needed)..."
+            cd "$REPO_DIR/wrapper"
+            if [ ! -d build ] || [ "${{ github.event.inputs.restart_only }}" != "true" ]; then
+              if [ ! -d build ]; then
+                cmake -B build -S . \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+              fi
+              
+              cmake --build build -j$(nproc)
+              echo "Build completed"
+            else
+              echo "Skipping build (restart_only mode)"
+            fi
+            
+            # 5. 엔진 재시동 (--debug --dev 옵션 기본값)
+            echo "[5/5] Starting engine with --debug --dev options..."
+            cd "$REPO_DIR/wrapper"
+            nohup ./run_engine.sh --debug --dev > /tmp/engine.log 2>&1 &
+            sleep 3
+            
+            # 6. 실행 확인
+            if pgrep -f matching_engine > /dev/null; then
+              echo "✅ Engine started successfully (PID: $(pgrep -f matching_engine))"
+            else
+              echo "❌ Engine failed to start. Check logs:"
+              tail -20 /tmp/engine.log
+              exit 1
+            fi
+          EOF
+            
+            DEPLOY_STATUS=$?
+            if [ $DEPLOY_STATUS -eq 0 ]; then
+              echo "✅ Successfully deployed to $host"
+              DEPLOYED_HOSTS="$DEPLOYED_HOSTS$host,"
+            else
+              echo "❌ Failed to deploy to $host"
+              FAILED_HOSTS="$FAILED_HOSTS$host,"
+            fi
+            echo ""
+          done
+          
+          # 배포 결과 저장
+          echo "DEPLOYED_HOSTS=${DEPLOYED_HOSTS%,}" >> $GITHUB_ENV
+          echo "FAILED_HOSTS=${FAILED_HOSTS%,}" >> $GITHUB_ENV
+      
+      - name: Verify deployment
+        run: |
+          IFS=',' read -ra HOSTS <<< "${{ secrets.EC2_HOSTS }}"
+          for host in "${HOSTS[@]}"; do
+            echo "=========================================="
+            echo "Verifying: $host"
+            echo "=========================================="
+            ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@$host << 'EOF'
+              echo "Engine process:"
+              ps aux | grep matching_engine | grep -v grep || echo "No matching_engine process found"
+              echo ""
+              echo "Aggregator process:"
+              ps aux | grep candle_aggregator | grep -v grep || echo "No aggregator process found"
+              echo ""
+              echo "Streamer process:"
+              ps aux | grep "node.*index.mjs" | grep -v grep || echo "No streamer process found"
+              echo ""
+              echo "Recent engine logs (last 5 lines):"
+              tail -5 /tmp/engine.log 2>/dev/null || echo "No engine log file found"
+            EOF
+            echo ""
+          done
+      
+      - name: Send Slack notification
+        if: always()
+        env:
+          DEPLOYED_HOSTS: ${{ env.DEPLOYED_HOSTS }}
+          FAILED_HOSTS: ${{ env.FAILED_HOSTS }}
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            DEPLOYED_COUNT=0
+            FAILED_COUNT=0
+            if [ -n "$DEPLOYED_HOSTS" ]; then
+              DEPLOYED_COUNT=$(echo "$DEPLOYED_HOSTS" | tr ',' '\n' | grep -v '^$' | wc -l)
+            fi
+            if [ -n "$FAILED_HOSTS" ]; then
+              FAILED_COUNT=$(echo "$FAILED_HOSTS" | tr ',' '\n' | grep -v '^$' | wc -l)
+            fi
+            TOTAL_COUNT=$(echo "${{ secrets.EC2_HOSTS }}" | tr ',' '\n' | grep -v '^$' | wc -l)
+            
+            if [ "${{ job.status }}" == "success" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$DEPLOYED_COUNT" -eq "$TOTAL_COUNT" ]; then
+              COLOR="good"
+              STATUS="✅ 성공"
+              MESSAGE="모든 인스턴스($DEPLOYED_COUNT/$TOTAL_COUNT)에 배포 완료"
+            else
+              COLOR="danger"
+              STATUS="❌ 실패"
+              MESSAGE="배포 실패: 성공 $DEPLOYED_COUNT/$TOTAL_COUNT"
+              if [ "$FAILED_COUNT" -gt 0 ] && [ -n "$FAILED_HOSTS" ]; then
+                MESSAGE="$MESSAGE\n실패한 호스트: ${FAILED_HOSTS%,}"
+              fi
+            fi
+            
+            COMMIT_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+            
+            PAYLOAD=$(cat <<EOF
+            {
+              "attachments": [{
+                "color": "$COLOR",
+                "title": "엔진 배포 결과",
+                "fields": [
+                  {
+                    "title": "상태",
+                    "value": "$STATUS",
+                    "short": true
+                  },
+                  {
+                    "title": "브랜치",
+                    "value": "${{ github.ref_name }}",
+                    "short": true
+                  },
+                  {
+                    "title": "커밋",
+                    "value": "<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$COMMIT_SHORT>",
+                    "short": true
+                  },
+                  {
+                    "title": "작업자",
+                    "value": "${{ github.actor }}",
+                    "short": true
+                  },
+                  {
+                    "title": "결과",
+                    "value": "$MESSAGE",
+                    "short": false
+                  }
+                ],
+                "footer": "GitHub Actions",
+                "ts": $(date +%s)
+              }]
+            }
+            EOF
+            )
+            
+            curl -X POST -H 'Content-type: application/json' \
+              --data "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}"
+          else
+            echo "SLACK_WEBHOOK_URL not set, skipping notification"
+          fi

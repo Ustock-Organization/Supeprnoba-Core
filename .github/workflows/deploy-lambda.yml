@@ -1,0 +1,126 @@
+name: Deploy Lambda Functions
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'liquibook/lambda/**'
+  workflow_dispatch:
+    inputs:
+      function_name:
+        description: 'Lambda function name to deploy (leave empty for all)'
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        function:
+          - name: Supernoba-admin
+            path: liquibook/lambda/Supernoba-admin
+          - name: Supernoba-order-router
+            path: liquibook/lambda/Supernoba-order-router
+          - name: Supernoba-asset-handler
+            path: liquibook/lambda/Supernoba-asset-handler
+          - name: Supernoba-fill-processor
+            path: liquibook/lambda/Supernoba-fill-processor
+          - name: Supernoba-history-saver
+            path: liquibook/lambda/Supernoba-history-saver
+          - name: Supernoba-notifier
+            path: liquibook/lambda/Supernoba-notifier
+          - name: Supernoba-chart-data-handler
+            path: liquibook/lambda/Supernoba-chart-data-handler
+          - name: Supernoba-connect-handler
+            path: liquibook/lambda/Supernoba-connect-handler
+          - name: Supernoba-subscribe-handler
+            path: liquibook/lambda/Supernoba-subscribe-handler
+          - name: Supernoba-disconnect-handler
+            path: liquibook/lambda/Supernoba-disconnect-handler
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.function.path }}/package.json
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+      
+      - name: Filter changed functions
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.function_name }}" ]; then
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              if [ "${{ github.event.inputs.function_name }}" == "${{ matrix.function.name }}" ]; then
+                echo "should_deploy=true" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^${{ matrix.function.path }}"; then
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+      
+      - name: Install dependencies
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          fi
+      
+      - name: Build (if needed)
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          if [ -f build.js ]; then
+            node build.js
+          fi
+      
+      - name: Create deployment package
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          if [ -d dist ]; then
+            # esbuild로 빌드된 경우
+            cd dist
+            zip -r ../function.zip index.js
+            cd ..
+          else
+            # 일반 Node.js Lambda
+            zip -r function.zip index.mjs node_modules/ package.json -x "*.git*" "*.test.*" "*.spec.*"
+          fi
+      
+      - name: Deploy to Lambda
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ matrix.function.name }} \
+            --zip-file fileb://function.zip \
+            --region ap-northeast-2
+      
+      - name: Verify deployment
+        if: steps.filter.outputs.should_deploy == 'true'
+        run: |
+          aws lambda get-function \
+            --function-name ${{ matrix.function.name }} \
+            --region ap-northeast-2 \
+            --query 'Configuration.[FunctionName,LastModified,CodeSize]' \
+            --output table

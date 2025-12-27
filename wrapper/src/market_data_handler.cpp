@@ -108,26 +108,57 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     }
     
     // buyer/seller ID 추출
-    // buyer/seller ID 추출
     const std::string& buyer_id = order->is_buy() ? 
         order->user_id() : matched_order->user_id();
     const std::string& seller_id = order->is_buy() ? 
         matched_order->user_id() : order->user_id();
     
+    // 전량 체결 여부 확인 (fill 호출 후 filled_qty 업데이트됨)
+    bool order_fully_filled = (order->filled_qty() >= order->order_qty());
+    bool matched_order_fully_filled = (matched_order->filled_qty() >= matched_order->order_qty());
+    
+    // === 부분 체결 실시간 알림 (엔진 직접 전송) ===
+    // 전량 체결은 Lambda가 처리하므로 엔진에서는 부분 체결만 알림
+    if (notifier_ && (!order_fully_filled || !matched_order_fully_filled)) {
+        // 부분 체결된 주문에 대해 실시간 상태 업데이트
+        if (!order_fully_filled) {
+            std::string side = order->is_buy() ? "BUY" : "SELL";
+            std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
+            notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
+                                       order->symbol(), side, order->price(), order->order_qty(), type, 
+                                       order->filled_qty(), fill_price, "PARTIALLY_FILLED");
+            Logger::info("PARTIAL_FILL notification sent:", order->order_id());
+        }
+        
+        if (!matched_order_fully_filled) {
+            std::string side = matched_order->is_buy() ? "BUY" : "SELL";
+            std::string type = (matched_order->price() == 0) ? "MARKET" : "LIMIT";
+            notifier_->sendOrderStatus(matched_order->user_id(), matched_order->order_id(), 
+                                       matched_order->symbol(), side, matched_order->price(), matched_order->order_qty(), type, 
+                                       matched_order->filled_qty(), fill_price, "PARTIALLY_FILLED");
+            Logger::info("PARTIAL_FILL notification sent:", matched_order->order_id());
+        }
+    }
+    
     // === Kinesis Fan-Out Publishing ===
-    // Engine -> Kinesis -> [DB, Notifier, Balance]
+    // Engine -> Kinesis -> [DB, Notifier (전량 체결만), Balance]
+    // 전량 체결된 주문만 Lambda가 알림 처리
     if (producer_) {
         const std::string& bo = order->is_buy() ? order->order_id() : matched_order->order_id();
         const std::string& so = order->is_buy() ? matched_order->order_id() : order->order_id();
         
-        producer_->publishFill(symbol, bo, so, buyer_id, seller_id, fill_qty, fill_price);
-        Logger::info("PUBLISHED_FILL:", symbol, fill_price, "x", fill_qty);
+        // buyer/seller 전량 체결 여부 전달
+        bool buyer_fully_filled = order->is_buy() ? order_fully_filled : matched_order_fully_filled;
+        bool seller_fully_filled = order->is_buy() ? matched_order_fully_filled : order_fully_filled;
+        
+        producer_->publishFill(symbol, bo, so, buyer_id, seller_id, fill_qty, fill_price,
+                               buyer_fully_filled, seller_fully_filled);
+        Logger::info("PUBLISHED_FILL:", symbol, fill_price, "x", fill_qty, 
+                     "buyer_filled:", buyer_fully_filled, "seller_filled:", seller_fully_filled);
     }
 
     // Ticker 캐시 업데이트 (Sub 데이터용)
     updateTickerCache(symbol, fill_price);
-    
-    // Legacy Notification & DynamoDB Removed for Fan-Out Architecture
 }
 
 
