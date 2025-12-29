@@ -13,6 +13,17 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
 
+// Market Maker IDs (지갑 업데이트 제외 대상)
+const MARKET_MAKER_IDS = new Set([
+    'mm-kinesis-direct-buy',
+    'mm-kinesis-direct-sell'
+]);
+
+// Helper: Check if user is a market maker
+function isMarketMaker(userId) {
+    return MARKET_MAKER_IDS.has(userId);
+}
+
 // DynamoDB Client
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 const ddb = DynamoDBDocumentClient.from(dynamoClient);
@@ -103,30 +114,39 @@ export const handler = async (event) => {
             // 6. Update Supabase Wallets (balance transfer)
             // NOTE: Supabase RPC 실패해도 DynamoDB 업데이트는 성공으로 처리
             // (Supabase는 잔고만 관리, DynamoDB는 주문/보유자산 관리)
-            const client = await getSupabase();
-            if (client) {
-                try {
-                    const { data: rpcData, error } = await client.rpc('process_fill_wallets', {
-                        p_symbol: data.symbol,
-                        p_buyer_id: data.buyer.user_id,
-                        p_seller_id: data.seller.user_id,
-                        p_price: data.price,
-                        p_quantity: data.quantity,
-                        p_timestamp: data.timestamp
-                    });
 
-                    if (error) {
-                        console.error(`[Supabase] RPC Fail [${data.trade_id}]:`, error.message);
-                        // Supabase 실패는 치명적이지 않으므로 throw하지 않음
-                    } else {
-                        console.log(`[Supabase] Wallets updated: ${JSON.stringify(rpcData)}`);
-                    }
-                } catch (rpcErr) {
-                    console.error(`[Supabase] RPC Exception [${data.trade_id}]:`, rpcErr.message);
-                    // Supabase 실패는 치명적이지 않으므로 throw하지 않음
-                }
+            // 마켓 메이커가 관련된 거래는 지갑 업데이트 스킵
+            const buyerIsMarketMaker = isMarketMaker(data.buyer.user_id);
+            const sellerIsMarketMaker = isMarketMaker(data.seller.user_id);
+
+            if (buyerIsMarketMaker || sellerIsMarketMaker) {
+                console.log(`[Supabase] Skipping wallet update - Market maker involved: buyer=${buyerIsMarketMaker}, seller=${sellerIsMarketMaker}`);
             } else {
-                console.warn(`[Supabase] Client not available, skipping wallet update`);
+                const client = await getSupabase();
+                if (client) {
+                    try {
+                        const { data: rpcData, error } = await client.rpc('process_fill_wallets', {
+                            p_symbol: data.symbol,
+                            p_buyer_id: data.buyer.user_id,
+                            p_seller_id: data.seller.user_id,
+                            p_price: data.price,
+                            p_quantity: data.quantity,
+                            p_timestamp: data.timestamp
+                        });
+
+                        if (error) {
+                            console.error(`[Supabase] RPC Fail [${data.trade_id}]:`, error.message);
+                            // Supabase 실패는 치명적이지 않으므로 throw하지 않음
+                        } else {
+                            console.log(`[Supabase] Wallets updated: ${JSON.stringify(rpcData)}`);
+                        }
+                    } catch (rpcErr) {
+                        console.error(`[Supabase] RPC Exception [${data.trade_id}]:`, rpcErr.message);
+                        // Supabase 실패는 치명적이지 않으므로 throw하지 않음
+                    }
+                } else {
+                    console.warn(`[Supabase] Client not available, skipping wallet update`);
+                }
             }
 
         } catch (e) {
@@ -182,19 +202,22 @@ async function updateHoldings(userId, symbol, quantity, price, side) {
         }));
 
         const currentQty = existing.Item?.quantity || 0;
+        const currentLocked = existing.Item?.locked || 0;
         const currentAvgPrice = existing.Item?.avgPrice || 0;
         const currentTotalCost = currentQty * currentAvgPrice;
 
-        let newQty, newAvgPrice;
+        let newQty, newAvgPrice, newLocked;
 
         if (side === 'BUY') {
             // 매수: 수량 증가, 평균 단가 재계산
             const fillCost = quantity * price;
             newQty = currentQty + quantity;
             newAvgPrice = newQty > 0 ? (currentTotalCost + fillCost) / newQty : price;
+            newLocked = currentLocked; // 매수는 locked 변동 없음
         } else {
-            // 매도: 수량 감소 (FIFO 방식으로 평균 단가는 유지)
+            // 매도: 수량 감소 + locked 감소 (주문 시 lock했던 수량 해제)
             newQty = Math.max(0, currentQty - quantity);
+            newLocked = Math.max(0, currentLocked - quantity);
             newAvgPrice = newQty > 0 ? currentAvgPrice : 0;
         }
 
@@ -219,6 +242,7 @@ async function updateHoldings(userId, symbol, quantity, price, side) {
                     user_id: userId,
                     symbol: symbol.toUpperCase(),
                     quantity: newQty,
+                    locked: newLocked,
                     avgPrice: newAvgPrice,
                     updated_at: new Date().toISOString()
                 }

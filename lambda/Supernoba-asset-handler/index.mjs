@@ -152,11 +152,17 @@ async function getUserAssets(supabase, userId) {
         ExpressionAttributeValues: { ':uid': userId }
     }));
 
-    const holdings = (holdingsResult.Items || []).map(item => ({
-        symbol: item.symbol,
-        quantity: Number(item.quantity || 0),
-        avgPrice: Number(item.avgPrice || 0)
-    }));
+    const holdings = (holdingsResult.Items || []).map(item => {
+        const quantity = Number(item.quantity || 0);
+        const locked = Number(item.locked || 0);
+        return {
+            symbol: item.symbol,
+            quantity: quantity,
+            available: quantity - locked,
+            locked: locked,
+            avgPrice: Number(item.avgPrice || 0)
+        };
+    });
 
     return {
         statusCode: 200,
