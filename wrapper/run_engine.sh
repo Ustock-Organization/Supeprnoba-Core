@@ -52,12 +52,20 @@ export REDIS_PORT="6379"
 export DEPTH_CACHE_HOST="supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com"
 export DEPTH_CACHE_PORT="6379"
 
-# Kinesis 스트림
+# Kinesis 스트림 (DEV 모드: Lambda 트리거 없는 dev 스트림 사용 → 비용 절감)
 export KINESIS_ORDERS_STREAM="supernoba-orders"
-export KINESIS_FILLS_STREAM="supernoba-fills"
 export KINESIS_TRADES_STREAM="supernoba-trades"
 export KINESIS_DEPTH_STREAM="supernoba-depth"
-export KINESIS_STATUS_STREAM="supernoba-order-status"
+
+if [ "$DEV_MODE" == "true" ]; then
+    # DEV 모드: Lambda 트리거 없는 dev 스트림 사용 (비용 0)
+    export KINESIS_FILLS_STREAM="supernoba-fills-dev"
+    export KINESIS_STATUS_STREAM="supernoba-order-status-dev"
+else
+    # PROD 모드: Lambda 연결된 실제 스트림 사용
+    export KINESIS_FILLS_STREAM="supernoba-fills"
+    export KINESIS_STATUS_STREAM="supernoba-order-status"
+fi
 
 
 # WebSocket 직접 알림 (API Gateway)
@@ -103,10 +111,14 @@ echo ""
 echo "[2/3] 현재 설정:"
 echo "  - KINESIS_ORDERS: $KINESIS_ORDERS_STREAM"
 echo "  - KINESIS_FILLS: $KINESIS_FILLS_STREAM"
+echo "  - KINESIS_STATUS: $KINESIS_STATUS_STREAM"
 echo "  - REDIS_HOST: $REDIS_HOST"
 echo "  - DEPTH_CACHE: $DEPTH_CACHE_HOST"
 echo "  - LOG_LEVEL: $LOG_LEVEL"
 echo "  - DEV_MODE: $DEV_MODE"
+if [ "$DEV_MODE" == "true" ]; then
+    echo "  - LAMBDA_COST: 비용 없음 (dev 스트림 사용)"
+fi
 
 # ========================================
 # DEV 모드: Redis 캐시 초기화

@@ -1,46 +1,33 @@
-/**
- * Market Maker CLI - Kinesis Direct Mode
- * Lambda를 거치지 않고 직접 Kinesis supernoba-orders 스트림에 주문 발행
- * EC2 엔진과 동일 인스턴스 또는 AWS 자격증명이 있는 환경에서 실행
- */
-
-const { KinesisClient, PutRecordCommand } = require('@aws-sdk/client-kinesis');
+const axios = require('axios');
 const chalk = require('chalk');
+const readline = require('readline');
 const keypress = require('keypress');
-const { v4: uuidv4 } = require('uuid');
 
 // === Configuration ===
 const CONFIG = {
     symbol: 'TEST',
     basePrice: 3000,
-    range: 2000,
-    wavePeriod: 60,
-    ordersPerMinute: 60,
+    range: 2000, // Price fluctuation range (+/-) for Sine Wave
+    wavePeriod: 60, // Minutes for full sine wave cycle
+    ordersPerMinute: 60, // 1 orders per second
+    endpoint: 'https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/orders',
+    userId: 'cli-market-maker',
+    apiKey: 'S0cLXAGtuza6T3GbYZ8TBbERqfdi5Xo1ilA914gf',
     
-    // Kinesis 설정
-    streamName: process.env.KINESIS_STREAM || 'supernoba-orders',
-    region: process.env.AWS_REGION || 'ap-northeast-2',
-    
-    // 모드 설정
+    // New Parameters
     mode: 'RANDOM', // SINE or RANDOM
-    volatility: 5,
-    trend: 0,
-    
-    // 사용자 ID (마켓메이커 전용)
-    userId: 'mm-kinesis-direct'
+    volatility: 5,   // Price change per tick in Random Mode
+    trend: 0         // Bias (-1 to 1) for upward/downward trend
 };
 
-// Kinesis 클라이언트
-const kinesis = new KinesisClient({ region: CONFIG.region });
-
 // === State ===
-let isRunning = false;
-let t = 0;
+let isRunning = false; // Manual start
+let t = 0; // Sine wave time factor
 let totalOrders = 0;
-let lastPrice = CONFIG.basePrice;
+let lastPrice = CONFIG.basePrice; // Initialize with base price
 let intervalId = null;
 let lastError = '';
-let lastOrderInfo = null;
+let lastOrderInfo = null; // { side, price, quantity, time }
 
 // === UI Helpers ===
 function clearScreen() {
@@ -49,7 +36,7 @@ function clearScreen() {
 
 function printStatus() {
     clearScreen();
-    console.log(chalk.bold.cyan('=== Supernoba Market Maker CLI (Kinesis Direct) ==='));
+    console.log(chalk.bold.cyan('=== Supernoba Market Maker CLI ==='));
     console.log('');
     
     console.log(chalk.bold('🎮  Controls'));
@@ -76,8 +63,7 @@ function printStatus() {
     console.log(chalk.bold('📊  Status'));
     console.log(`  State     : ${isRunning ? chalk.green.bold('RUNNING ▶') : chalk.red.bold('STOPPED ⏸')}`);
     console.log(`  Symbol    : ${chalk.yellow(CONFIG.symbol)}`);
-    console.log(`  Mode      : ${chalk.magenta('KINESIS DIRECT 🚀')}`);
-    console.log(`  Stream    : ${chalk.cyan(CONFIG.streamName)}`);
+    console.log(`  Mode      : ${CONFIG.mode === 'SINE' ? chalk.magenta('Sine Wave 🌊') : chalk.blue('Random Walk 🎲')}`);
     console.log(`  Price     : ${chalk.yellow(lastPrice)}`); 
     console.log(`  Orders    : ${totalOrders}`);
     
@@ -86,13 +72,13 @@ function printStatus() {
     }
     console.log('');
     
+    // --- 최근 주문 정보 ---
     console.log(chalk.bold('📝  Last Order'));
     if (lastOrderInfo) {
         const sideColor = lastOrderInfo.side === 'BUY' ? chalk.green : chalk.red;
         console.log(`  Side      : ${sideColor.bold(lastOrderInfo.side)}`);
         console.log(`  Price     : ${chalk.yellow(lastOrderInfo.price)}`);
         console.log(`  Quantity  : ${chalk.cyan(lastOrderInfo.quantity)}`);
-        console.log(`  OrderId   : ${chalk.gray(lastOrderInfo.orderId.substring(0, 8) + '...')}`);
         console.log(`  Time      : ${chalk.gray(lastOrderInfo.time)}`);
     } else {
         console.log(chalk.gray('  (No orders yet)'));
@@ -114,17 +100,6 @@ function printStatus() {
     console.log('');
 }
 
-// === Kinesis Order Publisher ===
-async function publishOrder(order) {
-    const command = new PutRecordCommand({
-        StreamName: CONFIG.streamName,
-        PartitionKey: order.symbol,
-        Data: Buffer.from(JSON.stringify(order))
-    });
-    
-    return kinesis.send(command);
-}
-
 // === Logic ===
 async function placeOrder() {
     if (!isRunning) return;
@@ -137,60 +112,67 @@ async function placeOrder() {
         const sineValue = Math.sin((t / CONFIG.wavePeriod) * 2 * Math.PI);
         price = Math.round(CONFIG.basePrice + (CONFIG.range * sineValue));
     } else {
-        const rand = (Math.random() - 0.5) * 2;
+        // RANDOM WALK
+        // Change = (Random(-1 to 1) * Volatility) + Trend
+        // More realistic: Normal distribution approximation
+        const rand = (Math.random() - 0.5) * 2; // -1 to 1
         const delta = Math.round((rand * CONFIG.volatility) + CONFIG.trend);
+        
+        // Ensure price doesn't go below 1
         lastPrice = Math.max(1, lastPrice + delta);
         price = lastPrice;
     }
     
-    lastPrice = price;
+    lastPrice = price; // Sync for display
     
     const quantity = Math.floor(Math.random() * 50) + 1;
-    const buyOrderId = uuidv4();
-    const sellOrderId = uuidv4();
 
-    // Kinesis 주문 형식 (order-router Lambda가 받는 형식)
+    // Send order (Self-Match)
     const buyOrder = {
-        order_id: buyOrderId,
         user_id: CONFIG.userId + '-buy',
         symbol: CONFIG.symbol,
         side: 'BUY',
         price: price,
         quantity: quantity,
-        order_type: 'LIMIT',
-        timestamp: Date.now()
+        order_type: 'LIMIT'
     };
     
     const sellOrder = {
-        order_id: sellOrderId,
         user_id: CONFIG.userId + '-sell',
         symbol: CONFIG.symbol,
         side: 'SELL',
         price: price,
         quantity: quantity,
-        order_type: 'LIMIT',
-        timestamp: Date.now()
+        order_type: 'LIMIT'
     };
 
     try {
-        await Promise.all([
-            publishOrder(buyOrder),
-            publishOrder(sellOrder)
-        ]);
-        
-        totalOrders += 2;
-        lastError = '';
-        lastOrderInfo = {
-            side: 'BUY/SELL',
-            price: price,
-            quantity: quantity,
-            orderId: buyOrderId,
-            time: new Date().toLocaleTimeString('ko-KR')
+        const headers = { 
+            'Content-Type': 'application/json',
+            'x-api-key': CONFIG.apiKey
         };
-        process.stdout.write(chalk.gray('.'));
-    } catch (err) {
-        lastError = err.message;
-        process.stdout.write(chalk.red('x'));
+
+        Promise.all([
+            axios.post(CONFIG.endpoint, buyOrder, { headers }),
+            axios.post(CONFIG.endpoint, sellOrder, { headers })
+        ]).then(() => {
+            totalOrders += 2;
+            lastError = '';
+            // 최근 주문 정보 저장
+            lastOrderInfo = {
+                side: 'BUY/SELL',
+                price: price,
+                quantity: quantity,
+                time: new Date().toLocaleTimeString('ko-KR')
+            };
+            process.stdout.write(chalk.gray('.'));
+        }).catch(err => {
+            lastError = err.message;
+            if (err.response) lastError += ` (${err.response.status})`;
+            process.stdout.write(chalk.red('x'));
+        });
+    } catch (e) {
+        lastError = e.message;
     }
 }
 
@@ -226,19 +208,20 @@ process.stdin.on('keypress', function (ch, key) {
     
     if ((key && key.name == 'm') || ch === 'm') {
         CONFIG.mode = (CONFIG.mode === 'SINE') ? 'RANDOM' : 'SINE';
+        // Reset lastPrice to basePrice when switching to Random for stability
         if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice;
         printStatus();
     }
     
     if (key && key.name == 'up') {
         CONFIG.basePrice += 10;
-        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice;
+        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice; // Reset current price
         printStatus();
     }
     
     if (key && key.name == 'down') {
         CONFIG.basePrice = Math.max(10, CONFIG.basePrice - 10);
-        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice;
+        if (CONFIG.mode === 'RANDOM') lastPrice = CONFIG.basePrice; // Reset current price
         printStatus();
     }
     
@@ -299,10 +282,5 @@ process.stdin.setRawMode(true);
 process.stdin.resume();
 
 // === Init ===
-console.log(chalk.cyan('Initializing Kinesis client...'));
-console.log(chalk.gray(`Stream: ${CONFIG.streamName}`));
-console.log(chalk.gray(`Region: ${CONFIG.region}`));
-console.log('');
-
 printStatus();
 startLoop();

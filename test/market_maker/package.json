@@ -1,11 +1,11 @@
 {
   "name": "market-maker-cli",
-  "version": "2.0.0",
-  "description": "CLI Market Maker for Supernoba - Direct Kinesis",
+  "version": "2.1.0",
+  "description": "CLI Market Maker for Supernoba - Kinesis Direct Mode (No Lambda Cost)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "start:kinesis": "node kinesis_mode.js"
+    "start:lambda": "node index.js.lambda.bak"
   },
   "dependencies": {
     "@aws-sdk/client-kinesis": "^3.0.0",
