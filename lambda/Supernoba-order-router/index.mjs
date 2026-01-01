@@ -49,27 +49,46 @@ async function unlockBalance(db, userId, amount) {
 }
 
 // === Holdings Lock (DynamoDB - SELL orders) ===
-// Fixed: TOCTOU resolved - single atomic UpdateCommand without GetCommand
+// Fixed: OCC pattern - read then conditional update (prevents TOCTOU via exact value matching)
 async function lockHoldings(userId, symbol, amount) {
   if (amount <= 0) return { success: true };
 
   try {
-    // 단일 원자적 UpdateCommand로 TOCTOU 해결
+    // Step 1: Read current state
+    const { Item } = await ddb.send(new GetCommand({
+      TableName: HOLDINGS_TABLE,
+      Key: { user_id: userId, symbol: symbol.toUpperCase() }
+    }));
+
+    if (!Item || !Item.quantity) {
+      return { success: false, error: 'NO_HOLDINGS', message: `보유 수량이 없습니다 (${symbol})` };
+    }
+
+    const currentQty = Item.quantity || 0;
+    const currentLocked = Item.locked || 0;
+    const available = currentQty - currentLocked;
+
+    if (available < amount) {
+      return { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (${symbol})` };
+    }
+
+    // Step 2: Atomic update with OCC (fails if values changed since read)
     await ddb.send(new UpdateCommand({
       TableName: HOLDINGS_TABLE,
       Key: { user_id: userId, symbol: symbol.toUpperCase() },
-      UpdateExpression: 'SET locked = if_not_exists(locked, :zero) + :amount, updated_at = :now',
-      ConditionExpression: 'attribute_exists(quantity) AND (quantity - if_not_exists(locked, :zero)) >= :amount',
+      UpdateExpression: 'SET locked = :new_locked, updated_at = :now',
+      ConditionExpression: 'quantity = :qty AND (attribute_not_exists(locked) OR locked = :current_locked)',
       ExpressionAttributeValues: {
-        ':amount': amount,
-        ':zero': 0,
+        ':new_locked': currentLocked + amount,
+        ':current_locked': currentLocked,
+        ':qty': currentQty,
         ':now': new Date().toISOString()
       }
     }));
     return { success: true };
   } catch (e) {
     return e.name === 'ConditionalCheckFailedException'
-      ? { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (${symbol})` }
+      ? { success: false, error: 'CONCURRENCY_ERROR', message: '동시성 충돌, 재시도 필요' }
       : { success: false, error: 'LOCK_FAILED', message: e.message };
   }
 }
