@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.958.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.16.3"
+  }
+}

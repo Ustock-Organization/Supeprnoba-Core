@@ -42,149 +42,169 @@ EngineCore::OrderBookPtr EngineCore::getOrCreateBook(const std::string& symbol) 
 }
 
 bool EngineCore::addOrder(OrderPtr order) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto book = getOrCreateBook(order->symbol());
-    
-    // 주문 맵에 저장
-    order_maps_[order->symbol()][order->order_id()] = order;
-    
-    // Liquibook에 추가
-    book->add(order);
-    book->perform_callbacks();
-    
-    ++total_orders_processed_;
-    
-    Logger::info("Order added:", order->order_id(), order->symbol());
+    std::string order_id = order->order_id();
+    std::string symbol = order->symbol();
+
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+        auto book = getOrCreateBook(symbol);
+
+        // 주문 맵에 저장
+        order_maps_[symbol][order_id] = order;
+
+        // Liquibook에 추가
+        book->add(order);
+        book->perform_callbacks();
+
+        ++total_orders_processed_;
+    }
+
+    Logger::info("Order added:", order_id, symbol);
     return true;
 }
 
-bool EngineCore::cancelOrder(const std::string& symbol, 
+bool EngineCore::cancelOrder(const std::string& symbol,
                               const std::string& order_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto order = findOrder(symbol, order_id);
-    if (!order) {
-        Logger::warn("Cancel failed - order not found:", order_id);
-        return false;
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+        auto order = findOrder(symbol, order_id);
+        if (!order) {
+            lock.unlock();
+            Logger::warn("Cancel failed - order not found:", order_id);
+            return false;
+        }
+
+        auto it = books_.find(symbol);
+        if (it == books_.end()) return false;
+
+        it->second->cancel(order);
+        it->second->perform_callbacks();
+
+        // 주문 맵에서 제거
+        order_maps_[symbol].erase(order_id);
     }
-    
-    auto it = books_.find(symbol);
-    if (it == books_.end()) return false;
-    
-    it->second->cancel(order);
-    it->second->perform_callbacks();
-    
-    // 주문 맵에서 제거
-    order_maps_[symbol].erase(order_id);
-    
+
     Logger::info("Order cancelled:", order_id);
     return true;
 }
 
-bool EngineCore::replaceOrder(const std::string& symbol, 
+bool EngineCore::replaceOrder(const std::string& symbol,
                                const std::string& order_id,
-                               int64_t qty_delta, 
+                               int64_t qty_delta,
                                liquibook::book::Price new_price) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto order = findOrder(symbol, order_id);
-    if (!order) {
-        Logger::warn("Replace failed - order not found:", order_id);
-        return false;
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+        auto order = findOrder(symbol, order_id);
+        if (!order) {
+            lock.unlock();
+            Logger::warn("Replace failed - order not found:", order_id);
+            return false;
+        }
+
+        auto it = books_.find(symbol);
+        if (it == books_.end()) return false;
+
+        it->second->replace(order, qty_delta, new_price);
+        it->second->perform_callbacks();
     }
-    
-    auto it = books_.find(symbol);
-    if (it == books_.end()) return false;
-    
-    it->second->replace(order, qty_delta, new_price);
-    it->second->perform_callbacks();
-    
+
     Logger::info("Order replaced:", order_id, "delta:", qty_delta, "price:", new_price);
     return true;
 }
 
 std::string EngineCore::snapshotOrderBook(const std::string& symbol) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = order_maps_.find(symbol);
-    if (it == order_maps_.end()) {
-        return "";
-    }
-    
     nlohmann::json snapshot;
-    snapshot["symbol"] = symbol;
-    snapshot["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    
-    nlohmann::json orders = nlohmann::json::array();
-    for (const auto& [id, order] : it->second) {
-        if (order->open_qty() > 0) {
-            orders.push_back(order->toJson());
+    size_t order_count = 0;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+
+        auto it = order_maps_.find(symbol);
+        if (it == order_maps_.end()) {
+            return "";
         }
+
+        snapshot["symbol"] = symbol;
+        snapshot["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        nlohmann::json orders = nlohmann::json::array();
+        for (const auto& [id, order] : it->second) {
+            if (order->open_qty() > 0) {
+                orders.push_back(order->toJson());
+            }
+        }
+        snapshot["orders"] = orders;
+        order_count = orders.size();
     }
-    snapshot["orders"] = orders;
-    
-    Logger::info("Snapshot created for:", symbol, "orders:", orders.size());
+
+    Logger::info("Snapshot created for:", symbol, "orders:", order_count);
     return snapshot.dump();
 }
 
-bool EngineCore::restoreOrderBook(const std::string& symbol, 
+bool EngineCore::restoreOrderBook(const std::string& symbol,
                                    const std::string& data) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+    size_t total = 0;
+
     try {
         auto snapshot = nlohmann::json::parse(data);
-        
-        // 기존 오더북 제거
-        books_.erase(symbol);
-        order_maps_.erase(symbol);
-        
-        // 새 오더북 생성 (리스너 없이)
-        auto book = std::make_shared<OrderBook>();
-        book->set_symbol(symbol);
-        books_[symbol] = book;
-        order_maps_[symbol] = {};
-        
-        const auto& orders = snapshot["orders"];
-        size_t total = orders.size();
-        size_t count = 0;
-        
-        // 프로그레스 바 표시
-        std::cout << "\r  Restoring " << symbol << ": [";
-        std::cout.flush();
-        
-        // 주문 복원 (리스너 없이 조용히)
-        for (const auto& j : orders) {
-            auto order = Order::fromJson(j);
-            order_maps_[symbol][order->order_id()] = order;
-            book->add(order);
-            
-            // 프로그레스 업데이트 (10% 단위)
-            ++count;
-            int progress = (count * 50) / total;  // 50칸 기준
-            static int last_progress = -1;
-            if (progress != last_progress) {
-                std::cout << "\r  Restoring " << symbol << ": [";
-                for (int i = 0; i < 50; ++i) {
-                    if (i < progress) std::cout << "█";
-                    else std::cout << "░";
+
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+            // 기존 오더북 제거
+            books_.erase(symbol);
+            order_maps_.erase(symbol);
+
+            // 새 오더북 생성 (리스너 없이)
+            auto book = std::make_shared<OrderBook>();
+            book->set_symbol(symbol);
+            books_[symbol] = book;
+            order_maps_[symbol] = {};
+
+            const auto& orders = snapshot["orders"];
+            total = orders.size();
+            size_t count = 0;
+
+            // 프로그레스 바 표시
+            std::cout << "\r  Restoring " << symbol << ": [";
+            std::cout.flush();
+
+            // 주문 복원 (리스너 없이 조용히)
+            for (const auto& j : orders) {
+                auto order = Order::fromJson(j);
+                order_maps_[symbol][order->order_id()] = order;
+                book->add(order);
+
+                // 프로그레스 업데이트 (10% 단위)
+                ++count;
+                int progress = (count * 50) / total;  // 50칸 기준
+                static int last_progress = -1;
+                if (progress != last_progress) {
+                    std::cout << "\r  Restoring " << symbol << ": [";
+                    for (int i = 0; i < 50; ++i) {
+                        if (i < progress) std::cout << "█";
+                        else std::cout << "░";
+                    }
+                    std::cout << "] " << count << "/" << total;
+                    std::cout.flush();
+                    last_progress = progress;
                 }
-                std::cout << "] " << count << "/" << total;
-                std::cout.flush();
-                last_progress = progress;
             }
+
+            std::cout << "\r  Restoring " << symbol << ": [";
+            for (int i = 0; i < 50; ++i) std::cout << "█";
+            std::cout << "] " << total << "/" << total << " ✓" << std::endl;
+
+            // 리스너 등록 (복원 완료 후)
+            book->set_order_listener(handler_);
+            book->set_depth_listener(handler_);
+            book->set_bbo_listener(handler_);
         }
-        
-        std::cout << "\r  Restoring " << symbol << ": [";
-        for (int i = 0; i < 50; ++i) std::cout << "█";
-        std::cout << "] " << total << "/" << total << " ✓" << std::endl;
-        
-        // 리스너 등록 (복원 완료 후)
-        book->set_order_listener(handler_);
-        book->set_depth_listener(handler_);
-        book->set_bbo_listener(handler_);
-        
+
         Logger::info("OrderBook restored:", symbol, "orders:", total);
         return true;
     } catch (const std::exception& e) {
@@ -194,30 +214,31 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
 }
 
 bool EngineCore::removeOrderBook(const std::string& symbol) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    books_.erase(symbol);
-    order_maps_.erase(symbol);
-    
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        books_.erase(symbol);
+        order_maps_.erase(symbol);
+    }
+
     Logger::info("OrderBook removed:", symbol);
     return true;
 }
 
 size_t EngineCore::getSymbolCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     return books_.size();
 }
 
 size_t EngineCore::getOrderCount(const std::string& symbol) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+
     auto it = order_maps_.find(symbol);
     if (it == order_maps_.end()) return 0;
     return it->second.size();
 }
 
 std::vector<std::string> EngineCore::getAllSymbols() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     std::vector<std::string> symbols;
     symbols.reserve(books_.size());
     for (const auto& [sym, book] : books_) {

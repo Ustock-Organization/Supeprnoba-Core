@@ -1,676 +1,575 @@
-
+// Supernoba-admin: 통합 관리자 Lambda with Authentication
 import Redis from 'ioredis';
 import { createClient } from '@supabase/supabase-js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { ScanCommand, GetCommand, DeleteCommand, PutCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import pg from 'pg';
 
-// === Configuration ===
+// === Auth Layer Import ===
+let verifyAdmin, authErrorResponse;
+try {
+  const authModule = await import('/opt/nodejs/verifyAuth.mjs');
+  verifyAdmin = authModule.verifyAdmin;
+  authErrorResponse = authModule.authErrorResponse;
+} catch (e) {
+  console.warn('[admin] Auth layer not available, using fallback');
+  // Fallback: 기존 API 키 방식만 사용
+  verifyAdmin = async (event) => {
+    const adminApiKey = process.env.ADMIN_API_KEY;
+    const authHeader = event.headers?.Authorization || event.headers?.authorization;
+    if (adminApiKey && authHeader === adminApiKey) {
+      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
+    }
+    return { success: false, error: 'UNAUTHORIZED', message: '인증이 필요합니다' };
+  };
+  authErrorResponse = (result) => ({
+    statusCode: 401,
+    headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ error: result.error, message: result.message })
+  });
+}
+
+const { Client: PgClient } = pg;
 const VALKEY_HOST = process.env.VALKEY_HOST;
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; 
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
-
-// Clients
-const valkey = new Redis({
-  host: VALKEY_HOST,
-  port: VALKEY_PORT,
-  tls: {}, 
-  connectTimeout: 5000,
-  maxRetriesPerRequest: 3,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
-});
-valkey.on('error', (err) => console.error('Redis error:', err.message));
-
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }));
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
+const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com';
+const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 
-const headers = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Content-Type': 'application/json',
-};
+const valkey = new Redis({ host: VALKEY_HOST, port: 6379, tls: {}, connectTimeout: 5000, maxRetriesPerRequest: 3 });
+valkey.on('error', (e) => console.error('Redis:', e.message));
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+const secrets = new SecretsManagerClient({ region: 'ap-northeast-2' });
+let dbCreds = null, pgClient = null;
 
-// Helper: Detect Platform (Used in Request)
-const detectPlatform = (url) => {
-    if (!url) return 'ETC';
-    const lower = url.toLowerCase();
-    if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'YOUTUBE';
-    if (lower.includes('twitter.com') || lower.includes('x.com')) return 'X';
-    if (lower.includes('instagram.com')) return 'INSTAGRAM';
-    if (lower.includes('tiktok.com')) return 'TIKTOK';
-    if (lower.includes('chzzk')) return 'CHZZK';
-    if (lower.includes('afreecatv')) return 'AFREECATV';
-    return 'ETC';
-};
+const H = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS', 'Content-Type': 'application/json' };
 
-// Admin Check
-function isAdmin(event) {
-  const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  if (!ADMIN_API_KEY) return true;
-  if (authHeader !== ADMIN_API_KEY) {
-      console.log(`[AUTH FAIL] Expected: '${ADMIN_API_KEY}', Got: '${authHeader}'`);
-      return false;
+// 관리자 인증 체크 (JWT + API Key 병행)
+const checkAdmin = async (event) => {
+  const result = await verifyAdmin(event);
+  if (!result.success) {
+    return { authorized: false, response: authErrorResponse(result, H) };
   }
-  return true; 
+  return { authorized: true, userId: result.userId, method: result.method };
+};
+
+const detectPlatform = (url) => {
+  if (!url) return 'ETC';
+  const lower = url.toLowerCase();
+  if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'YOUTUBE';
+  if (lower.includes('twitter.com') || lower.includes('x.com')) return 'X';
+  if (lower.includes('instagram.com')) return 'INSTAGRAM';
+  if (lower.includes('tiktok.com')) return 'TIKTOK';
+  if (lower.includes('chzzk')) return 'CHZZK';
+  if (lower.includes('afreecatv')) return 'AFREECATV';
+  return 'ETC';
+};
+const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
+const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
+
+async function getPg() {
+  if (pgClient) return pgClient;
+  if (!dbCreds) {
+    if (process.env.DB_USERNAME && process.env.DB_PASSWORD) dbCreds = { username: process.env.DB_USERNAME, password: process.env.DB_PASSWORD };
+    else if (DB_SECRET_ARN) { const r = await secrets.send(new GetSecretValueCommand({ SecretId: DB_SECRET_ARN })); const s = JSON.parse(r.SecretString); dbCreds = { username: s.username, password: s.password }; }
+    else dbCreds = { username: 'postgres', password: 'postgres' };
+  }
+  pgClient = new PgClient({ host: RDS_HOST, port: 5432, database: 'postgres', user: dbCreds.username, password: dbCreds.password, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
+  await pgClient.connect();
+  return pgClient;
 }
 
 export const handler = async (event) => {
-    if (event.httpMethod === 'OPTIONS') {
-        return { statusCode: 200, headers, body: '' };
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
+  try {
+    const m = event.httpMethod, q = event.queryStringParameters || {}, path = event.path || '';
+
+    // auth - Supabase 기반 인증 (공개 엔드포인트)
+    if (q.type === 'auth') {
+      if (m === 'GET') {
+        const { userId, twitterUsername, googleEmail } = q;
+        let admin = false;
+        if (twitterUsername) admin = twitterUsername.replace('@', '').toLowerCase() === 'tchinnom';
+        if (googleEmail && !admin) admin = ['tchinnom@gmail.com', 'admin@supernoba.com'].includes(googleEmail.toLowerCase());
+        if (userId && !admin) {
+          const { data } = await supabase.from('user_profiles').select('is_admin').eq('id', userId).single();
+          if (data) admin = data.is_admin === true;
+        }
+        return ok({ isAdmin: admin });
+      }
+      if (m === 'POST') {
+        const b = JSON.parse(event.body || '{}');
+        if (!b.email || !b.password) return err(400, 'Email and password required');
+
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: b.email,
+          password: b.password
+        });
+        if (error) return err(401, error.message);
+
+        let isAdminUser = ['admin@supernoba.com', 'tchinnom@gmail.com'].includes(b.email.toLowerCase());
+        if (!isAdminUser && data.user) {
+          const { data: profile } = await supabase.from('user_profiles').select('is_admin').eq('id', data.user.id).single();
+          isAdminUser = profile?.is_admin === true;
+        }
+
+        if (!isAdminUser) return err(403, 'Not an admin user');
+        return ok({ success: true, session: data.session, user: data.user });
+      }
     }
 
-    try {
-        const path = event.path || '';
-        const method = event.httpMethod;
-        const queryParams = event.queryStringParameters || {};
-        
-        // Extract Symbol from path if present
-        const pathParts = path.split('/').filter(p => p);
-        let symbolParam = null;
-
-        // Ignore base path parts (admin, Supernoba-admin, symbols, etc.)
-        const basePaths = ['admin', 'supernoba-admin', 'symbols', 'sync', 'request', 'approve', 'reject'];
-        const relevantParts = pathParts.filter(p => !basePaths.includes(p.toLowerCase()));
-
-        if (relevantParts.length > 0) {
-            symbolParam = relevantParts[relevantParts.length - 1];
-        }
-        
-        // === POST /sync (Hydrate Redis) ===
-        if (method === 'POST' && path.includes('sync')) {
-             if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-             console.log('[SYNC] Starting Redis hydration...');
-             const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
-             
-             if (Items && Items.length > 0) {
-                 const pipeline = valkey.pipeline();
-                 pipeline.del('active:symbols');
-                 
-                 for (const item of Items) {
-                     if (item.status === 'ACTIVE') {
-                         pipeline.sadd('active:symbols', item.symbol);
-                         pipeline.set(`ticker:${item.symbol}`, JSON.stringify({
-                             symbol: item.symbol,
-                             price: item.listingPrice || 0,
-                             changePercent: 0,
-                             volume: 0,
-                             high: 0,
-                             low: 0
-                         }));
-                     }
-                 }
-                 await pipeline.exec();
-                 console.log(`[SYNC] Hydrated ${Items.length} symbols.`);
-                 return { statusCode: 200, headers, body: JSON.stringify({ message: `Synced ${Items.length} symbols` }) };
-             }
-             return { statusCode: 200, headers, body: JSON.stringify({ message: 'No symbols to sync' }) };
-        }
-
-        // === GET /symbols (List & Search) ===
-        if (method === 'GET' && !symbolParam && !path.includes('sync')) {
-             // Check if requesting creator_requests
-             if (queryParams.type === 'requests') {
-                 if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-                 const status = queryParams.status || 'pending';
-                 const { data, error } = await supabaseAdmin
-                     .from('creator_requests')
-                     .select('*')
-                     .eq('status', status)
-                     .order('created_at', { ascending: true });
-
-                 if (error) {
-                     console.error('[REQUESTS] Fetch error:', error);
-                     return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to fetch requests', details: error.message }) };
-                 }
-
-                 return { statusCode: 200, headers, body: JSON.stringify(data || []) };
-             }
-
-             // Check if requesting auth check
-             if (queryParams.type === 'auth') {
-                 const userId = queryParams.userId;
-                 const twitterUsername = queryParams.twitterUsername;
-                 const googleEmail = queryParams.googleEmail;
-
-                 if (!userId && !twitterUsername && !googleEmail) {
-                     return { statusCode: 400, headers, body: JSON.stringify({ error: 'userId, twitterUsername, or googleEmail required' }) };
-                 }
-
-                 try {
-                     let isAdminUser = false;
-                     let userData = null;
-
-                     // Check by user ID first (for existing admin users in DB)
-                     if (userId) {
-                         const { data, error } = await supabaseAdmin
-                             .from('user_profiles')
-                             .select('id, username, email, is_admin')
-                             .eq('id', userId)
-                             .single();
-
-                         if (!error && data) {
-                             isAdminUser = data.is_admin === true;
-                             userData = data;
-                         }
-                     }
-
-                     // Check by Twitter username - @tchinnom is admin
-                     if (twitterUsername && !isAdminUser) {
-                         const cleanUsername = twitterUsername.replace('@', '').toLowerCase();
-                         isAdminUser = (cleanUsername === 'tchinnom');
-
-                         if (userId && isAdminUser) {
-                             await supabaseAdmin
-                                 .from('user_profiles')
-                                 .upsert({
-                                     id: userId,
-                                     username: cleanUsername,
-                                     is_admin: true,
-                                     updated_at: new Date().toISOString()
-                                 }, { onConflict: 'id' });
-                         }
-                     }
-
-                     // Check by Google email - specific emails are admin
-                     if (googleEmail && !isAdminUser) {
-                         const cleanEmail = googleEmail.toLowerCase();
-                         // Allowed Google admin emails
-                         const allowedGoogleAdmins = [
-                             'tchinnom@gmail.com',
-                             'admin@supernoba.com'
-                         ];
-                         isAdminUser = allowedGoogleAdmins.includes(cleanEmail);
-
-                         if (userId && isAdminUser) {
-                             await supabaseAdmin
-                                 .from('user_profiles')
-                                 .upsert({
-                                     id: userId,
-                                     email: cleanEmail,
-                                     is_admin: true,
-                                     updated_at: new Date().toISOString()
-                                 }, { onConflict: 'id' });
-                         }
-                     }
-
-                     return {
-                         statusCode: 200,
-                         headers,
-                         body: JSON.stringify({ isAdmin: isAdminUser, user: userData })
-                     };
-                 } catch (e) {
-                     console.error('[AUTH CHECK] Error:', e);
-                     return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
-                 }
-             }
-
-             const q = queryParams.q ? queryParams.q.toUpperCase() : null;
-             const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
-             let results = Items || [];
-
-             if (q) {
-                 results = results.filter(s => s.symbol.includes(q) || (s.name && s.name.toUpperCase().includes(q)));
-             }
-
-             return { statusCode: 200, headers, body: JSON.stringify(results) };
-        }
-
-        // === GET /symbols/{symbol} (Detail) ===
-        if (method === 'GET' && symbolParam) {
-            const { Item } = await dynamodb.send(new GetCommand({
-                TableName: SYMBOLS_TABLE,
-                Key: { symbol: symbolParam.toUpperCase() }
-            }));
-            
-            if (!Item) return { statusCode: 404, headers, body: JSON.stringify({ error: 'Symbol not found' }) };
-            return { statusCode: 200, headers, body: JSON.stringify(Item) };
-        }
-
-        // === POST /symbols (Request Listing or Admin Direct Add) ===
-        if (method === 'POST' && !path.includes('sync')) {
-             const body = JSON.parse(event.body || '{}');
-             const action = body.action || queryParams.action;
-
-             // Admin direct login
-             if (queryParams.type === 'auth') {
-                 const { email, password } = body;
-
-                 // Direct admin credentials check
-                 if (email === 'admin' && password === 'Shworms747**') {
-                     try {
-                         const adminEmail = 'admin@supernoba.com';
-
-                         // Try to sign in first
-                         const { data: signInData, error: signInError } = await supabaseAdmin.auth.signInWithPassword({
-                             email: adminEmail,
-                             password: password
-                         });
-
-                         if (signInError) {
-                             // If user doesn't exist, create them
-                             if (signInError.message.includes('Invalid login credentials')) {
-                                 const { data: signUpData, error: signUpError } = await supabaseAdmin.auth.admin.createUser({
-                                     email: adminEmail,
-                                     password: password,
-                                     email_confirm: true,
-                                     user_metadata: { full_name: 'Admin', is_admin: true }
-                                 });
-
-                                 if (signUpError) {
-                                     console.error('[AUTH] Create admin user error:', signUpError);
-                                     return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to create admin user', details: signUpError.message }) };
-                                 }
-
-                                 // Update profile with admin flag
-                                 await supabaseAdmin
-                                     .from('user_profiles')
-                                     .upsert({
-                                         id: signUpData.user.id,
-                                         username: 'admin',
-                                         email: adminEmail,
-                                         is_admin: true,
-                                         updated_at: new Date().toISOString()
-                                     }, { onConflict: 'id' });
-
-                                 // Sign in with new account
-                                 const { data: newSignIn, error: newSignInError } = await supabaseAdmin.auth.signInWithPassword({
-                                     email: adminEmail,
-                                     password: password
-                                 });
-
-                                 if (newSignInError) {
-                                     return { statusCode: 401, headers, body: JSON.stringify({ error: 'Auth failed after create' }) };
-                                 }
-
-                                 return {
-                                     statusCode: 200,
-                                     headers,
-                                     body: JSON.stringify({
-                                         success: true,
-                                         session: newSignIn.session,
-                                         user: newSignIn.user,
-                                         isAdmin: true
-                                     })
-                                 };
-                             }
-                             return { statusCode: 401, headers, body: JSON.stringify({ error: signInError.message }) };
-                         }
-
-                         // Ensure admin flag is set
-                         await supabaseAdmin
-                             .from('user_profiles')
-                             .upsert({
-                                 id: signInData.user.id,
-                                 username: 'admin',
-                                 email: adminEmail,
-                                 is_admin: true,
-                                 updated_at: new Date().toISOString()
-                             }, { onConflict: 'id' });
-
-                         return {
-                             statusCode: 200,
-                             headers,
-                             body: JSON.stringify({
-                                 success: true,
-                                 session: signInData.session,
-                                 user: signInData.user,
-                                 isAdmin: true
-                             })
-                         };
-                     } catch (e) {
-                         console.error('[AUTH LOGIN] Error:', e);
-                         return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
-                     }
-                 }
-
-                 return { statusCode: 401, headers, body: JSON.stringify({ error: 'Invalid credentials' }) };
-             }
-
-             // User request for listing
-             if (action === 'request') {
-                  const { creator_name, creator_url, logo_url } = body;
-                  if (!creator_url) return { statusCode: 400, headers, body: JSON.stringify({ error: 'URL is required' }) };
-
-                  const detected = detectPlatform(creator_url);
-                  const { data, error } = await supabaseAdmin
-                      .from('creator_requests')
-                      .insert([{
-                          creator_name: creator_name || 'Unknown',
-                          creator_url,
-                          logo_url: logo_url || '',
-                          status: 'pending',
-                          platform: detected
-                      }])
-                      .select();
-
-                  if (error) return { statusCode: 500, headers, body: JSON.stringify({ error: 'DB Error', details: error }) };
-                  return { statusCode: 201, headers, body: JSON.stringify({ message: 'Request submitted', data }) };
-             }
-
-             // Admin approve creator request
-             if (action === 'approve') {
-                  if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-                  const { requestId, symbol, name, logo_url, base_asset } = body;
-                  if (!requestId || !symbol) {
-                      return { statusCode: 400, headers, body: JSON.stringify({ error: 'requestId and symbol are required' }) };
-                  }
-
-                  // Get the request from Supabase
-                  const { data: request, error: fetchError } = await supabaseAdmin
-                      .from('creator_requests')
-                      .select('*')
-                      .eq('id', requestId)
-                      .single();
-
-                  if (fetchError || !request) {
-                      return { statusCode: 404, headers, body: JSON.stringify({ error: 'Request not found' }) };
-                  }
-
-                  const symbolUpper = symbol.toUpperCase();
-                  const now = new Date().toISOString();
-                  const detectedPlatform = request.platform || detectPlatform(request.creator_url);
-
-                  // Check if symbol already exists
-                  const { Item: existing } = await dynamodb.send(new GetCommand({
-                      TableName: SYMBOLS_TABLE,
-                      Key: { symbol: symbolUpper }
-                  }));
-
-                  if (existing) {
-                      return { statusCode: 409, headers, body: JSON.stringify({ error: 'Symbol already exists', symbol: symbolUpper }) };
-                  }
-
-                  // Create new symbol in DynamoDB
-                  const newSymbol = {
-                      symbol: symbolUpper,
-                      name: name || request.creator_name || symbolUpper,
-                      base_asset: base_asset || symbolUpper,
-                      quote_asset: 'BOLT',
-                      status: 'ACTIVE',
-                      listingDate: now,
-                      listingPrice: 0,
-                      delistingDate: null,
-                      platform: detectedPlatform,
-                      creatorUrl: request.creator_url || '',
-                      profileUrl: `/creator/${symbolUpper}`,
-                      logoUrl: logo_url || request.logo_url || '',
-                      marketCap: 0,
-                      totalSupply: 0,
-                      circulatingSupply: 0,
-                      volume24h: 0,
-                      priceChange24h: 0,
-                      allTimeHigh: 0,
-                      allTimeLow: 0,
-                      platformStats: { subscribers: 0, followers: 0, views: 0, videos: 0, lastUpdated: null },
-                      tags: [],
-                      categories: [],
-                      verified: false,
-                      trustScore: 5,
-                      userRating: 0,
-                      ratingCount: 0,
-                      description: `Official symbol for ${name || request.creator_name || symbolUpper}`
-                  };
-
-                  await dynamodb.send(new PutCommand({
-                      TableName: SYMBOLS_TABLE,
-                      Item: newSymbol
-                  }));
-
-                  // Add to Valkey
-                  await valkey.sadd('active:symbols', symbolUpper);
-                  await valkey.set(`ticker:${symbolUpper}`, JSON.stringify({
-                      symbol: symbolUpper,
-                      price: 0,
-                      changePercent: 0,
-                      volume: 0,
-                      high: 0,
-                      low: 0
-                  }));
-
-                  // Update request status in Supabase
-                  await supabaseAdmin
-                      .from('creator_requests')
-                      .update({ status: 'approved', processed_at: now, admin_note: `Approved as ${symbolUpper}` })
-                      .eq('id', requestId);
-
-                  console.log(`[ADMIN] Approved request ${requestId} as symbol: ${symbolUpper}`);
-                  return { statusCode: 201, headers, body: JSON.stringify({ message: 'Approved', symbol: newSymbol }) };
-             }
-
-             // Admin reject creator request
-             if (action === 'reject') {
-                  if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-                  const { requestId, reason } = body;
-                  if (!requestId) {
-                      return { statusCode: 400, headers, body: JSON.stringify({ error: 'requestId is required' }) };
-                  }
-
-                  const now = new Date().toISOString();
-
-                  const { error } = await supabaseAdmin
-                      .from('creator_requests')
-                      .update({ status: 'rejected', processed_at: now, admin_note: reason || 'Rejected by admin' })
-                      .eq('id', requestId);
-
-                  if (error) {
-                      return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to reject', details: error }) };
-                  }
-
-                  console.log(`[ADMIN] Rejected request ${requestId}`);
-                  return { statusCode: 200, headers, body: JSON.stringify({ message: 'Rejected' }) };
-             }
-
-             // Admin direct add (no action or action=add)
-             if (!action || action === 'add') {
-                  if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-                  const { symbol, name, logo_url, description, creator_url, platform } = body;
-
-                  if (!symbol) {
-                      return { statusCode: 400, headers, body: JSON.stringify({ error: 'symbol is required' }) };
-                  }
-
-                  const symbolUpper = symbol.toUpperCase();
-                  const now = new Date().toISOString();
-                  const detectedPlatform = platform || detectPlatform(creator_url);
-
-                  // Check if symbol already exists
-                  const { Item: existing } = await dynamodb.send(new GetCommand({
-                      TableName: SYMBOLS_TABLE,
-                      Key: { symbol: symbolUpper }
-                  }));
-
-                  if (existing) {
-                      return { statusCode: 409, headers, body: JSON.stringify({ error: 'Symbol already exists', symbol: symbolUpper }) };
-                  }
-
-                  const newSymbol = {
-                      symbol: symbolUpper,
-                      name: name || symbolUpper,
-                      base_asset: symbolUpper,
-                      quote_asset: 'BOLT',
-                      status: 'ACTIVE',
-                      listingDate: now,
-                      listingPrice: 0,
-                      delistingDate: null,
-                      platform: detectedPlatform,
-                      creatorUrl: creator_url || '',
-                      profileUrl: `/creator/${symbolUpper}`,
-                      logoUrl: logo_url || '',
-                      marketCap: 0,
-                      totalSupply: 0,
-                      circulatingSupply: 0,
-                      volume24h: 0,
-                      priceChange24h: 0,
-                      allTimeHigh: 0,
-                      allTimeLow: 0,
-                      platformStats: { subscribers: 0, followers: 0, views: 0, videos: 0, lastUpdated: null },
-                      tags: [],
-                      categories: [],
-                      verified: false,
-                      trustScore: 5,
-                      userRating: 0,
-                      ratingCount: 0,
-                      description: description || `Official symbol for ${name || symbolUpper}`
-                  };
-
-                  // Save to DynamoDB
-                  await dynamodb.send(new PutCommand({
-                      TableName: SYMBOLS_TABLE,
-                      Item: newSymbol
-                  }));
-
-                  // Add to Valkey active:symbols
-                  await valkey.sadd('active:symbols', symbolUpper);
-
-                  // Initialize ticker cache
-                  await valkey.set(`ticker:${symbolUpper}`, JSON.stringify({
-                      symbol: symbolUpper,
-                      price: 0,
-                      changePercent: 0,
-                      volume: 0,
-                      high: 0,
-                      low: 0
-                  }));
-
-                  console.log(`[ADMIN] Symbol created: ${symbolUpper}`);
-                  return { statusCode: 201, headers, body: JSON.stringify({ message: 'Symbol created', symbol: newSymbol }) };
-             }
-
-             return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid action' }) };
-        }
-
-        // === PUT /symbols/{symbol} (Update Symbol) ===
-        if (method === 'PUT') {
-             if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-
-             let targetSymbol = symbolParam;
-             if (!targetSymbol) {
-                 try {
-                     const body = JSON.parse(event.body || '{}');
-                     targetSymbol = body.symbol;
-                 } catch (e) {}
-             }
-
-             if (!targetSymbol) {
-                 return { statusCode: 400, headers, body: JSON.stringify({ error: 'symbol is required' }) };
-             }
-
-             const symbolUpper = targetSymbol.toUpperCase();
-             const body = JSON.parse(event.body || '{}');
-             const { name, logo_url, description, status, creator_url, platform } = body;
-
-             // Check if symbol exists
-             const { Item: existing } = await dynamodb.send(new GetCommand({
-                 TableName: SYMBOLS_TABLE,
-                 Key: { symbol: symbolUpper }
-             }));
-
-             if (!existing) {
-                 return { statusCode: 404, headers, body: JSON.stringify({ error: 'Symbol not found' }) };
-             }
-
-             // Build update expression
-             const updateExprParts = [];
-             const exprAttrValues = {};
-             const exprAttrNames = {};
-
-             if (name !== undefined) {
-                 updateExprParts.push('#name = :name');
-                 exprAttrValues[':name'] = name;
-                 exprAttrNames['#name'] = 'name';
-             }
-             if (logo_url !== undefined) {
-                 updateExprParts.push('logoUrl = :logoUrl');
-                 exprAttrValues[':logoUrl'] = logo_url;
-             }
-             if (description !== undefined) {
-                 updateExprParts.push('description = :description');
-                 exprAttrValues[':description'] = description;
-             }
-             if (status !== undefined) {
-                 updateExprParts.push('#status = :status');
-                 exprAttrValues[':status'] = status;
-                 exprAttrNames['#status'] = 'status';
-             }
-             if (creator_url !== undefined) {
-                 updateExprParts.push('creatorUrl = :creatorUrl');
-                 exprAttrValues[':creatorUrl'] = creator_url;
-             }
-             if (platform !== undefined) {
-                 updateExprParts.push('platform = :platform');
-                 exprAttrValues[':platform'] = platform;
-             }
-
-             if (updateExprParts.length === 0) {
-                 return { statusCode: 400, headers, body: JSON.stringify({ error: 'No fields to update' }) };
-             }
-
-             // Update DynamoDB
-             await dynamodb.send(new UpdateCommand({
-                 TableName: SYMBOLS_TABLE,
-                 Key: { symbol: symbolUpper },
-                 UpdateExpression: `SET ${updateExprParts.join(', ')}`,
-                 ExpressionAttributeValues: exprAttrValues,
-                 ...(Object.keys(exprAttrNames).length > 0 && { ExpressionAttributeNames: exprAttrNames })
-             }));
-
-             // Update Valkey if status changed
-             if (status !== undefined) {
-                 if (status === 'ACTIVE') {
-                     await valkey.sadd('active:symbols', symbolUpper);
-                 } else {
-                     await valkey.srem('active:symbols', symbolUpper);
-                 }
-             }
-
-             console.log(`[ADMIN] Symbol updated: ${symbolUpper}`);
-             return { statusCode: 200, headers, body: JSON.stringify({ message: 'Symbol updated', symbol: symbolUpper }) };
-        }
-        
-        // === DELETE /symbols/{symbol} ===
-        if (method === 'DELETE') {
-             if (!isAdmin(event)) return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
-             
-             let targetSymbol = symbolParam;
-             if (!targetSymbol) {
-                 try {
-                     const body = JSON.parse(event.body || '{}');
-                     targetSymbol = body.symbol;
-                 } catch (e) {}
-             }
-             
-             if (targetSymbol) {
-                 const symbolUpper = targetSymbol.toUpperCase();
-                 await dynamodb.send(new DeleteCommand({
-                     TableName: SYMBOLS_TABLE,
-                     Key: { symbol: symbolUpper }
-                 }));
-                 
-                 await Promise.all([
-                     valkey.srem('active:symbols', symbolUpper),
-                     valkey.srem('subscribed:symbols', symbolUpper),
-                     valkey.del(`depth:${symbolUpper}`),
-                     valkey.del(`ticker:${symbolUpper}`)
-                 ]);
-                 
-                 return { statusCode: 200, headers, body: JSON.stringify({ message: 'Symbol deleted (Metadata only)' }) };
-             }
-        }
-
-        return { statusCode: 404, headers, body: JSON.stringify({ error: 'Not Found' }) };
-
-    } catch (e) {
-        console.error('Admin Error:', e);
-        return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
+    // requests - 관리자 전용
+    if (q.type === 'requests') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const { data, error } = await supabase.from('creator_requests').select('*').eq('status', q.status || 'pending').order('created_at', { ascending: true });
+      if (error) return err(500, error.message);
+      return ok(data || []);
     }
+
+    // symbols - 개별 종목 또는 전체 목록 (공개 엔드포인트)
+    if (q.type === 'symbols' || (m === 'GET' && !q.type && !path.includes('sync'))) {
+      const symbolMatch = path.match(/\/symbols\/([^\/]+)/);
+      if (symbolMatch && symbolMatch[1]) {
+        const sym = symbolMatch[1].toUpperCase();
+        const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (!Item) return err(404, 'Symbol not found');
+        return ok({ symbol: Item.symbol, name: Item.name || Item.symbol, logo_url: Item.logoUrl || null, logoUrl: Item.logoUrl || null, status: Item.status || 'ACTIVE', platform: Item.platform || 'ETC', creatorUrl: Item.creatorUrl || null, profileUrl: Item.profileUrl || null, description: Item.description || null, verified: Item.verified || false, trustScore: Item.trustScore, dividendStatus: Item.dividendStatus || 'pending', dividendPerShare: Item.dividendPerShare || 0, platformStats: Item.platformStats || {}, socialLinks: Item.socialLinks || {}, tags: Item.tags || [], categories: Item.categories || [] });
+      }
+      const search = q.q ? q.q.toUpperCase() : null;
+      const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
+      let r = Items || [];
+      if (search) r = r.filter(s => s.symbol.includes(search) || (s.name && s.name.toUpperCase().includes(search)));
+      return ok(r);
+    }
+
+    // sync - 관리자 전용
+    if (m === 'POST' && path.includes('sync')) {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
+      const deletedSymbols = await valkey.smembers('deleted:symbols');
+      const deletedSet = new Set(deletedSymbols);
+      if (Items?.length > 0) {
+        const p = valkey.pipeline();
+        p.del('active:symbols');
+        let syncedCount = 0;
+        for (const i of Items) {
+          if (deletedSet.has(i.symbol)) continue;
+          if (i.status === 'ACTIVE') {
+            p.sadd('active:symbols', i.symbol);
+            p.set(`ticker:${i.symbol}`, JSON.stringify({ symbol: i.symbol, price: i.listingPrice || 0, changePercent: 0, volume: 0 }));
+            syncedCount++;
+          }
+        }
+        await p.exec();
+        return ok({ synced: syncedCount, skippedDeleted: deletedSymbols.length });
+      }
+      return ok({ synced: 0 });
+    }
+
+    // 종목 상장 API (POST, action=listing) - 관리자 전용
+    if (m === 'POST' && q.action === 'listing') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const { symbol, name, listingPrice, totalShares, platform, creatorId, ownerId, description, logoUrl, creatorUrl, profileUrl, tags, categories } = b;
+
+      if (!symbol || typeof symbol !== 'string' || symbol.trim() === '') return err(400, 'symbol is required');
+      if (!name || typeof name !== 'string' || name.trim() === '') return err(400, 'name is required');
+      if (typeof listingPrice !== 'number' || listingPrice <= 0) return err(400, 'listingPrice must be a positive number');
+      if (typeof totalShares !== 'number' || totalShares <= 0) return err(400, 'totalShares must be a positive number');
+      if (!platform || typeof platform !== 'string' || platform.trim() === '') return err(400, 'platform is required');
+
+      const sym = symbol.toUpperCase().trim();
+      const now = new Date().toISOString();
+
+      const isDeleted = await valkey.sismember('deleted:symbols', sym);
+      if (isDeleted) return err(400, `Symbol ${sym} was previously deleted. Use action=restore to restore it.`);
+
+      const { Item: existing } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (existing) return err(409, `Symbol ${sym} already exists`);
+
+      const item = {
+        symbol: sym,
+        name: name.trim(),
+        listingPrice,
+        totalShares,
+        platform: platform.trim(),
+        status: 'PENDING',
+        creatorId: creatorId || null,
+        ownerId: ownerId || null,
+        description: description || null,
+        logoUrl: logoUrl || null,
+        creatorUrl: creatorUrl || null,
+        profileUrl: profileUrl || null,
+        tags: tags || [],
+        categories: categories || [],
+        verified: false,
+        trustScore: 5,
+        platformStats: {},
+        socialLinks: {},
+        prevClose: null,
+        lastClose: null,
+        createdAt: now,
+        updatedAt: now
+      };
+
+      await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: item }));
+      await valkey.set(`symbol:${sym}:listingPrice`, listingPrice.toString());
+
+      const tickerData = {
+        symbol: sym,
+        price: listingPrice,
+        open: listingPrice,
+        high: listingPrice,
+        low: listingPrice,
+        close: listingPrice,
+        prevClose: listingPrice,
+        changePercent: 0,
+        change: 0,
+        volume: 0,
+        value: 0,
+        trades: 0,
+        updatedAt: now
+      };
+      await valkey.set(`ticker:${sym}`, JSON.stringify(tickerData));
+
+      return ok({ success: true, symbol: sym, status: 'PENDING', message: `Symbol ${sym} listed successfully. Use activate action to make it active.` });
+    }
+
+    // 종목 활성화 API (POST, action=activate) - 관리자 전용
+    if (m === 'POST' && q.action === 'activate') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const { symbol } = b;
+
+      if (!symbol || typeof symbol !== 'string') return err(400, 'symbol is required');
+      const sym = symbol.toUpperCase().trim();
+
+      const isDeleted = await valkey.sismember('deleted:symbols', sym);
+      if (isDeleted) return err(400, `Symbol ${sym} was deleted and cannot be activated`);
+
+      const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (!Item) return err(404, `Symbol ${sym} not found`);
+      if (Item.status === 'ACTIVE') return err(400, `Symbol ${sym} is already active`);
+
+      const now = new Date().toISOString();
+
+      await dynamodb.send(new UpdateCommand({
+        TableName: SYMBOLS_TABLE,
+        Key: { symbol: sym },
+        UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': 'ACTIVE', ':updatedAt': now }
+      }));
+
+      await valkey.sadd('subscribed:symbols', sym);
+      await valkey.sadd('active:symbols', sym);
+
+      return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
+    }
+
+    // 종목 수정 API (PUT) - 관리자 전용
+    if (m === 'PUT' && (q.type === 'symbols' || path.includes('/symbols/'))) {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const symbolMatch = path.match(/\/symbols\/([^\/]+)/);
+      const sym = (symbolMatch?.[1] || b.symbol || '').toUpperCase().trim();
+      if (!sym) return err(400, 'symbol is required');
+
+      const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (!Item) return err(404, `Symbol ${sym} not found`);
+
+      const now = new Date().toISOString();
+      const updateExprParts = ['updatedAt = :updatedAt'];
+      const exprAttrNames = {};
+      const exprAttrValues = { ':updatedAt': now };
+
+      const updateableFields = ['name', 'listingPrice', 'totalShares', 'creatorId', 'ownerId', 'description', 'logoUrl', 'creatorUrl', 'profileUrl', 'platform', 'verified', 'trustScore', 'dividendStatus', 'dividendPerShare', 'tags', 'categories', 'platformStats', 'socialLinks', 'prevClose', 'lastClose'];
+
+      for (const field of updateableFields) {
+        if (b[field] !== undefined) {
+          if (field === 'listingPrice' && (typeof b[field] !== 'number' || b[field] <= 0)) {
+            return err(400, 'listingPrice must be a positive number');
+          }
+          if (field === 'totalShares' && (typeof b[field] !== 'number' || b[field] <= 0)) {
+            return err(400, 'totalShares must be a positive number');
+          }
+
+          updateExprParts.push(`#${field} = :${field}`);
+          exprAttrNames[`#${field}`] = field;
+          exprAttrValues[`:${field}`] = b[field];
+        }
+      }
+
+      if (b.status !== undefined) {
+        const validStatuses = ['PENDING', 'ACTIVE', 'SUSPENDED', 'DELISTED'];
+        if (!validStatuses.includes(b.status)) return err(400, `Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+        updateExprParts.push('#status = :status');
+        exprAttrNames['#status'] = 'status';
+        exprAttrValues[':status'] = b.status;
+
+        if (b.status === 'ACTIVE') {
+          await valkey.sadd('subscribed:symbols', sym);
+          await valkey.sadd('active:symbols', sym);
+        } else if (b.status !== 'ACTIVE' && Item.status === 'ACTIVE') {
+          await valkey.srem('subscribed:symbols', sym);
+          await valkey.srem('active:symbols', sym);
+        }
+      }
+
+      await dynamodb.send(new UpdateCommand({
+        TableName: SYMBOLS_TABLE,
+        Key: { symbol: sym },
+        UpdateExpression: 'SET ' + updateExprParts.join(', '),
+        ExpressionAttributeNames: Object.keys(exprAttrNames).length > 0 ? exprAttrNames : undefined,
+        ExpressionAttributeValues: exprAttrValues
+      }));
+
+      if (b.listingPrice !== undefined) {
+        await valkey.set(`symbol:${sym}:listingPrice`, b.listingPrice.toString());
+      }
+
+      return ok({ success: true, symbol: sym, message: `Symbol ${sym} updated successfully` });
+    }
+
+    // 관리자 알림 API (GET, type=alerts) - 관리자 전용
+    if (m === 'GET' && q.type === 'alerts') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const alerts = [];
+
+      const engineErrors = await valkey.lrange('engine:errors', 0, 99);
+      if (engineErrors.length > 0) {
+        alerts.push({
+          type: 'ENGINE_ERRORS',
+          severity: 'high',
+          count: engineErrors.length,
+          items: engineErrors.map(e => {
+            try { return JSON.parse(e); } catch { return { message: e }; }
+          })
+        });
+      }
+
+      const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
+      const missingPriceSymbols = [];
+
+      for (const item of (Items || [])) {
+        const hasPrevClose = item.prevClose !== null && item.prevClose !== undefined && item.prevClose > 0;
+        const hasListingPrice = item.listingPrice !== null && item.listingPrice !== undefined && item.listingPrice > 0;
+        const redisListingPrice = await valkey.get(`symbol:${item.symbol}:listingPrice`);
+
+        if (!hasPrevClose && !hasListingPrice && !redisListingPrice) {
+          missingPriceSymbols.push({
+            symbol: item.symbol,
+            name: item.name,
+            status: item.status,
+            hasPrevClose,
+            hasListingPrice,
+            hasRedisListingPrice: !!redisListingPrice
+          });
+        }
+      }
+
+      if (missingPriceSymbols.length > 0) {
+        alerts.push({
+          type: 'MISSING_PRICE_DATA',
+          severity: 'medium',
+          count: missingPriceSymbols.length,
+          description: 'Symbols without prevClose or listingPrice - engine may not work correctly',
+          items: missingPriceSymbols
+        });
+      }
+
+      const runningSymbols = await valkey.smembers('mm:running:symbols');
+      if (runningSymbols.length > 0) {
+        alerts.push({
+          type: 'MARKET_MAKER_RUNNING',
+          severity: 'info',
+          count: runningSymbols.length,
+          items: runningSymbols
+        });
+      }
+
+      return ok({
+        timestamp: new Date().toISOString(),
+        totalAlerts: alerts.length,
+        alerts
+      });
+    }
+
+    // 크리에이터 등록 신청/승인/거절 API (POST)
+    if (m === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      const action = q.action || b.action;
+
+      // action=request: 크리에이터 등록 신청 (공개 엔드포인트)
+      if (action === 'request') {
+        const { creator_name, creator_url, platform, logo_url } = b;
+        if (!creator_name || !creator_url) return err(400, 'creator_name and creator_url are required');
+
+        const { data, error: insertErr } = await supabase
+          .from('creator_requests')
+          .insert({
+            creator_name,
+            creator_url,
+            platform: platform || 'ETC',
+            logo_url: logo_url || null,
+            status: 'pending',
+            created_at: new Date().toISOString()
+          })
+          .select()
+          .single();
+
+        if (insertErr) {
+          console.error('[REQUEST] Supabase Insert Error:', insertErr);
+          return err(500, 'Failed to submit request: ' + insertErr.message);
+        }
+
+        console.log('[REQUEST] Created:', data);
+        return ok({ message: 'Request submitted successfully', request: data });
+      }
+
+      // action=approve: 크리에이터 승인 - 관리자 전용
+      if (action === 'approve') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { requestId, symbol, name, logo_url } = b;
+        if (!symbol || !name) return err(400, 'symbol and name are required');
+
+        const sym = symbol.toUpperCase().trim();
+        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        if (isDeleted) return err(400, `Symbol ${sym} was previously deleted and cannot be approved`);
+
+        console.log(`[APPROVE] Processing: ${symbol}, ReqID: ${requestId}`);
+
+        let detectedPlatform = 'ETC';
+        let creatorUrl = '';
+        if (requestId) {
+          const { data: reqData } = await supabase.from('creator_requests').select('creator_url, platform').eq('id', requestId).single();
+          if (reqData) {
+            creatorUrl = reqData.creator_url || '';
+            detectedPlatform = reqData.platform || detectPlatform(creatorUrl);
+          }
+          await supabase.from('creator_requests').update({ status: 'approved', platform: detectedPlatform }).eq('id', requestId);
+        }
+
+        const now = new Date().toISOString();
+        const newSymbol = {
+          symbol: symbol.toUpperCase(),
+          name: name || symbol.toUpperCase(),
+          base_asset: symbol.toUpperCase(),
+          quote_asset: 'BOLT',
+          status: 'ACTIVE',
+          listingDate: now,
+          listingPrice: 0,
+          platform: detectedPlatform,
+          creatorUrl,
+          profileUrl: `/creator/${symbol.toUpperCase()}`,
+          logoUrl: logo_url || '',
+          marketCap: 0, totalSupply: 0, circulatingSupply: 0, volume24h: 0, priceChange24h: 0,
+          allTimeHigh: 0, allTimeLow: 0,
+          platformStats: { subscribers: 0, followers: 0, views: 0, videos: 0, lastUpdated: null },
+          tags: [], categories: [], verified: false, trustScore: null, dividendStatus: 'pending', dividendPerShare: 0, userRating: 0, ratingCount: 0,
+          description: `Official symbol for Creator ${name}`
+        };
+
+        await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
+        await valkey.sadd('active:symbols', symbol.toUpperCase());
+
+        return ok({ message: `Symbol ${symbol} approved and created`, symbol: newSymbol });
+      }
+
+      // action=reject: 크리에이터 거절 - 관리자 전용
+      if (action === 'reject') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { requestId, reason } = b;
+        if (!requestId) return err(400, 'requestId is required');
+
+        console.log(`[REJECT] Processing: RequestId: ${requestId}`);
+
+        const { data, error: rejectErr } = await supabase
+          .from('creator_requests')
+          .update({ status: 'rejected', processed_at: new Date().toISOString(), admin_note: reason || 'Rejected by admin' })
+          .eq('id', requestId)
+          .select();
+
+        if (rejectErr) {
+          console.error('[REJECT] Update Error:', rejectErr);
+          return err(500, 'Failed to reject request: ' + rejectErr.message);
+        }
+
+        return ok({ message: 'Request rejected', data });
+      }
+    }
+
+    // 종목 삭제 API (DELETE) - 관리자 전용
+    if (m === 'DELETE') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const sym = (b.symbol || '').toUpperCase().trim();
+      if (!sym) return err(400, 'symbol is required');
+
+      console.log(`[DELETE] Processing symbol: ${sym}`);
+
+      const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (!Item) return err(404, `Symbol ${sym} not found`);
+
+      await valkey.sadd('deleted:symbols', sym);
+
+      const pipe = valkey.pipeline();
+      pipe.del(`ticker:${sym}`);
+      pipe.del(`depth:${sym}`);
+      pipe.del(`symbol:${sym}:listingPrice`);
+      pipe.srem('active:symbols', sym);
+      pipe.srem('subscribed:symbols', sym);
+      pipe.del(`candle:1m:${sym}`);
+      pipe.del(`candle:5m:${sym}`);
+      pipe.del(`candle:15m:${sym}`);
+      pipe.del(`candle:30m:${sym}`);
+      pipe.del(`candle:1h:${sym}`);
+      pipe.del(`candle:4h:${sym}`);
+      pipe.del(`candle:1d:${sym}`);
+      pipe.del(`ohlc:${sym}`);
+      pipe.del(`mm:config:${sym}`);
+      pipe.del(`mm:price:${sym}`);
+      pipe.del(`mm:orderCount:${sym}`);
+      pipe.srem('mm:running:symbols', sym);
+      pipe.del(`symbol:${sym}:main`);
+      pipe.del(`symbol:${sym}:subscribers`);
+      await pipe.exec();
+
+      try {
+        const db = await getPg();
+        await db.query('DELETE FROM market_maker_configs WHERE symbol = $1', [sym]);
+        console.log(`[DELETE] MarketMaker config deleted for ${sym}`);
+      } catch (pgErr) {
+        console.warn(`[DELETE] PostgreSQL cleanup warning: ${pgErr.message}`);
+      }
+
+      await dynamodb.send(new DeleteCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+
+      console.log(`[DELETE] Symbol ${sym} deleted successfully`);
+      return ok({ success: true, symbol: sym, message: `Symbol ${sym} and all related data deleted successfully` });
+    }
+
+    return err(404, 'Not found');
+  } catch (e) { console.error('Error:', e); return err(500, e.message); }
 };

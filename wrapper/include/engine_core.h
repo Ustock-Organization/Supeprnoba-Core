@@ -4,7 +4,7 @@
 #include "order.h"
 #include "market_data_handler.h"
 #include <map>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -44,7 +44,7 @@ private:
     
     std::map<std::string, OrderBookPtr> books_;
     std::map<std::string, std::map<std::string, OrderPtr>> order_maps_;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex rw_mutex_;  // shared_mutex for read-write locking
     MarketDataHandler* handler_;
     
     uint64_t total_orders_processed_ = 0;
