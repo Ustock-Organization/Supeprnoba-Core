@@ -31,10 +31,12 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
                                    0, 0, "ACCEPTED");
     }
     
-    // Kinesis로 ACCEPTED 이벤트 발행 (order-status 스트림)
+    // Kinesis로 ACCEPTED 이벤트 발행 (order-status 스트림) - 주문 정보 포함
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                      order->user_id(), "ACCEPTED", "");
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
+                                      order->user_id(), "ACCEPTED", "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published ACCEPTED event to Kinesis:", order->order_id());
     }
 }
@@ -91,14 +93,38 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     if (fill_price > day.high_price) day.high_price = fill_price;
     if (fill_price < day.low_price) day.low_price = fill_price;
     
-    // 현재가 및 변동률 계산
+    // 현재가 및 변동률 계산 (prev_close 기준)
     day.last_price = fill_price;
     day.volume += fill_qty;  // 거래량 누적
-    if (day.open_price > 0) {
-        day.change_rate = ((double)fill_price - (double)day.open_price) / (double)day.open_price * 100.0;
+
+    // prev_close 로드 (아직 안 되어 있으면)
+    if (day.prev_close == 0) {
+        loadPrevClose(symbol);
     }
-    
-    Logger::info("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume, "change:", day.change_rate, "%");
+
+    // 변동률 계산: prev_close 기준, 없으면 listingPrice 조회
+    uint64_t base_price = day.prev_close;
+    if (base_price == 0 && redis_ && redis_->isConnected()) {
+        // Redis에서 listingPrice 조회
+        auto listing_price_opt = redis_->get("symbol:" + symbol + ":listingPrice");
+        if (listing_price_opt.has_value() && !listing_price_opt.value().empty()) {
+            try {
+                base_price = std::stoull(listing_price_opt.value());
+                Logger::info("Using listingPrice for", symbol, ":", base_price);
+            } catch (...) {
+                Logger::warn("Failed to parse listingPrice for", symbol);
+            }
+        }
+    }
+
+    if (base_price == 0) {
+        Logger::error("CRITICAL: No prev_close or listingPrice for symbol:", symbol);
+        day.change_rate = 0.0;
+    } else {
+        day.change_rate = ((double)fill_price - (double)base_price) / (double)base_price * 100.0;
+    }
+
+    Logger::info("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume, "change:", day.change_rate, "% (base:", base_price, ")");
     
     // === OHLC 캐시 저장 (당일만) ===
     auto now = std::chrono::system_clock::now();
@@ -297,16 +323,35 @@ void MarketDataHandler::on_trade(const OrderBook* book,
     // 고가/저가 업데이트
     if (price > day.high_price) day.high_price = price;
     if (price < day.low_price) day.low_price = price;
-    
-    // 현재가 및 변동률 계산
+
+    // 현재가 및 변동률 계산 (prev_close 기준)
     day.last_price = price;
-    if (day.open_price > 0) {
-        day.change_rate = ((double)price - (double)day.open_price) / (double)day.open_price * 100.0;
+
+    // prev_close 로드 (아직 안 되어 있으면)
+    if (day.prev_close == 0) {
+        loadPrevClose(symbol);
     }
-    
+
+    // 변동률 계산: prev_close 기준, 없으면 listingPrice 조회
+    uint64_t base_price = day.prev_close;
+    if (base_price == 0 && redis_ && redis_->isConnected()) {
+        auto listing_price_opt = redis_->get("symbol:" + symbol + ":listingPrice");
+        if (listing_price_opt.has_value() && !listing_price_opt.value().empty()) {
+            try {
+                base_price = std::stoull(listing_price_opt.value());
+            } catch (...) {}
+        }
+    }
+
+    if (base_price == 0) {
+        day.change_rate = 0.0;
+    } else {
+        day.change_rate = ((double)price - (double)base_price) / (double)base_price * 100.0;
+    }
+
     // Ticker 캐시 업데이트 (Sub 데이터용)
     updateTickerCache(symbol, price);
-    
+
     if (producer_) {
         producer_->publishTrade(symbol, qty, price);
     }
@@ -410,20 +455,22 @@ int MarketDataHandler::getCurrentTradingDay() const {
 void MarketDataHandler::checkDayReset(const std::string& symbol) {
     int today = getCurrentTradingDay();
     DayData& day = symbol_day_data_[symbol];
-    
+
     if (day.trading_day != today) {
         // 전일 데이터 저장 (Valkey에 백업)
         if (day.trading_day > 0 && day.open_price > 0) {
             savePrevDayData(symbol, day);
         }
-        
-        // 전일 변동률 보존 후 리셋
+
+        // 전일 종가와 변동률 보존 후 리셋
+        uint64_t prev_close = day.last_price;  // 전일 종가 보존
         double prev_change = day.change_rate;
         day = DayData{};
         day.trading_day = today;
+        day.prev_close = prev_close;
         day.prev_change_rate = prev_change;
-        
-        Logger::info("Day reset for", symbol, "new trading day:", today);
+
+        Logger::info("Day reset for", symbol, "new trading day:", today, "prev_close:", prev_close);
     }
 }
 
@@ -446,9 +493,9 @@ void MarketDataHandler::savePrevDayData(const std::string& symbol, const DayData
 
 void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t price) {
     if (!redis_ || !redis_->isConnected()) return;
-    
+
     const DayData& day = symbol_day_data_[symbol];
-    
+
     // Ticker JSON (Sub 데이터용)
     nlohmann::json ticker;
     ticker["e"] = "t";  // event = ticker
@@ -458,9 +505,55 @@ void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t pr
     ticker["p"] = price;
     ticker["c"] = std::round(day.change_rate * 100) / 100.0;  // 소수점 2자리
     ticker["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
-    
+
     redis_->set("ticker:" + symbol, ticker.dump());
     Logger::debug("Ticker saved:", symbol, "price:", price, "change:", day.change_rate, "%");
+}
+
+void MarketDataHandler::loadPrevClose(const std::string& symbol) {
+    DayData& day = symbol_day_data_[symbol];
+
+    // 이미 로드되어 있으면 스킵
+    if (day.prev_close > 0) return;
+
+    if (!redis_ || !redis_->isConnected()) {
+        Logger::warn("Cannot load prev_close for", symbol, "- Redis not connected");
+        return;
+    }
+
+    // prev:{symbol}에서 전일 종가 조회
+    auto prev_data_opt = redis_->get("prev:" + symbol);
+    if (prev_data_opt.has_value() && !prev_data_opt.value().empty()) {
+        try {
+            nlohmann::json prev_json = nlohmann::json::parse(prev_data_opt.value());
+            if (prev_json.contains("close") && !prev_json["close"].is_null()) {
+                day.prev_close = prev_json["close"].get<uint64_t>();
+                Logger::info("Loaded prev_close from prev:", symbol, "=", day.prev_close);
+            }
+            if (prev_json.contains("change_rate") && !prev_json["change_rate"].is_null()) {
+                day.prev_change_rate = prev_json["change_rate"].get<double>();
+            }
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to parse prev data for", symbol, ":", e.what());
+        }
+    }
+
+    // prev_close가 없으면 listingPrice 시도
+    if (day.prev_close == 0) {
+        auto listing_price_opt = redis_->get("symbol:" + symbol + ":listingPrice");
+        if (listing_price_opt.has_value() && !listing_price_opt.value().empty()) {
+            try {
+                day.prev_close = std::stoull(listing_price_opt.value());
+                Logger::info("Loaded listingPrice as prev_close for", symbol, "=", day.prev_close);
+            } catch (...) {
+                Logger::warn("Failed to parse listingPrice for", symbol);
+            }
+        }
+    }
+
+    if (day.prev_close == 0) {
+        Logger::error("CRITICAL: No prev_close or listingPrice found for symbol:", symbol);
+    }
 }
 
 } // namespace aws_wrapper

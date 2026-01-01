@@ -35,7 +35,11 @@ public:
                                     const std::string& order_id,
                                     const std::string& user_id,
                                     const std::string& status,
-                                    const std::string& reason = "") = 0;
+                                    const std::string& reason = "",
+                                    uint64_t price = 0,
+                                    uint64_t quantity = 0,
+                                    bool is_buy = true,
+                                    const std::string& order_type = "") = 0;
     
     virtual void flush(int timeout_ms = 1000) = 0;
 };

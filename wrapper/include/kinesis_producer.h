@@ -38,7 +38,11 @@ public:
                             const std::string& order_id,
                             const std::string& user_id,
                             const std::string& status,
-                            const std::string& reason = "") override;
+                            const std::string& reason = "",
+                            uint64_t price = 0,
+                            uint64_t quantity = 0,
+                            bool is_buy = true,
+                            const std::string& order_type = "") override;
     
     void flush(int timeout_ms = 1000) override;
     

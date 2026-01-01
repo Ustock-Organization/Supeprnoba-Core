@@ -112,7 +112,11 @@ void KinesisProducer::publishOrderStatus(const std::string& symbol,
                                           const std::string& order_id,
                                           const std::string& user_id,
                                           const std::string& status,
-                                          const std::string& reason) {
+                                          const std::string& reason,
+                                          uint64_t price,
+                                          uint64_t quantity,
+                                          bool is_buy,
+                                          const std::string& order_type) {
     nlohmann::json j;
     j["event"] = "ORDER_STATUS";
     j["symbol"] = symbol;
@@ -122,12 +126,18 @@ void KinesisProducer::publishOrderStatus(const std::string& symbol,
     if (!reason.empty()) {
         j["reason"] = reason;
     }
+    // ACCEPTED 상태일 때 주문 정보 포함 (order-status-processor에서 DynamoDB에 저장)
+    if (status == "ACCEPTED" && quantity > 0) {
+        j["price"] = price;
+        j["quantity"] = quantity;
+        j["side"] = is_buy ? "BUY" : "SELL";
+        j["type"] = order_type.empty() ? "LIMIT" : order_type;
+    }
     j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    
-    // 모든 ORDER_STATUS 이벤트는 order-status 스트림으로 발행
+
     produce(status_stream_, symbol, j.dump());
-    Logger::debug("Published ORDER_STATUS to order-status stream:", order_id, status, "user:", user_id);
+    Logger::debug("Published ORDER_STATUS:", order_id, status, "user:", user_id);
 }
 
 void KinesisProducer::flush(int timeout_ms) {
