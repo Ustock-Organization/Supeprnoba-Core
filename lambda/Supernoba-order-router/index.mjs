@@ -15,6 +15,7 @@ let supabase = null;
 
 // === Config ===
 const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 const KINESIS_STREAM = process.env.KINESIS_ORDERS_STREAM || 'supernoba-orders';
 const HEADERS = { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' };
 
@@ -48,27 +49,27 @@ async function unlockBalance(db, userId, amount) {
 }
 
 // === Holdings Lock (DynamoDB - SELL orders) ===
+// Fixed: TOCTOU resolved - single atomic UpdateCommand without GetCommand
 async function lockHoldings(userId, symbol, amount) {
   if (amount <= 0) return { success: true };
 
   try {
-    const { Item } = await ddb.send(new GetCommand({ TableName: HOLDINGS_TABLE, Key: { user_id: userId, symbol: symbol.toUpperCase() } }));
-    if (!Item) return { success: false, error: 'INSUFFICIENT_FUNDS', message: `보유 자산 없음 (${symbol})` };
-
-    const available = (Item.quantity || 0) - (Item.locked || 0);
-    if (available < amount) return { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (가용: ${available})` };
-
+    // 단일 원자적 UpdateCommand로 TOCTOU 해결
     await ddb.send(new UpdateCommand({
       TableName: HOLDINGS_TABLE,
       Key: { user_id: userId, symbol: symbol.toUpperCase() },
-      UpdateExpression: 'SET locked = :locked, updated_at = :now',
-      ConditionExpression: 'quantity >= :needed',
-      ExpressionAttributeValues: { ':locked': (Item.locked || 0) + amount, ':now': new Date().toISOString(), ':needed': (Item.locked || 0) + amount }
+      UpdateExpression: 'SET locked = if_not_exists(locked, :zero) + :amount, updated_at = :now',
+      ConditionExpression: 'attribute_exists(quantity) AND (quantity - if_not_exists(locked, :zero)) >= :amount',
+      ExpressionAttributeValues: {
+        ':amount': amount,
+        ':zero': 0,
+        ':now': new Date().toISOString()
+      }
     }));
     return { success: true };
   } catch (e) {
     return e.name === 'ConditionalCheckFailedException'
-      ? { success: false, error: 'INSUFFICIENT_FUNDS', message: '잔고 부족' }
+      ? { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (${symbol})` }
       : { success: false, error: 'LOCK_FAILED', message: e.message };
   }
 }
@@ -153,7 +154,29 @@ export const handler = async (event) => {
     // === CANCEL Order ===
     if (action === 'CANCEL') {
       if (!order_id) return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'Missing order_id' }) };
+
       try {
+        // Fixed: 주문 소유권 및 상태 확인
+        const { Item: order } = await ddb.send(new GetCommand({
+          TableName: ORDERS_TABLE,
+          Key: { user_id, order_id }
+        }));
+
+        if (!order) {
+          return { statusCode: 404, headers: HEADERS, body: JSON.stringify({
+            error: 'ORDER_NOT_FOUND',
+            message: '주문을 찾을 수 없거나 권한이 없습니다'
+          })};
+        }
+
+        // 이미 취소/완료된 주문인지 확인
+        if (['CANCELLED', 'FILLED', 'REJECTED'].includes(order.status)) {
+          return { statusCode: 400, headers: HEADERS, body: JSON.stringify({
+            error: 'ORDER_NOT_CANCELLABLE',
+            message: `주문 상태가 ${order.status}입니다`
+          })};
+        }
+
         await kinesis.send(new PutRecordCommand({
           StreamName: KINESIS_STREAM,
           Data: Buffer.from(JSON.stringify({ action: 'CANCEL', order_id, user_id, symbol: symbol.toUpperCase(), timestamp: Date.now() })),
@@ -161,7 +184,7 @@ export const handler = async (event) => {
         }));
         return { statusCode: 200, headers: HEADERS, body: JSON.stringify({ message: 'Cancel Sent' }) };
       } catch (e) {
-        console.error('[order-router] CANCEL Kinesis failed:', e.message);
+        console.error('[order-router] CANCEL failed:', e.message);
         return { statusCode: 500, headers: HEADERS, body: JSON.stringify({ error: 'Cancel failed' }) };
       }
     }

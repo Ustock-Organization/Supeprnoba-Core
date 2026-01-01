@@ -147,9 +147,33 @@ async function handleCancel(data) {
         if (!orderResult.Item) return;
 
         const order = orderResult.Item;
+
+        // Idempotency check: 이미 처리된 취소인지 확인
+        if (order.cancel_processed === true) {
+            console.log(`[order-status-processor] Cancel already processed: ${data.order_id}`);
+            return;
+        }
+
         const remainingQty = Number(order.quantity) - Number(order.filled_qty || 0);
 
         if (remainingQty <= 0) return;
+
+        // 먼저 cancel_processed 플래그 설정 (원자적)
+        try {
+            await ddb.send(new UpdateCommand({
+                TableName: ORDERS_TABLE,
+                Key: { user_id: data.user_id, order_id: data.order_id },
+                UpdateExpression: 'SET cancel_processed = :true',
+                ConditionExpression: 'attribute_not_exists(cancel_processed) OR cancel_processed = :false',
+                ExpressionAttributeValues: { ':true': true, ':false': false }
+            }));
+        } catch (e) {
+            if (e.name === 'ConditionalCheckFailedException') {
+                console.log(`[order-status-processor] Cancel already being processed: ${data.order_id}`);
+                return;
+            }
+            throw e;
+        }
 
         if (order.side === 'BUY') {
             // BUY 취소: Supabase 잔고 언락

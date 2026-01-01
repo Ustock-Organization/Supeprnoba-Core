@@ -110,10 +110,12 @@ export const handler = async (event) => {
     const failures = results.filter(r => r.status === 'rejected');
     if (failures.length > 0) {
         console.error(`Batch completed with ${failures.length} errors.`);
-        // Kinesis partial batch failure response
-        const failedRecords = failures.map((_, idx) => {
-            const failedIdx = results.findIndex((r, i) => r.status === 'rejected' && i >= idx);
-            return { itemIdentifier: records[failedIdx].kinesis.sequenceNumber };
+        // Kinesis partial batch failure response (fixed: proper index mapping)
+        const failedRecords = [];
+        results.forEach((r, i) => {
+            if (r.status === 'rejected') {
+                failedRecords.push({ itemIdentifier: records[i].kinesis.sequenceNumber });
+            }
         });
         return { batchItemFailures: failedRecords };
     }

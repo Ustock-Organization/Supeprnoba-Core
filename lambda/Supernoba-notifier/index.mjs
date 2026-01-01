@@ -20,19 +20,37 @@ const apiClient = endpoint ? new ApiGatewayManagementApiClient({
     endpoint: endpoint
 }) : null;
 
-// Redis Client
+// Redis Client (Fixed: lazyConnect for cold start optimization)
 const redis = new Redis({
     host: REDIS_HOST,
     port: REDIS_PORT,
     tls: VALKEY_TLS ? {} : undefined,
+    lazyConnect: true,
+    enableOfflineQueue: false,
     connectTimeout: 5000,
     maxRetriesPerRequest: 1,
+    retryStrategy: (times) => times <= 2 ? 1000 : null,
 });
 
 redis.on('error', (err) => console.error('Redis Error:', err.message));
 
+// Ensure Redis connection before operations
+async function ensureConnected() {
+    if (redis.status === 'ready') return true;
+    try {
+        if (redis.status === 'wait') await redis.connect();
+        return redis.status === 'ready';
+    } catch (err) {
+        console.error('[notifier] Redis connect error:', err.message);
+        return false;
+    }
+}
+
 export const handler = async (event) => {
     console.log(`[notifier] Received ${event.Records.length} records.`);
+
+    // Ensure Redis is connected
+    await ensureConnected();
 
     const failedRecords = [];
 
