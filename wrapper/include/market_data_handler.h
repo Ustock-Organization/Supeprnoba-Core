@@ -23,6 +23,7 @@ using BookDepth = liquibook::book::Depth<10>;
 
 // 일일 시장 데이터 (OHLC + 변동률)
 struct DayData {
+    uint64_t prev_close = 0;    // 전일 종가 (변동률 계산 기준)
     uint64_t open_price = 0;    // 당일 시가 (첫 체결가)
     uint64_t high_price = 0;    // 당일 고가
     uint64_t low_price = 0;     // 당일 저가
@@ -74,6 +75,7 @@ public:
     DayData& getDayData(const std::string& symbol);
     void checkDayReset(const std::string& symbol);
     int getCurrentTradingDay() const;
+    void loadPrevClose(const std::string& symbol);
 
 private:
     IProducer* producer_;
