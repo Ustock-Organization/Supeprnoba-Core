@@ -8,25 +8,19 @@ import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from '@aws-sdk/lib-
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 
-// === Auth Layer Import ===
-// Layer에서 import하거나 로컬 fallback
-let verifyAuth, verifySelf, authErrorResponse;
+// === Auth Layer Import (Simplified) ===
+let auth;
 try {
-  const authModule = await import('/opt/nodejs/verifyAuth.mjs');
-  verifyAuth = authModule.verifyAuth;
-  verifySelf = authModule.verifySelf;
-  authErrorResponse = authModule.authErrorResponse;
-} catch (e) {
-  // Layer가 없을 경우 인증 스킵 (개발 환경용)
-  console.warn('[order-router] Auth layer not available, authentication disabled');
-  verifyAuth = async () => ({ success: true, userId: null, anonymous: true });
-  verifySelf = async () => ({ success: true, userId: null, anonymous: true });
-  authErrorResponse = (result) => ({
-    statusCode: 401,
-    headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: result.error, message: result.message })
-  });
+  auth = await import('/opt/nodejs/verifyAuth.mjs');
+} catch {
+  const { createFallbackAuth } = await import('/opt/nodejs/verifyAuth.mjs').catch(() => ({}));
+  auth = createFallbackAuth?.('order-router') || {
+    verifyAuth: async () => ({ success: true, anonymous: true }),
+    verifySelf: async () => ({ success: true, anonymous: true }),
+    authErrorResponse: (r) => ({ statusCode: 401, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify(r) })
+  };
 }
+const { verifySelf, authErrorResponse } = auth;
 
 // === Clients (Singleton) ===
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
@@ -39,7 +33,56 @@ const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
 const KINESIS_STREAM = process.env.KINESIS_ORDERS_STREAM || 'supernoba-orders';
 const HEADERS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Content-Type': 'application/json' };
 
+// === Singletons ===
+const testerCache = new Map(); // userId -> { isTester: boolean, expiry: timestamp }
+const TESTER_CACHE_TTL = 5 * 60 * 1000; // 5분
+
 const getSupabase = () => supabase || (supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY));
+
+// === Tester Account Verification (5분 캐시) ===
+// is_admin 또는 is_tester 컬럼 중 하나라도 true면 거래 허용
+async function isAuthorizedTester(db, userId) {
+  // 환경변수로 테스터 검증 비활성화 가능
+  if (process.env.DISABLE_TESTER_CHECK === 'true') {
+    return true;
+  }
+
+  // 캐시 확인
+  const cached = testerCache.get(userId);
+  if (cached && cached.expiry > Date.now()) {
+    return cached.isTester;
+  }
+
+  // Supabase에서 조회 (is_admin 또는 is_tester)
+  try {
+    const { data, error } = await db.from('user_profiles')
+      .select('is_admin, is_tester')
+      .eq('id', userId)
+      .single();
+
+    // is_admin 또는 is_tester 중 하나라도 true면 허용
+    const isTester = !error && (data?.is_admin === true || data?.is_tester === true);
+    testerCache.set(userId, { isTester, expiry: Date.now() + TESTER_CACHE_TTL });
+    return isTester;
+  } catch (e) {
+    console.error('[TesterCheck] Error:', e.message);
+    return false;
+  }
+}
+
+// === Market Buy Lock 계산 ===
+// max_price 파라미터 필수 (프론트엔드에서 오더북 기반으로 계산)
+async function calculateMarketBuyLock(quantity, maxPrice) {
+  if (!maxPrice || maxPrice <= 0) {
+    return { success: false, error: 'NO_MAX_PRICE', message: '시장가 매수 시 max_price(예상 최대 체결가) 필수' };
+  }
+
+  // 사용자 제공 max_price 기반으로 lock (10% 버퍼)
+  const lockAmount = Math.ceil(maxPrice * quantity * 1.1);
+
+  console.log(`[MarketBuyLock] qty=${quantity}, maxPrice=${maxPrice}, lockAmount=${lockAmount}`);
+  return { success: true, lockAmount };
+}
 
 // === Retry Wrapper for OCC (Optimistic Concurrency Control) ===
 async function withRetry(fn, maxRetries = 3, baseDelay = 50) {
@@ -76,10 +119,14 @@ async function lockBalanceOnce(db, userId, amount) {
   return updateErr ? { success: false, error: 'CONCURRENCY_ERROR', message: '재시도 필요' } : { success: true };
 }
 
-async function lockBalance(db, userId, amount) {
+// HOF: amount 검사 + retry 래퍼 생성
+const withAmountCheck = (onceFn) => async (...args) => {
+  const amount = args[args.length - 1];
   if (amount <= 0) return { success: true };
-  return withRetry(() => lockBalanceOnce(db, userId, amount));
-}
+  return withRetry(() => onceFn(...args));
+};
+
+const lockBalance = withAmountCheck(lockBalanceOnce);
 
 async function unlockBalanceOnce(db, userId, amount) {
   const { data: wallet, error } = await db.from('wallets').select('available, locked').eq('user_id', userId).eq('currency', 'BOLT').single();
@@ -95,10 +142,7 @@ async function unlockBalanceOnce(db, userId, amount) {
   return updateErr ? { success: false, error: 'CONCURRENCY_ERROR', message: '재시도 필요' } : { success: true };
 }
 
-async function unlockBalance(db, userId, amount) {
-  if (amount <= 0) return { success: true };
-  return withRetry(() => unlockBalanceOnce(db, userId, amount));
-}
+const unlockBalance = withAmountCheck(unlockBalanceOnce);
 
 // === Holdings Lock (DynamoDB - SELL orders) ===
 async function lockHoldingsOnce(userId, symbol, amount) {
@@ -140,10 +184,7 @@ async function lockHoldingsOnce(userId, symbol, amount) {
   }
 }
 
-async function lockHoldings(userId, symbol, amount) {
-  if (amount <= 0) return { success: true };
-  return withRetry(() => lockHoldingsOnce(userId, symbol, amount));
-}
+const lockHoldings = withAmountCheck(lockHoldingsOnce);
 
 async function unlockHoldingsOnce(userId, symbol, amount) {
   try {
@@ -177,10 +218,7 @@ async function unlockHoldingsOnce(userId, symbol, amount) {
   }
 }
 
-async function unlockHoldings(userId, symbol, amount) {
-  if (amount <= 0) return { success: true };
-  return withRetry(() => unlockHoldingsOnce(userId, symbol, amount));
-}
+const unlockHoldings = withAmountCheck(unlockHoldingsOnce);
 
 // === Main Handler ===
 export const handler = async (event) => {
@@ -191,7 +229,7 @@ export const handler = async (event) => {
 
   try {
     const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body || event;
-    const { symbol, user_id, action = 'ADD', order_id, price = 0, quantity = 0, side = 'BUY', type = 'LIMIT', conditions } = body;
+    const { symbol, user_id, action = 'ADD', order_id, price = 0, quantity = 0, side = 'BUY', type = 'LIMIT', conditions, max_price } = body;
 
     if (!symbol || !user_id) return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'Missing required fields' }) };
 
@@ -209,29 +247,84 @@ export const handler = async (event) => {
 
     // === ADD Order ===
     if (action === 'ADD') {
-      if (type === 'MARKET') {
-        return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'MARKET_ORDER_DISABLED', message: '시장가 주문은 현재 지원되지 않습니다' }) };
+      // [1] 테스터 계정 검증 (관리자 등록 계정만 거래 가능)
+      const isTester = await isAuthorizedTester(db, user_id);
+      if (!isTester) {
+        return { statusCode: 403, headers: HEADERS, body: JSON.stringify({
+          error: 'UNAUTHORIZED_TESTER',
+          message: '테스터로 등록된 계정만 거래 가능합니다'
+        })};
       }
 
       const orderId = crypto.randomUUID();
       const isBuy = side.toUpperCase() === 'BUY';
-      const finalPrice = type === 'MARKET' ? (isBuy ? 2147483647 : 0) : Number(price);
       const finalQty = Number(quantity);
 
       if (isNaN(finalQty) || finalQty <= 0) {
         return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'INVALID_QUANTITY', message: '수량은 0보다 커야 합니다' }) };
       }
+
+      // [2] 가격 결정 (MARKET: price=0, 엔진에서 시장가로 처리)
+      const finalPrice = type === 'MARKET' ? 0 : Number(price);
+
       if (type === 'LIMIT' && (isNaN(finalPrice) || finalPrice <= 0)) {
         return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'INVALID_PRICE', message: '가격은 0보다 커야 합니다' }) };
       }
-      const lockAmount = isBuy ? (type === 'LIMIT' ? finalPrice * finalQty : 0) : finalQty;
+
+      // [3] Lock 금액 계산
+      let lockAmount = 0;
+      if (isBuy) {
+        if (type === 'MARKET') {
+          // 시장가 매수: max_price 파라미터 필수 (프론트엔드에서 오더북 기반 계산)
+          const lockCalc = await calculateMarketBuyLock(finalQty, Number(max_price));
+          if (!lockCalc.success) {
+            return { statusCode: 400, headers: HEADERS, body: JSON.stringify(lockCalc) };
+          }
+          lockAmount = lockCalc.lockAmount;
+          console.log(`[ADD] MARKET BUY lock: ${lockAmount} (max_price=${max_price})`);
+        } else {
+          // 지정가 매수: 가격 * 수량
+          lockAmount = finalPrice * finalQty;
+        }
+      } else {
+        // 매도: 수량만큼 보유량 lock
+        lockAmount = finalQty;
+      }
 
       if (lockAmount > 0) {
         const lockRes = isBuy ? await lockBalance(db, user_id, lockAmount) : await lockHoldings(user_id, symbol, lockAmount);
         if (!lockRes.success) return { statusCode: 400, headers: HEADERS, body: JSON.stringify(lockRes) };
       }
 
+      // [4] 시장가 주문은 IOC (Immediate-Or-Cancel) 자동 설정
+      // 미체결 수량은 자동 취소되어 주문목록에 표시되지 않음
+      const finalConditions = { ...(conditions || {}) };
+      if (type === 'MARKET') {
+        finalConditions.immediate_or_cancel = true;
+      }
+
       try {
+        // [5] DynamoDB에 주문 저장 (lock_amount 포함) - 환불 시 필요
+        const now = new Date().toISOString();
+        await ddb.send(new UpdateCommand({
+          TableName: ORDERS_TABLE,
+          Key: { user_id, order_id: orderId },
+          UpdateExpression: 'SET symbol = :symbol, side = :side, #type = :type, price = :price, quantity = :qty, filled_qty = :zero, #status = :status, lock_amount = :lock, created_at = :now, updated_at = :now',
+          ExpressionAttributeNames: { '#type': 'type', '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':symbol': symbol.toUpperCase(),
+            ':side': isBuy ? 'BUY' : 'SELL',
+            ':type': type,
+            ':price': finalPrice,
+            ':qty': finalQty,
+            ':zero': 0,
+            ':status': 'PENDING',
+            ':lock': lockAmount,
+            ':now': now
+          }
+        }));
+
+        // [6] Kinesis로 전송
         await kinesis.send(new PutRecordCommand({
           StreamName: KINESIS_STREAM,
           Data: Buffer.from(JSON.stringify({
@@ -244,13 +337,20 @@ export const handler = async (event) => {
             quantity: finalQty,
             order_type: type,
             timestamp: Date.now(),
-            conditions: conditions || {}
+            conditions: finalConditions,
+            lock_amount: lockAmount
           })),
           PartitionKey: symbol
         }));
 
-        return { statusCode: 200, headers: HEADERS, body: JSON.stringify({ order_id: orderId, message: 'Order Accepted' }) };
+        return { statusCode: 200, headers: HEADERS, body: JSON.stringify({
+          order_id: orderId,
+          message: 'Order Accepted',
+          type,
+          lock_amount: lockAmount
+        }) };
       } catch (e) {
+        console.error('[ADD] Error:', e.message);
         isBuy ? await unlockBalance(db, user_id, lockAmount) : await unlockHoldings(user_id, symbol, lockAmount);
         return { statusCode: 500, headers: HEADERS, body: JSON.stringify({ error: 'Order placement failed' }) };
       }
