@@ -6,29 +6,21 @@ import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, Dyna
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import pg from 'pg';
 
-// === Auth Layer Import ===
-let verifyAdmin, authErrorResponse;
+// === Auth Layer Import (Simplified) ===
+let auth;
 try {
-  const authModule = await import('/opt/nodejs/verifyAuth.mjs');
-  verifyAdmin = authModule.verifyAdmin;
-  authErrorResponse = authModule.authErrorResponse;
-} catch (e) {
-  console.warn('[admin] Auth layer not available, using fallback');
-  // Fallback: 기존 API 키 방식만 사용
-  verifyAdmin = async (event) => {
-    const adminApiKey = process.env.ADMIN_API_KEY;
-    const authHeader = event.headers?.Authorization || event.headers?.authorization;
-    if (adminApiKey && authHeader === adminApiKey) {
-      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
-    }
-    return { success: false, error: 'UNAUTHORIZED', message: '인증이 필요합니다' };
+  auth = await import('/opt/nodejs/verifyAuth.mjs');
+} catch {
+  const { createFallbackAuth } = await import('/opt/nodejs/verifyAuth.mjs').catch(() => ({}));
+  auth = createFallbackAuth?.('admin') || {
+    verifyAdmin: async (e) => {
+      const key = process.env.ADMIN_API_KEY, h = e.headers?.Authorization || e.headers?.authorization;
+      return key && h === key ? { success: true, userId: 'admin', method: 'api_key' } : { success: false, error: 'UNAUTHORIZED' };
+    },
+    authErrorResponse: (r) => ({ statusCode: 401, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify(r) })
   };
-  authErrorResponse = (result) => ({
-    statusCode: 401,
-    headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: result.error, message: result.message })
-  });
 }
+const { verifyAdmin, authErrorResponse } = auth;
 
 const { Client: PgClient } = pg;
 const VALKEY_HOST = process.env.VALKEY_HOST;
@@ -56,16 +48,20 @@ const checkAdmin = async (event) => {
   return { authorized: true, userId: result.userId, method: result.method };
 };
 
+// 플랫폼 패턴 테이블 (확장 용이)
+const PLATFORM_PATTERNS = {
+  YOUTUBE: ['youtube.com', 'youtu.be'],
+  X: ['twitter.com', 'x.com'],
+  INSTAGRAM: ['instagram.com'],
+  TIKTOK: ['tiktok.com'],
+  CHZZK: ['chzzk'],
+  AFREECATV: ['afreecatv']
+};
+
 const detectPlatform = (url) => {
   if (!url) return 'ETC';
   const lower = url.toLowerCase();
-  if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'YOUTUBE';
-  if (lower.includes('twitter.com') || lower.includes('x.com')) return 'X';
-  if (lower.includes('instagram.com')) return 'INSTAGRAM';
-  if (lower.includes('tiktok.com')) return 'TIKTOK';
-  if (lower.includes('chzzk')) return 'CHZZK';
-  if (lower.includes('afreecatv')) return 'AFREECATV';
-  return 'ETC';
+  return Object.entries(PLATFORM_PATTERNS).find(([, p]) => p.some(s => lower.includes(s)))?.[0] || 'ETC';
 };
 const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
 const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
