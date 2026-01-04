@@ -160,4 +160,61 @@ int RdsClient::batch_put_candles(const std::string& symbol, const std::string& i
     return saved;
 }
 
+// [Phase 3] 계층적 집계를 위한 캔들 조회
+std::vector<Candle> RdsClient::get_candles_by_interval(
+    const std::string& symbol,
+    const std::string& interval,
+    int64_t start_epoch,
+    int64_t end_epoch) {
+
+    std::vector<Candle> candles;
+    if (!connected_ || !conn_) return candles;
+
+    // 소문자로 변환 (파티션 키와 일치)
+    std::string lower_symbol = symbol;
+    for (auto& c : lower_symbol) c = std::tolower(c);
+
+    std::string sql = R"(
+        SELECT time_ymdhm, open, high, low, close, volume
+        FROM candle_history
+        WHERE symbol = $1 AND interval = $2
+          AND time_epoch >= $3 AND time_epoch < $4
+        ORDER BY time_epoch ASC
+    )";
+
+    std::string start_str = std::to_string(start_epoch);
+    std::string end_str = std::to_string(end_epoch);
+
+    const char* params[4] = {
+        lower_symbol.c_str(), interval.c_str(),
+        start_str.c_str(), end_str.c_str()
+    };
+
+    PGresult* res = PQexecParams(conn_, sql.c_str(), 4, nullptr, params, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        Logger::error("RDS get_candles_by_interval failed:", PQerrorMessage(conn_));
+        PQclear(res);
+        return candles;
+    }
+
+    int rows = PQntuples(res);
+    for (int i = 0; i < rows; i++) {
+        Candle c;
+        c.symbol = symbol;
+        c.time = PQgetvalue(res, i, 0);  // time_ymdhm
+        c.open = std::stod(PQgetvalue(res, i, 1));
+        c.high = std::stod(PQgetvalue(res, i, 2));
+        c.low = std::stod(PQgetvalue(res, i, 3));
+        c.close = std::stod(PQgetvalue(res, i, 4));
+        c.volume = std::stod(PQgetvalue(res, i, 5));
+        candles.push_back(c);
+    }
+
+    PQclear(res);
+    Logger::debug("RDS get_candles:", symbol, interval, "range:",
+                 start_epoch, "-", end_epoch, "found:", rows);
+    return candles;
+}
+
 } // namespace aggregator

@@ -27,9 +27,17 @@ public:
     // 배치 저장 (INSERT ... ON CONFLICT)
     int batch_put_candles(const std::string& symbol, const std::string& interval,
                          const std::vector<Candle>& candles);
-    
+
     // 심볼 파티션 생성
     bool ensure_partition(const std::string& symbol);
+
+    // [Phase 3] 캔들 조회 (계층적 집계용)
+    // start_epoch 이상, end_epoch 미만 범위의 캔들 조회
+    std::vector<Candle> get_candles_by_interval(
+        const std::string& symbol,
+        const std::string& interval,
+        int64_t start_epoch,
+        int64_t end_epoch);
 
 private:
     std::string host_;

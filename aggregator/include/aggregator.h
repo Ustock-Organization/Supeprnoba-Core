@@ -37,13 +37,12 @@ public:
     
     // 현재 시간이 타임프레임 경계인지 확인
     static bool is_timeframe_boundary(const std::string& ymdhm, const Timeframe& tf);
-    
+
     // YYYYMMDDHHmm → 타임프레임 시작 시간 정렬
     static std::string align_to_timeframe(const std::string& ymdhm, int minutes);
-    
-private:
-    // N개의 1분봉을 1개의 캔들로 집계
-    Candle aggregate_candles(const std::vector<Candle>& candles, 
+
+    // N개의 캔들을 1개의 캔들로 집계 (public for hierarchical aggregation)
+    Candle aggregate_candles(const std::vector<Candle>& candles,
                             const std::string& aligned_time);
 };
 

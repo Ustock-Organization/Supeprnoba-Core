@@ -92,12 +92,24 @@ std::map<std::string, std::vector<Candle>> Aggregator::aggregate(
         // 각 그룹을 하나의 캔들로 집계
         std::vector<Candle> aggregated;
         for (const auto& [aligned_time, group_candles] : groups) {
-            // 완성된 캔들만 추가 (분 수가 맞는지 확인)
-            if (group_candles.size() >= static_cast<size_t>(tf.minutes)) {
+            // [FIX] 최소 50% 캔들이 있으면 집계 허용 (기존: 100% 필요)
+            // 30m, 1h 등에서 1-2개 캔들 누락 시에도 집계 가능
+            size_t min_required = std::max(static_cast<size_t>(1),
+                                           static_cast<size_t>(tf.minutes) / 2);
+
+            if (group_candles.size() >= min_required) {
                 Candle agg = aggregate_candles(group_candles, aligned_time);
                 aggregated.push_back(agg);
-                Logger::debug("[AGG]", agg.symbol, tf.interval, "@", aligned_time,
-                             "O:", agg.open, "H:", agg.high, "L:", agg.low, "C:", agg.close);
+
+                // 부분 집계인 경우 경고 로그
+                if (group_candles.size() < static_cast<size_t>(tf.minutes)) {
+                    Logger::debug("[AGG-PARTIAL]", agg.symbol, tf.interval, "@", aligned_time,
+                                 "candles:", group_candles.size(), "/", tf.minutes,
+                                 "O:", agg.open, "H:", agg.high, "L:", agg.low, "C:", agg.close);
+                } else {
+                    Logger::debug("[AGG]", agg.symbol, tf.interval, "@", aligned_time,
+                                 "O:", agg.open, "H:", agg.high, "L:", agg.low, "C:", agg.close);
+                }
             }
         }
         

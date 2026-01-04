@@ -13,8 +13,75 @@
 #include <csignal>
 #include <atomic>
 #include <map>
+#include <ctime>
+#include <set>
 
 using namespace aggregator;
+
+// [Phase 3] 현재 UTC epoch 조회
+int64_t get_current_epoch() {
+    return static_cast<int64_t>(std::time(nullptr));
+}
+
+// [Phase 3] epoch를 타임프레임 시작으로 정렬 (내림)
+int64_t align_epoch_to_timeframe(int64_t epoch, int seconds) {
+    return (epoch / seconds) * seconds;
+}
+
+// [Phase 3] YYYYMMDDHHmm 형식으로 변환 (KST 기준)
+std::string epoch_to_ymdhm(int64_t epoch) {
+    const int64_t KST_OFFSET = 9 * 3600;  // UTC+9
+    time_t kst_time = static_cast<time_t>(epoch + KST_OFFSET);
+    struct tm* tm = gmtime(&kst_time);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d%02d%02d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min);
+    return std::string(buf);
+}
+
+// [Phase 3] 계층적 집계 수행 (4h, 1d, 1w)
+// source_interval에서 데이터를 읽어 target_interval로 집계
+void aggregate_higher_timeframe(
+    RdsClient& rds,
+    Aggregator& agg,
+    const std::string& symbol,
+    const std::string& source_interval,
+    const std::string& target_interval,
+    int target_seconds,
+    int64_t target_epoch) {
+
+    int64_t start_epoch = target_epoch - target_seconds;
+    int64_t end_epoch = target_epoch;
+
+    // 소스 타임프레임 캔들 조회
+    auto source_candles = rds.get_candles_by_interval(
+        symbol, source_interval, start_epoch, end_epoch);
+
+    if (source_candles.empty()) {
+        Logger::debug("[HIER-AGG] No source candles for", symbol,
+                     target_interval, "from", source_interval);
+        return;
+    }
+
+    // 집계
+    std::string aligned_time = epoch_to_ymdhm(target_epoch - target_seconds);
+    Candle agg_candle = agg.aggregate_candles(source_candles, aligned_time);
+
+    if (agg_candle.time.empty()) {
+        Logger::warn("[HIER-AGG] Failed to aggregate", symbol, target_interval);
+        return;
+    }
+
+    // 저장
+    if (rds.put_candle(symbol, target_interval, agg_candle)) {
+        Logger::info("[HIER-AGG]", symbol, target_interval, "@", aligned_time,
+                    "aggregated from", source_candles.size(), source_interval, "candles");
+    } else {
+        Logger::error("[HIER-AGG] Failed to save", symbol, target_interval);
+    }
+}
 
 std::atomic<bool> running{true};
 
@@ -83,10 +150,20 @@ int main(int argc, char* argv[]) {
     
     // 마지막으로 처리한 캔들 개수 (중복 로그/처리 방지)
     std::map<std::string, size_t> last_processed_counts;
-    
+
     // 마지막 저장된 epoch 추적 (중복 저장 방지)
     // key: "symbol:interval", value: last saved epoch
     std::map<std::string, int64_t> last_saved_epochs;
+
+    // [Phase 3] 계층적 집계 상태 추적
+    std::set<std::string> known_symbols;           // 알려진 심볼 목록
+    int64_t last_4h_check = 0;                     // 마지막 4h 경계 체크 시간
+    int64_t last_1d_check = 0;                     // 마지막 1d 경계 체크 시간
+    int64_t last_1w_check = 0;                     // 마지막 1w 경계 체크 시간
+
+    const int SECONDS_4H = 4 * 3600;               // 4시간
+    const int SECONDS_1D = 24 * 3600;              // 1일
+    const int SECONDS_1W = 7 * 24 * 3600;          // 1주
     
     while (running) {
         try {
@@ -168,22 +245,68 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 
-                // 5. 60개 이상일 때 Valkey 정리 (S3 백업 제거됨)
-                if (closed_candles.size() >= 60) {
-                    // 처리된 캔들 정리
-                    size_t processed_count = closed_candles.size();
-                    
-                    if (valkey.trim_closed_candles(symbol, processed_count)) {
-                        Logger::debug("[VALKEY]", symbol, "trimmed", processed_count, "candles");
+                // 5. Valkey 정리 정책 (4h 집계 지원을 위해 240개 유지)
+                // [FIX] 기존 60개 → 240개로 변경 (4h = 240분)
+                // 1d/1w는 Phase 3의 RDS 기반 집계로 처리
+                const size_t VALKEY_TRIM_THRESHOLD = 240;  // 4시간 분량
+                const size_t VALKEY_KEEP_COUNT = 120;      // 최소 2시간 분량 유지
+
+                if (closed_candles.size() >= VALKEY_TRIM_THRESHOLD) {
+                    // 오래된 캔들만 정리 (최근 KEEP_COUNT개 유지)
+                    size_t trim_count = closed_candles.size() - VALKEY_KEEP_COUNT;
+
+                    if (valkey.trim_closed_candles(symbol, trim_count)) {
+                        Logger::info("[VALKEY]", symbol, "trimmed", trim_count,
+                                    "candles, keeping", VALKEY_KEEP_COUNT);
                     }
-                    
+
                     // 처리 후 상태 업데이트
-                    last_processed_counts[symbol] = 0;
+                    last_processed_counts[symbol] = VALKEY_KEEP_COUNT;
                 } else {
-                    Logger::debug("Waiting for 60 candles, current:", closed_candles.size());
+                    Logger::debug("Valkey buffer:", closed_candles.size(), "/", VALKEY_TRIM_THRESHOLD);
                 }
+
+                // [Phase 3] 심볼 추적
+                known_symbols.insert(symbol);
             }
-            
+
+            // [Phase 3] 계층적 집계 - 4h, 1d, 1w
+            // 매 타임프레임 경계에서 RDS 저장된 하위 캔들로 상위 집계
+            int64_t now = get_current_epoch();
+
+            // 4시간봉 집계 (1h × 4 → 4h)
+            int64_t aligned_4h = align_epoch_to_timeframe(now, SECONDS_4H);
+            if (aligned_4h > last_4h_check && !known_symbols.empty()) {
+                Logger::info("[HIER-AGG] 4h boundary reached, aggregating...");
+                for (const auto& sym : known_symbols) {
+                    aggregate_higher_timeframe(rds, aggregator, sym, "1h", "4h",
+                                              SECONDS_4H, aligned_4h);
+                }
+                last_4h_check = aligned_4h;
+            }
+
+            // 일봉 집계 (1h × 24 → 1d)
+            int64_t aligned_1d = align_epoch_to_timeframe(now, SECONDS_1D);
+            if (aligned_1d > last_1d_check && !known_symbols.empty()) {
+                Logger::info("[HIER-AGG] 1d boundary reached, aggregating...");
+                for (const auto& sym : known_symbols) {
+                    aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
+                                              SECONDS_1D, aligned_1d);
+                }
+                last_1d_check = aligned_1d;
+            }
+
+            // 주봉 집계 (1d × 7 → 1w)
+            int64_t aligned_1w = align_epoch_to_timeframe(now, SECONDS_1W);
+            if (aligned_1w > last_1w_check && !known_symbols.empty()) {
+                Logger::info("[HIER-AGG] 1w boundary reached, aggregating...");
+                for (const auto& sym : known_symbols) {
+                    aggregate_higher_timeframe(rds, aggregator, sym, "1d", "1w",
+                                              SECONDS_1W, aligned_1w);
+                }
+                last_1w_check = aligned_1w;
+            }
+
         } catch (const std::exception& e) {
             Logger::error("Processing error:", e.what());
         }
