@@ -41,6 +41,9 @@ public:
     // YYYYMMDDHHmm → 타임프레임 시작 시간 정렬
     static std::string align_to_timeframe(const std::string& ymdhm, int minutes);
 
+    // 타임프레임 종료 시간 계산 (aligned_time + minutes)
+    static std::string get_timeframe_end(const std::string& aligned_time, int minutes);
+
     // N개의 캔들을 1개의 캔들로 집계 (public for hierarchical aggregation)
     Candle aggregate_candles(const std::vector<Candle>& candles,
                             const std::string& aligned_time);

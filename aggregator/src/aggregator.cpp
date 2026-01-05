@@ -67,33 +67,80 @@ Candle Aggregator::aggregate_candles(const std::vector<Candle>& candles,
     return result;
 }
 
+// 타임프레임 종료 시간 계산 (aligned_time + minutes)
+std::string Aggregator::get_timeframe_end(const std::string& aligned_time, int minutes) {
+    int year = std::stoi(aligned_time.substr(0, 4));
+    int month = std::stoi(aligned_time.substr(4, 2));
+    int day = std::stoi(aligned_time.substr(6, 2));
+    int hour = std::stoi(aligned_time.substr(8, 2));
+    int min = std::stoi(aligned_time.substr(10, 2));
+
+    // minutes 추가
+    int total_min = hour * 60 + min + minutes;
+
+    // 일자 넘김 처리 (간단히)
+    int new_day = day;
+    if (total_min >= 24 * 60) {
+        total_min -= 24 * 60;
+        new_day++;
+    }
+
+    int new_hour = total_min / 60;
+    int new_min = total_min % 60;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << std::setw(2) << month
+        << std::setw(2) << new_day
+        << std::setw(2) << new_hour
+        << std::setw(2) << new_min;
+    return oss.str();
+}
+
 std::map<std::string, std::vector<Candle>> Aggregator::aggregate(
     const std::vector<Candle>& one_min_candles) {
-    
+
     std::map<std::string, std::vector<Candle>> result;
-    
+
     if (one_min_candles.empty()) return result;
-    
+
     // 1분봉은 그대로 추가
     result["1m"] = one_min_candles;
-    
+
+    // [FIX] 가장 최근 1분봉 시간을 "현재 시간"으로 사용
+    // 이 시간 이전에 종료된 타임프레임만 집계
+    std::string latest_time = one_min_candles[0].time;
+    for (const auto& c : one_min_candles) {
+        if (c.time > latest_time) latest_time = c.time;
+    }
+
     // 각 타임프레임별로 집계
     for (const auto& tf : TIMEFRAMES) {
         if (tf.minutes <= 1) continue;  // 1분봉은 스킵
-        
+
         // 1분봉들을 타임프레임 경계로 그룹화
         std::map<std::string, std::vector<Candle>> groups;
-        
+
         for (const auto& candle : one_min_candles) {
             std::string aligned = align_to_timeframe(candle.time, tf.minutes);
             groups[aligned].push_back(candle);
         }
-        
+
         // 각 그룹을 하나의 캔들로 집계
         std::vector<Candle> aggregated;
         for (const auto& [aligned_time, group_candles] : groups) {
-            // [FIX] 최소 50% 캔들이 있으면 집계 허용 (기존: 100% 필요)
-            // 30m, 1h 등에서 1-2개 캔들 누락 시에도 집계 가능
+            // [FIX] 타임프레임이 완전히 종료된 경우만 저장
+            // 예: 3분봉 09:18은 09:21이 되어야 저장
+            std::string tf_end = get_timeframe_end(aligned_time, tf.minutes);
+
+            if (tf_end > latest_time) {
+                // 아직 진행중인 타임프레임 - 저장하지 않음
+                Logger::debug("[AGG-SKIP]", tf.interval, "@", aligned_time,
+                             "not closed yet (ends at", tf_end, ", latest:", latest_time, ")");
+                continue;
+            }
+
+            // [FIX] 최소 50% 캔들이 있으면 집계 허용
             size_t min_required = std::max(static_cast<size_t>(1),
                                            static_cast<size_t>(tf.minutes) / 2);
 
@@ -112,12 +159,12 @@ std::map<std::string, std::vector<Candle>> Aggregator::aggregate(
                 }
             }
         }
-        
+
         if (!aggregated.empty()) {
             result[tf.interval] = aggregated;
         }
     }
-    
+
     return result;
 }
 
