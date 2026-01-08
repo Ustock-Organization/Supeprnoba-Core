@@ -68,3 +68,16 @@ engine_pkg.zip
 func_*.zip
 lambda/**/node_modules/
 lambda/**/*.zip
+
+# Security - Sensitive Configuration Files
+admin_config.json
+**/env.json
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# AWS Credentials
+credentials
+*.pem
+*.key

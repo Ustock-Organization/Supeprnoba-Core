@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-common",
+  "version": "1.0.0",
+  "description": "Supernoba Lambda Common Layer - Redis, CORS, Utilities",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.9.0"
+  }
+}
