@@ -1,20 +1,29 @@
 // disconnect-handler Lambda
 // 연결 해제 시 모든 관련 캐시 정리 + 만료된 connectionId 정리
 
-import Redis from 'ioredis';
+import { getValkeyClient } from '/opt/nodejs/index.mjs';
 
-const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
-
-const valkey = new Redis({
-  host: process.env.VALKEY_HOST || 'supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com',
-  port: parseInt(process.env.VALKEY_PORT || '6379'),
-  tls: VALKEY_TLS ? {} : undefined,
-});
+// Layer를 통한 Valkey 클라이언트 (websocket 프리셋)
+const valkey = getValkeyClient({ type: 'depth', preset: 'websocket' });
 
 export const handler = async (event) => {
-  const connectionId = event.requestContext.connectionId;
+  const connectionId = event.requestContext?.connectionId;
   
-  console.log(`Disconnecting: ${connectionId}`);
+  if (!connectionId) {
+    console.error('[disconnect] ❌ Missing connectionId');
+    return { statusCode: 400, body: 'Missing connectionId' };
+  }
+  
+  console.log(`[disconnect] Disconnecting: ${connectionId}`);
+  
+  // Valkey 연결 시도
+  try {
+    if (valkey.status !== 'ready') {
+      await valkey.connect().catch(() => {});
+    }
+  } catch (e) {
+    console.warn(`[disconnect] Valkey connection warning:`, e.message);
+  }
   
   try {
     // === 1. ws:connectionId에서 userId 조회 ===
@@ -42,10 +51,10 @@ export const handler = async (event) => {
       const remainingLegacy = await valkey.scard(`symbol:${mainSymbol}:subscribers`);
       if (remainingMain === 0 && remainingLegacy === 0) {
         await valkey.srem('subscribed:symbols', mainSymbol);
-        console.log(`Removed ${mainSymbol} from subscribed:symbols (no subscribers)`);
+        console.log(`[disconnect] Removed ${mainSymbol} from subscribed:symbols (no subscribers)`);
       }
       
-      console.log(`Removed main subscription: ${mainSymbol}`);
+      console.log(`[disconnect] Removed main subscription: ${mainSymbol}`);
     }
     
     // === 3. Sub 구독 정리 (SCAN) ===
@@ -57,7 +66,7 @@ export const handler = async (event) => {
       for (const key of keys) {
         if (key.endsWith(':subscribers') || key.endsWith(':main') || key.endsWith(':sub')) {
           const removed = await valkey.srem(key, connectionId);
-          if (removed > 0) console.log(`Removed from ${key}`);
+          if (removed > 0) console.log(`[disconnect] Removed from ${key}`);
         }
       }
     } while (cursor !== '0');
@@ -65,7 +74,7 @@ export const handler = async (event) => {
     // === 4. user:userId:connections에서 제거 ===
     if (userId) {
       await valkey.srem(`user:${userId}:connections`, connectionId);
-      console.log(`Removed ${connectionId} from user:${userId}:connections`);
+      console.log(`[disconnect] Removed ${connectionId} from user:${userId}:connections`);
       
       // === 5. 만료된 connectionId 정리 (해당 userId) ===
       const allConns = await valkey.smembers(`user:${userId}:connections`);
@@ -82,29 +91,28 @@ export const handler = async (event) => {
       }
       
       if (staleCount > 0) {
-        console.log(`Cleaned ${staleCount} stale connections for user:${userId}`);
+        console.log(`[disconnect] Cleaned ${staleCount} stale connections for user:${userId}`);
       }
       
       // === 6. 연결이 모두 비어있으면 user 키 삭제 ===
       const remainingConns = await valkey.scard(`user:${userId}:connections`);
       if (remainingConns === 0) {
         await valkey.del(`user:${userId}:connections`);
-        console.log(`Deleted empty user:${userId}:connections`);
+        console.log(`[disconnect] Deleted empty user:${userId}:connections`);
       }
     }
     
     // === 7. ws:connectionId 삭제 ===
     await valkey.del(`ws:${connectionId}`);
-    
-    // === 8. realtime:connections에서 제거 (로그인 사용자였다면) ===
-    await valkey.srem('realtime:connections', connectionId);
-    
-    console.log(`Deleted ws:${connectionId}`);
-    
+    console.log(`[disconnect] Deleted ws:${connectionId}`);
+
+    // realtime:connections 제거됨 - 브로드캐스트에서 미사용
+
+    console.log(`[disconnect] ✅ Completed: ${connectionId}`);
     return { statusCode: 200, body: 'Disconnected' };
     
   } catch (error) {
-    console.error('Disconnect error:', error.message);
+    console.error('[disconnect] ❌ Disconnect error:', error.message, error.stack);
     return { statusCode: 500, body: 'Error' };
   }
 };
