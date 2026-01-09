@@ -41,7 +41,7 @@ jobs:
             echo "host_$i=${HOSTS[$i]}" >> $GITHUB_OUTPUT
           done
           echo "host_count=${#HOSTS[@]}" >> $GITHUB_OUTPUT
-          echo "hosts=${secrets.EC2_HOSTS}" >> $GITHUB_OUTPUT
+          echo "hosts=${{ secrets.EC2_HOSTS }}" >> $GITHUB_OUTPUT
       
       - name: Add EC2 hosts to known_hosts
         run: |
