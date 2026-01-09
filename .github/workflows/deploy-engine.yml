@@ -4,9 +4,10 @@ on:
   push:
     branches: [main, master, develop]
     paths:
-      - 'liquibook/wrapper/**'
-      - 'liquibook/engine/**'
-      - 'liquibook/aggregator/**'
+      - 'wrapper/**'
+      - 'engine/**'
+      - 'aggregator/**'
+      - 'streamer/**'
       - '.github/workflows/deploy-engine.yml'
   workflow_dispatch:
     inputs:
@@ -134,7 +135,22 @@ jobs:
               sleep 1
               echo "Streamer process stopped"
             fi
-            
+
+            # Streamer 코드 업데이트 및 재시작
+            echo "[3.5/5] Restarting Streamer..."
+            cd "$REPO_DIR/streamer/node"
+            if [ ! -d node_modules ]; then
+              npm install
+            fi
+            nohup node index.mjs > /tmp/streamer.log 2>&1 &
+            sleep 2
+            if pgrep -f "node.*index.mjs" > /dev/null; then
+              echo "✅ Streamer restarted (PID: $(pgrep -f 'node.*index.mjs'))"
+            else
+              echo "⚠️ Streamer failed to start. Check /tmp/streamer.log"
+            fi
+            cd "$REPO_DIR"
+
             # 4. 빌드 (필요한 경우)
             echo "[4/5] Building engine (if needed)..."
             cd "$REPO_DIR/wrapper"
