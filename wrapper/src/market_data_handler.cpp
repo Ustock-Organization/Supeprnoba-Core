@@ -1,4 +1,5 @@
 #include "market_data_handler.h"
+#include "engine_core.h"
 #include "redis_client.h"
 #include "notification_client.h"
 #include "iproducer.h"
@@ -215,6 +216,16 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 
     // Ticker 캐시 업데이트 (Sub 데이터용)
     updateTickerCache(symbol, fill_price);
+
+    // 완전 체결된 주문을 order_maps_에서 제거 (메모리 누수 방지)
+    if (engine_) {
+        if (order_fully_filled) {
+            engine_->removeFilledOrder(symbol, order->order_id());
+        }
+        if (matched_order_fully_filled) {
+            engine_->removeFilledOrder(symbol, matched_order->order_id());
+        }
+    }
 }
 
 
@@ -401,6 +412,7 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     depth_json["c"] = std::round(day.change_rate * 100) / 100.0;
     depth_json["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
     depth_json["p"] = day.last_price;  // 현재가도 추가
+    depth_json["pc"] = day.prev_close;  // 전일종가 추가 (Frontend 호환)
     
     // DEBUG: 저장 전 depth_json 내용 출력
     Logger::info("DEPTH_DEBUG:", symbol, 
@@ -505,6 +517,7 @@ void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t pr
     ticker["p"] = price;
     ticker["c"] = std::round(day.change_rate * 100) / 100.0;  // 소수점 2자리
     ticker["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
+    ticker["pc"] = day.prev_close;  // 전일종가 추가 (Frontend 호환)
 
     redis_->set("ticker:" + symbol, ticker.dump());
     Logger::debug("Ticker saved:", symbol, "price:", price, "change:", day.change_rate, "%");

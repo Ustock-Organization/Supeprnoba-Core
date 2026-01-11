@@ -1,25 +1,30 @@
-// Supernoba-fill-processor
+/**
+ * @deprecated 2026-01-12 - stock-processor (C++)로 이전됨
+ * 이전 위치: Supernoba-back/src/processors/fill_processor.cpp
+ * AWS Lambda 트리거를 비활성화하고, 이 파일은 참조용으로만 보존
+ */
+// Supernoba-fill-processor - DynamoDB Version (Supabase Removed)
 // Trigger: Kinesis Stream (supernoba-fills)
 // Logic:
-//   1. 원자적 트랜잭션: DynamoDB orders + holdings (TransactWriteItems)
+//   1. 원자적 트랜잭션: DynamoDB TransactWriteItems
 //      - Buyer/Seller Orders 업데이트 (filled_qty, status)
 //      - Buyer/Seller Holdings 업데이트 (quantity, locked, avg_price)
-//   2. Supabase wallets (BOLT balance transfer) - 별도 처리, 실패 시 로깅
+//      - Buyer/Seller Wallets 업데이트 (locked 감소, available 증가)
 //
 // 원자성 보장:
-//   - Orders와 Holdings는 단일 트랜잭션으로 처리 (all-or-nothing)
+//   - Orders, Holdings, Wallets 모두 단일 트랜잭션으로 처리 (all-or-nothing)
 //   - Optimistic locking (version 필드) + 자동 재시도
-//   - Supabase Wallet은 별도 처리 (DynamoDB 트랜잭션과 독립)
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, UpdateCommand, GetCommand, PutCommand, DeleteCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import { KinesisClient, PutRecordCommand } from '@aws-sdk/client-kinesis';
 
 // === Configuration ===
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
+const NOTIFICATION_STREAM = process.env.NOTIFICATION_STREAM || 'supernoba-order-status';
 const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
+const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
 const MM_IDS_SECRET_ID = process.env.MM_IDS_SECRET_ID || 'supernoba/mm-ids';
 
 // Secrets Manager Client
@@ -65,26 +70,67 @@ async function isMarketMaker(userId) {
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 const ddb = DynamoDBDocumentClient.from(dynamoClient);
 
-// Supabase Client (lazy import)
-let supabaseClient = null;
-let createSupabaseClient = null;
+// Kinesis Client (for notifications after DB update)
+const kinesisClient = new KinesisClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 
-async function getSupabase() {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+// Publish FILL notification to Kinesis (after DynamoDB update completes)
+async function publishFillNotification(data, buyerFullyFilled, sellerFullyFilled) {
+    const timestamp = Date.now();
 
-    if (!supabaseClient && !createSupabaseClient) {
+    // FILL notification with source marker (notifier only processes events with source: 'fill-processor')
+    const fillEvent = {
+        event: 'FILL',
+        source: 'fill-processor',  // 중요: notifier가 이 필드를 체크하여 중복 처리 방지
+        trade_id: data.trade_id,
+        symbol: data.symbol,
+        price: data.price,
+        quantity: data.quantity,
+        timestamp,
+        buyer: {
+            user_id: data.buyer.user_id,
+            order_id: data.buyer.order_id,
+            fully_filled: buyerFullyFilled
+        },
+        seller: {
+            user_id: data.seller.user_id,
+            order_id: data.seller.order_id,
+            fully_filled: sellerFullyFilled
+        }
+    };
+
+    // 알림 전송 (재시도 포함)
+    let notificationSent = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const supabaseModule = await import('@supabase/supabase-js');
-            createSupabaseClient = supabaseModule.createClient;
-            supabaseClient = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-                auth: { persistSession: false }
-            });
+            await kinesisClient.send(new PutRecordCommand({
+                StreamName: NOTIFICATION_STREAM,
+                Data: Buffer.from(JSON.stringify(fillEvent)),
+                PartitionKey: data.buyer.user_id
+            }));
+            console.log(`[fill-processor] ✅ Published FILL notification for ${data.trade_id}`);
+            notificationSent = true;
+            break;
         } catch (err) {
-            console.warn(`[Supabase] Failed to initialize:`, err.message);
-            return null;
+            console.warn(`[fill-processor] Notification attempt ${attempt}/3 failed:`, err.message);
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 100 * attempt));
+            }
         }
     }
-    return supabaseClient;
+
+    if (!notificationSent) {
+        // 구조화된 에러 로그 (CloudWatch 알람용)
+        console.error(JSON.stringify({
+            level: 'ERROR',
+            type: 'NOTIFICATION_FAILED',
+            trade_id: data.trade_id,
+            buyer_id: data.buyer.user_id,
+            seller_id: data.seller.user_id,
+            symbol: data.symbol,
+            timestamp: Date.now(),
+            message: 'Failed to publish fill notification after 3 attempts'
+        }));
+    }
 }
 
 export const handler = async (event) => {
@@ -100,46 +146,21 @@ export const handler = async (event) => {
 
             console.log(`Processing FILL: ${data.trade_id} (${data.symbol})`);
 
-            // 1. Orders + Holdings 원자적 트랜잭션 처리
-            const buyerFullyFilled = data.buyer?.fully_filled === true;
-            const sellerFullyFilled = data.seller?.fully_filled === true;
-
-            await processFillAtomic(data, buyerFullyFilled, sellerFullyFilled);
-            console.log(`[DynamoDB] Atomic transaction completed: orders & holdings updated`);
-
-            // 3. Update Supabase Wallets
+            // Market Maker 체크 (MM은 wallet 업데이트 스킵)
             const [buyerIsMarketMaker, sellerIsMarketMaker] = await Promise.all([
                 isMarketMaker(data.buyer.user_id),
                 isMarketMaker(data.seller.user_id)
             ]);
-            const tradeValue = data.price * data.quantity;
 
-            if (buyerIsMarketMaker && sellerIsMarketMaker) {
-                console.log(`[Supabase] Skipping - Both parties are market makers`);
-            } else {
-                const client = await getSupabase();
-                if (client) {
-                    try {
-                        await Promise.all([
-                            !buyerIsMarketMaker ? updateBuyerWallet(client, data.buyer.user_id, tradeValue) : Promise.resolve(),
-                            !sellerIsMarketMaker ? updateSellerWallet(client, data.seller.user_id, tradeValue) : Promise.resolve()
-                        ]);
-                    } catch (walletErr) {
-                        // Wallet 실패는 DynamoDB 트랜잭션에 영향 없음 (별도 처리)
-                        // 추후 DLQ 또는 재처리 큐로 전송 가능
-                        console.error(`[Supabase] Wallet update FAILED - Trade ${data.trade_id}:`, {
-                            error: walletErr.message,
-                            buyer: !buyerIsMarketMaker ? data.buyer.user_id : 'MM',
-                            seller: !sellerIsMarketMaker ? data.seller.user_id : 'MM',
-                            tradeValue,
-                            symbol: data.symbol,
-                            quantity: data.quantity,
-                            price: data.price
-                        });
-                        // NOTE: DynamoDB 트랜잭션은 이미 완료됨. Wallet 실패는 별도 모니터링 필요.
-                    }
-                }
-            }
+            // 원자적 트랜잭션: Orders + Holdings + Wallets 모두 한번에 처리
+            const buyerFullyFilled = data.buyer?.fully_filled === true;
+            const sellerFullyFilled = data.seller?.fully_filled === true;
+
+            await processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, buyerIsMarketMaker, sellerIsMarketMaker);
+            console.log(`[DynamoDB] Atomic transaction completed: orders, holdings, wallets updated`);
+
+            // DynamoDB 업데이트 완료 후 알림 발행 (순서 보장)
+            await publishFillNotification(data, buyerFullyFilled, sellerFullyFilled);
 
         } catch (e) {
             console.error(`[fill-processor] Error:`, e.message);
@@ -165,18 +186,19 @@ export const handler = async (event) => {
 };
 
 // ========================================
-// 원자적 트랜잭션 처리 (Orders + Holdings)
+// 원자적 트랜잭션 처리 (Orders + Holdings + Wallets)
 // ========================================
-async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, maxRetries = 3) {
+async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, buyerIsMarketMaker = false, sellerIsMarketMaker = false, maxRetries = 3) {
     const symbol = data.symbol.toUpperCase();
     const quantity = data.quantity;
     const price = data.price;
+    const tradeValue = price * quantity;
     const now = new Date().toISOString();
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-            // 1. Holdings 현재 상태 조회 (트랜잭션 구성을 위해)
-            const [buyerHolding, sellerHolding] = await Promise.all([
+            // 1. Holdings 및 Wallets 현재 상태 조회 (트랜잭션 구성을 위해)
+            const queries = [
                 ddb.send(new GetCommand({
                     TableName: HOLDINGS_TABLE,
                     Key: { user_id: data.buyer.user_id, symbol }
@@ -185,7 +207,28 @@ async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, maxR
                     TableName: HOLDINGS_TABLE,
                     Key: { user_id: data.seller.user_id, symbol }
                 }))
-            ]);
+            ];
+
+            // MM이 아닌 경우에만 wallet 조회 추가
+            if (!buyerIsMarketMaker) {
+                queries.push(ddb.send(new GetCommand({
+                    TableName: WALLETS_TABLE,
+                    Key: { user_id: data.buyer.user_id, currency: 'BOLT' }
+                })));
+            }
+            if (!sellerIsMarketMaker) {
+                queries.push(ddb.send(new GetCommand({
+                    TableName: WALLETS_TABLE,
+                    Key: { user_id: data.seller.user_id, currency: 'BOLT' }
+                })));
+            }
+
+            const results = await Promise.all(queries);
+            const [buyerHolding, sellerHolding] = results;
+            let buyerWallet = null, sellerWallet = null;
+            let walletIndex = 2;
+            if (!buyerIsMarketMaker) buyerWallet = results[walletIndex++];
+            if (!sellerIsMarketMaker) sellerWallet = results[walletIndex];
 
             // 2. Buyer Holdings 계산
             const buyerCurrentQty = buyerHolding.Item?.quantity || 0;
@@ -310,10 +353,54 @@ async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, maxR
                 });
             }
 
+            // 4-5. Buyer Wallet 업데이트 (locked 차감 - 체결된 금액만큼 locked 감소)
+            if (!buyerIsMarketMaker && buyerWallet?.Item) {
+                const bwCurrent = buyerWallet.Item;
+                const bwNewLocked = Math.max(0, (bwCurrent.locked || 0) - tradeValue);
+                const bwVersion = bwCurrent.version || 0;
+
+                transactItems.push({
+                    Update: {
+                        TableName: WALLETS_TABLE,
+                        Key: { user_id: data.buyer.user_id, currency: 'BOLT' },
+                        UpdateExpression: 'SET locked = :locked, version = :newVer, updated_at = :now',
+                        ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
+                        ExpressionAttributeValues: {
+                            ':locked': bwNewLocked,
+                            ':ver': bwVersion,
+                            ':newVer': bwVersion + 1,
+                            ':now': now
+                        }
+                    }
+                });
+            }
+
+            // 4-6. Seller Wallet 업데이트 (available 증가 - 판매 대금 수령)
+            if (!sellerIsMarketMaker && sellerWallet?.Item) {
+                const swCurrent = sellerWallet.Item;
+                const swNewAvailable = (swCurrent.available || 0) + tradeValue;
+                const swVersion = swCurrent.version || 0;
+
+                transactItems.push({
+                    Update: {
+                        TableName: WALLETS_TABLE,
+                        Key: { user_id: data.seller.user_id, currency: 'BOLT' },
+                        UpdateExpression: 'SET available = :available, version = :newVer, updated_at = :now',
+                        ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
+                        ExpressionAttributeValues: {
+                            ':available': swNewAvailable,
+                            ':ver': swVersion,
+                            ':newVer': swVersion + 1,
+                            ':now': now
+                        }
+                    }
+                });
+            }
+
             // 5. 트랜잭션 실행
             await ddb.send(new TransactWriteCommand({ TransactItems: transactItems }));
 
-            console.log(`[Atomic] Trade ${data.trade_id}: Orders(buyer=${data.buyer.order_id}, seller=${data.seller.order_id}) + Holdings updated`);
+            console.log(`[Atomic] Trade ${data.trade_id}: Orders + Holdings + Wallets updated atomically`);
             return;
 
         } catch (err) {
@@ -322,8 +409,8 @@ async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, maxR
                 console.warn(`[Atomic] Transaction cancelled (attempt ${attempt + 1}/${maxRetries}):`,
                     reasons.map(r => r.Code).join(', '));
 
-                // ConditionalCheckFailed면 재시도 (optimistic locking 충돌)
-                if (reasons.some(r => r.Code === 'ConditionalCheckFailed')) {
+                // ConditionalCheckFailed 또는 TransactionConflict면 재시도
+                if (reasons.some(r => r.Code === 'ConditionalCheckFailed' || r.Code === 'TransactionConflict')) {
                     await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
                     continue;
                 }
@@ -336,183 +423,4 @@ async function processFillAtomic(data, buyerFullyFilled, sellerFullyFilled, maxR
     }
 
     throw new Error(`Atomic transaction failed after ${maxRetries} retries for trade ${data.trade_id}`);
-}
-
-// Helper: Update order in DynamoDB (레거시 - 개별 호출용)
-async function updateOrderInDynamoDB(userId, orderId, fillQuantity, fillPrice, isFullyFilled = false) {
-    const status = isFullyFilled ? 'FILLED' : 'PARTIAL';
-
-    await ddb.send(new UpdateCommand({
-        TableName: ORDERS_TABLE,
-        Key: { user_id: userId, order_id: orderId },
-        UpdateExpression: 'SET filled_qty = if_not_exists(filled_qty, :zero) + :qty, filled_price = :fillPrice, #status = :status, updated_at = :now',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: {
-            ':qty': fillQuantity,
-            ':zero': 0,
-            ':fillPrice': fillPrice,
-            ':status': status,
-            ':now': new Date().toISOString()
-        }
-    }));
-}
-
-// Helper: Update holdings in DynamoDB with optimistic locking
-async function updateHoldings(userId, symbol, quantity, price, side, maxRetries = 3) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            const existing = await ddb.send(new GetCommand({
-                TableName: HOLDINGS_TABLE,
-                Key: { user_id: userId, symbol: symbol.toUpperCase() }
-            }));
-
-            const currentQty = existing.Item?.quantity || 0;
-            const currentLocked = existing.Item?.locked || 0;
-            const currentVersion = existing.Item?.version || 0;
-            const currentAvgPrice = existing.Item?.avg_price || 0;
-            const currentTotalCost = currentQty * currentAvgPrice;
-
-            let newQty, newAvgPrice, newLocked;
-
-            if (side === 'BUY') {
-                const fillCost = quantity * price;
-                newQty = currentQty + quantity;
-                newAvgPrice = newQty > 0 ? Math.round((currentTotalCost + fillCost) / newQty * 10) / 10 : price;
-                newLocked = currentLocked;
-            } else {
-                newQty = Math.max(0, currentQty - quantity);
-                newLocked = Math.max(0, currentLocked - quantity);
-                newAvgPrice = newQty > 0 ? currentAvgPrice : 0;
-            }
-
-            if (newQty <= 0) {
-                try {
-                    await ddb.send(new DeleteCommand({
-                        TableName: HOLDINGS_TABLE,
-                        Key: { user_id: userId, symbol: symbol.toUpperCase() },
-                        ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
-                        ExpressionAttributeValues: { ':ver': currentVersion }
-                    }));
-                    return;
-                } catch (deleteErr) {
-                    if (deleteErr.name === 'ConditionalCheckFailedException') {
-                        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
-                        continue;
-                    }
-                    if (deleteErr.name !== 'ResourceNotFoundException') throw deleteErr;
-                }
-            } else {
-                try {
-                    if (existing.Item) {
-                        await ddb.send(new UpdateCommand({
-                            TableName: HOLDINGS_TABLE,
-                            Key: { user_id: userId, symbol: symbol.toUpperCase() },
-                            UpdateExpression: 'SET quantity = :qty, locked = :locked, avg_price = :avgPrice, version = :newVer, updated_at = :now',
-                            ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
-                            ExpressionAttributeValues: {
-                                ':qty': newQty,
-                                ':locked': newLocked,
-                                ':avgPrice': newAvgPrice,
-                                ':ver': currentVersion,
-                                ':newVer': currentVersion + 1,
-                                ':now': new Date().toISOString()
-                            }
-                        }));
-                    } else {
-                        await ddb.send(new PutCommand({
-                            TableName: HOLDINGS_TABLE,
-                            Item: {
-                                user_id: userId,
-                                symbol: symbol.toUpperCase(),
-                                quantity: newQty,
-                                locked: newLocked,
-                                avg_price: newAvgPrice,
-                                version: 1,
-                                updated_at: new Date().toISOString()
-                            },
-                            ConditionExpression: 'attribute_not_exists(user_id)'
-                        }));
-                    }
-                    return;
-                } catch (condErr) {
-                    if (condErr.name === 'ConditionalCheckFailedException') {
-                        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
-                        continue;
-                    }
-                    throw condErr;
-                }
-            }
-        } catch (err) {
-            if (attempt === maxRetries - 1) throw err;
-        }
-    }
-    throw new Error(`Holdings update failed after ${maxRetries} retries`);
-}
-
-// Helper: Update buyer wallet (locked 차감)
-async function updateBuyerWallet(client, userId, amount, maxRetries = 3) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        const { data: wallet, error: fetchErr } = await client
-            .from('wallets')
-            .select('locked')
-            .eq('user_id', userId)
-            .eq('currency', 'BOLT')
-            .single();
-
-        if (fetchErr || !wallet) {
-            console.warn(`[Wallet] Buyer ${userId}: wallet not found`);
-            return;
-        }
-
-        const newLocked = Math.max(0, (wallet.locked || 0) - amount);
-
-        const { error: updateErr } = await client
-            .from('wallets')
-            .update({ locked: newLocked })
-            .eq('user_id', userId)
-            .eq('currency', 'BOLT')
-            .eq('locked', wallet.locked);
-
-        if (!updateErr) {
-            console.log(`[Wallet] Buyer ${userId}: locked → ${newLocked}`);
-            return;
-        }
-        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
-    }
-    console.error(`[Wallet] Buyer ${userId}: update failed after ${maxRetries} retries`);
-    throw new Error(`Buyer wallet update failed for ${userId}`);
-}
-
-// Helper: Update seller wallet (available 증가)
-async function updateSellerWallet(client, userId, amount, maxRetries = 3) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        const { data: wallet, error: fetchErr } = await client
-            .from('wallets')
-            .select('available')
-            .eq('user_id', userId)
-            .eq('currency', 'BOLT')
-            .single();
-
-        if (fetchErr || !wallet) {
-            console.warn(`[Wallet] Seller ${userId}: wallet not found`);
-            return;
-        }
-
-        const newAvailable = (wallet.available || 0) + amount;
-
-        const { error: updateErr } = await client
-            .from('wallets')
-            .update({ available: newAvailable })
-            .eq('user_id', userId)
-            .eq('currency', 'BOLT')
-            .eq('available', wallet.available);
-
-        if (!updateErr) {
-            console.log(`[Wallet] Seller ${userId}: available → ${newAvailable}`);
-            return;
-        }
-        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
-    }
-    console.error(`[Wallet] Seller ${userId}: update failed after ${maxRetries} retries`);
-    throw new Error(`Seller wallet update failed for ${userId}`);
 }

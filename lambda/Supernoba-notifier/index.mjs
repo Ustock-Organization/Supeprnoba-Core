@@ -1,3 +1,8 @@
+/**
+ * @deprecated 2026-01-12 - stock-processor (C++)로 이전됨
+ * 이전 위치: Supernoba-back/src/processors/notification_processor.cpp
+ * AWS Lambda 트리거를 비활성화하고, 이 파일은 참조용으로만 보존
+ */
 // Supernoba-notifier
 // Trigger: Kinesis Streams (supernoba-fills, supernoba-order-status)
 // Logic: Send WebSocket notifications to users for order updates
@@ -61,7 +66,9 @@ export const handler = async (event) => {
             const data = JSON.parse(payloadStr);
 
             // Handle FILL events (체결 알림)
-            if (data.event === 'FILL') {
+            // 중요: fill-processor에서 발행한 이벤트만 처리 (DynamoDB 업데이트 완료 후)
+            // source가 없는 FILL 이벤트는 C++에서 직접 발행한 것이므로 무시 (race condition 방지)
+            if (data.event === 'FILL' && data.source === 'fill-processor') {
                 await handleFillEvent(data);
             }
             // Handle ORDER_STATUS events (상태 변경 알림)

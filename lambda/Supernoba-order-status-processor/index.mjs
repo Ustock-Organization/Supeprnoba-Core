@@ -1,42 +1,27 @@
-// Supernoba-order-status-processor
+/**
+ * @deprecated 2026-01-12 - stock-processor (C++)로 이전됨
+ * 이전 위치: Supernoba-back/src/processors/order_status_processor.cpp
+ * AWS Lambda 트리거를 비활성화하고, 이 파일은 참조용으로만 보존
+ */
+// Supernoba-order-status-processor - DynamoDB Version (Supabase Removed)
 // Trigger: Kinesis Stream (supernoba-order-status)
 // Logic:
 //   1. ACCEPTED: Create order in DynamoDB (주문 저장)
 //   2. Update DynamoDB orders (status)
-//   3. CANCELLED: Unlock balance (Supabase)
+//   3. CANCELLED: Unlock balance/holdings (DynamoDB)
 // Note: WebSocket notifications moved to Supernoba-notifier
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 
 const REGION = process.env.AWS_REGION || 'ap-northeast-2';
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
+const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
 
 // DynamoDB Client
 const dynamoClient = new DynamoDBClient({ region: REGION });
 const ddb = DynamoDBDocumentClient.from(dynamoClient);
-
-// Supabase Client (lazy import)
-let supabaseClient = null;
-
-async function getSupabase() {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
-
-    if (!supabaseClient) {
-        try {
-            const { createClient } = await import('@supabase/supabase-js');
-            supabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-                auth: { persistSession: false }
-            });
-        } catch (err) {
-            console.warn(`[Supabase] Failed to initialize:`, err.message);
-            return null;
-        }
-    }
-    return supabaseClient;
-}
 
 export const handler = async (event) => {
     const records = event.Records || [];
@@ -101,6 +86,8 @@ async function createOrderInDynamoDB(data) {
         quantity: Number(data.quantity),
         filled_qty: 0,
         status: 'ACCEPTED',
+        // 시장가 주문을 위한 lock_amount 저장 (환불 시 사용)
+        lock_amount: data.lock_amount ? Number(data.lock_amount) : null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
     };
@@ -176,35 +163,51 @@ async function handleCancel(data) {
         }
 
         if (order.side === 'BUY') {
-            // BUY 취소: Supabase 잔고 언락
-            const lockAmount = Number(order.price) * remainingQty;
-            const client = await getSupabase();
-            if (!client || lockAmount <= 0) return;
+            // BUY 취소: DynamoDB wallet 언락
+            // 시장가 주문의 경우 lock_amount 사용 (price가 2147483647이므로)
+            // 지정가 주문의 경우 price * remainingQty 사용
+            let lockAmount;
+            if (order.lock_amount && order.type === 'MARKET') {
+                // 시장가 주문: 비례 계산 (이미 체결된 수량 제외)
+                const originalQty = Number(order.quantity);
+                lockAmount = Math.ceil(Number(order.lock_amount) * (remainingQty / originalQty));
+                console.log(`[handleCancel] MARKET order unlock: ${lockAmount} (lock_amount=${order.lock_amount}, remaining=${remainingQty}/${originalQty})`);
+            } else {
+                // 지정가 주문: 기존 방식
+                lockAmount = Number(order.price) * remainingQty;
+            }
 
-            const { data: wallet, error: walletError } = await client
-                .from('wallets')
-                .select('available, locked')
-                .eq('user_id', data.user_id)
-                .eq('currency', 'BOLT')
-                .single();
+            if (lockAmount <= 0) return;
 
-            if (!walletError && wallet) {
-                const newAvailable = Number(wallet.available) + lockAmount;
-                const newLocked = Math.max(0, Number(wallet.locked) - lockAmount);
+            // DynamoDB wallet에서 locked → available 이동
+            const walletResult = await ddb.send(new GetCommand({
+                TableName: WALLETS_TABLE,
+                Key: { user_id: data.user_id, currency: 'BOLT' }
+            }));
 
-                const { error: updateError } = await client
-                    .from('wallets')
-                    .update({ available: newAvailable, locked: newLocked })
-                    .eq('user_id', data.user_id)
-                    .eq('currency', 'BOLT');
+            if (walletResult.Item) {
+                const wallet = walletResult.Item;
+                const newAvailable = Number(wallet.available || 0) + lockAmount;
+                const newLocked = Math.max(0, Number(wallet.locked || 0) - lockAmount);
+                const version = wallet.version || 0;
 
-                if (!updateError) {
-                    console.log(`[order-status-processor] Unlocked ${lockAmount} BOLT for ${data.order_id}`);
-                }
+                await ddb.send(new UpdateCommand({
+                    TableName: WALLETS_TABLE,
+                    Key: { user_id: data.user_id, currency: 'BOLT' },
+                    UpdateExpression: 'SET available = :available, locked = :locked, version = :newVer, updated_at = :now',
+                    ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
+                    ExpressionAttributeValues: {
+                        ':available': newAvailable,
+                        ':locked': newLocked,
+                        ':ver': version,
+                        ':newVer': version + 1,
+                        ':now': new Date().toISOString()
+                    }
+                }));
+                console.log(`[order-status-processor] Unlocked ${lockAmount} BOLT for ${data.order_id}`);
             }
         } else if (order.side === 'SELL') {
             // SELL 취소: DynamoDB Holdings 언락
-            const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
             const symbol = order.symbol || data.symbol;
 
             if (!symbol) return;
@@ -215,15 +218,20 @@ async function handleCancel(data) {
             }));
 
             if (holdingsResult.Item) {
-                const currentLocked = Number(holdingsResult.Item.locked || 0);
+                const holding = holdingsResult.Item;
+                const currentLocked = Number(holding.locked || 0);
                 const newLocked = Math.max(0, currentLocked - remainingQty);
+                const version = holding.version || 0;
 
                 await ddb.send(new UpdateCommand({
                     TableName: HOLDINGS_TABLE,
                     Key: { user_id: data.user_id, symbol: symbol.toUpperCase() },
-                    UpdateExpression: 'SET locked = :locked, updated_at = :now',
+                    UpdateExpression: 'SET locked = :locked, version = :newVer, updated_at = :now',
+                    ConditionExpression: 'version = :ver OR attribute_not_exists(version)',
                     ExpressionAttributeValues: {
                         ':locked': newLocked,
+                        ':ver': version,
+                        ':newVer': version + 1,
                         ':now': new Date().toISOString()
                     }
                 }));

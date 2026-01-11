@@ -10,14 +10,20 @@ $LAMBDA_DIR = $SCRIPT_DIR
 $REGION = "ap-northeast-2"
 
 # Lambda functions to deploy
+# NOTE: 아래 4개 Lambda는 stock-processor (C++)로 이전됨 - 2026-01-12
+#   - Supernoba-fill-processor → Supernoba-back/src/processors/fill_processor.cpp
+#   - Supernoba-history-saver → Supernoba-back/src/processors/history_processor.cpp
+#   - Supernoba-notifier → Supernoba-back/src/processors/notification_processor.cpp
+#   - Supernoba-order-status-processor → Supernoba-back/src/processors/order_status_processor.cpp
 $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-admin"; Path = "Supernoba-admin"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-order-router"; Path = "Supernoba-order-router"; HasPackageJson = $true; HasBuild = $true },
     @{ Name = "Supernoba-asset-handler"; Path = "Supernoba-asset-handler"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-fill-processor"; Path = "Supernoba-fill-processor"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-history-saver"; Path = "Supernoba-history-saver"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-notifier"; Path = "Supernoba-notifier"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-order-status-processor"; Path = "Supernoba-order-status-processor"; HasPackageJson = $true; HasBuild = $false },
+    # DEPRECATED: stock-processor로 이전됨
+    # @{ Name = "Supernoba-fill-processor"; Path = "Supernoba-fill-processor"; HasPackageJson = $true; HasBuild = $false },
+    # @{ Name = "Supernoba-history-saver"; Path = "Supernoba-history-saver"; HasPackageJson = $true; HasBuild = $false },
+    # @{ Name = "Supernoba-notifier"; Path = "Supernoba-notifier"; HasPackageJson = $true; HasBuild = $false },
+    # @{ Name = "Supernoba-order-status-processor"; Path = "Supernoba-order-status-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-chart-data-handler"; Path = "Supernoba-chart-data-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-connect-handler"; Path = "Supernoba-connect-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-subscribe-handler"; Path = "Supernoba-subscribe-handler"; HasPackageJson = $false; HasBuild = $false },
