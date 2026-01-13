@@ -1,11 +1,16 @@
 #include "engine_core.h"
 #include "logger.h"
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
 
 EngineCore::EngineCore(MarketDataHandler* handler)
     : handler_(handler) {
+    // MarketDataHandler에 EngineCore 참조 설정 (완전 체결된 주문 제거용)
+    if (handler_) {
+        handler_->setEngineCore(this);
+    }
     Logger::info("EngineCore initialized");
 }
 
@@ -115,6 +120,20 @@ bool EngineCore::replaceOrder(const std::string& symbol,
     return true;
 }
 
+void EngineCore::removeFilledOrder(const std::string& symbol,
+                                    const std::string& order_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+    auto sym_it = order_maps_.find(symbol);
+    if (sym_it == order_maps_.end()) return;
+
+    auto ord_it = sym_it->second.find(order_id);
+    if (ord_it == sym_it->second.end()) return;
+
+    sym_it->second.erase(ord_it);
+    Logger::info("Filled order removed from map:", order_id, "symbol:", symbol);
+}
+
 std::string EngineCore::snapshotOrderBook(const std::string& symbol) {
     nlohmann::json snapshot;
     size_t order_count = 0;
@@ -222,6 +241,16 @@ bool EngineCore::removeOrderBook(const std::string& symbol) {
 
     Logger::info("OrderBook removed:", symbol);
     return true;
+}
+
+bool EngineCore::hasOrder(const std::string& symbol,
+                           const std::string& order_id) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+
+    auto sym_it = order_maps_.find(symbol);
+    if (sym_it == order_maps_.end()) return false;
+
+    return sym_it->second.find(order_id) != sym_it->second.end();
 }
 
 size_t EngineCore::getSymbolCount() const {

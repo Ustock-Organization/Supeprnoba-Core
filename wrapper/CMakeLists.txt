@@ -22,8 +22,8 @@ find_package(hiredis CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
 # AWS SDK (vcpkg 통해 설치)
-find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis apigatewaymanagementapi)
-message(STATUS "Building with Kinesis + API Gateway Management support")
+find_package(AWSSDK CONFIG REQUIRED COMPONENTS kinesis apigatewaymanagementapi dynamodb)
+message(STATUS "Building with Kinesis + API Gateway Management + DynamoDB support")
 
 # Proto 파일 컴파일
 set(PROTO_FILES proto/snapshot.proto)
@@ -62,6 +62,7 @@ set(SOURCES
     src/kinesis_consumer.cpp
     src/kinesis_producer.cpp
     src/notification_client.cpp
+    src/dynamodb_client.cpp
 )
 
 # 메인 실행파일

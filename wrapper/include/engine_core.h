@@ -23,12 +23,18 @@ public:
     bool cancelOrder(const std::string& symbol, const std::string& order_id);
     bool replaceOrder(const std::string& symbol, const std::string& order_id,
                       int64_t qty_delta, liquibook::book::Price new_price);
+
+    // 완전 체결된 주문을 order_maps_에서 제거 (메모리 누수 방지)
+    void removeFilledOrder(const std::string& symbol, const std::string& order_id);
     
     // === 스냅샷 API (gRPC용) ===
     std::string snapshotOrderBook(const std::string& symbol);
     bool restoreOrderBook(const std::string& symbol, const std::string& data);
     bool removeOrderBook(const std::string& symbol);
     
+    // === 주문 조회 API ===
+    bool hasOrder(const std::string& symbol, const std::string& order_id) const;
+
     // === 메트릭 API ===
     size_t getSymbolCount() const;
     size_t getOrderCount(const std::string& symbol) const;

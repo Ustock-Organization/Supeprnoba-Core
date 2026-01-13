@@ -71,6 +71,16 @@ fi
 # WebSocket 직접 알림 (API Gateway)
 export WEBSOCKET_ENDPOINT="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/"
 
+# DynamoDB 설정 (ACCEPTED 주문 복원)
+export DYNAMODB_ORDERS_TABLE="supernoba-orders"
+if [ "$DEV_MODE" == "true" ]; then
+    # DEV 모드: DynamoDB에서 주문 로드 비활성화 (빠른 시작)
+    export LOAD_ORDERS_FROM_DYNAMODB="false"
+else
+    # PROD 모드: DynamoDB에서 ACCEPTED 주문 로드
+    export LOAD_ORDERS_FROM_DYNAMODB="true"
+fi
+
 # 기타 설정
 export GRPC_PORT="50051"
 if [ "$DEBUG_MODE" == "true" ]; then
@@ -114,6 +124,8 @@ echo "  - KINESIS_FILLS: $KINESIS_FILLS_STREAM"
 echo "  - KINESIS_STATUS: $KINESIS_STATUS_STREAM"
 echo "  - REDIS_HOST: $REDIS_HOST"
 echo "  - DEPTH_CACHE: $DEPTH_CACHE_HOST"
+echo "  - DYNAMODB_TABLE: $DYNAMODB_ORDERS_TABLE"
+echo "  - LOAD_FROM_DYNAMODB: $LOAD_ORDERS_FROM_DYNAMODB"
 echo "  - LOG_LEVEL: $LOG_LEVEL"
 echo "  - DEV_MODE: $DEV_MODE"
 if [ "$DEV_MODE" == "true" ]; then

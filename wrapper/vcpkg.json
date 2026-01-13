@@ -12,7 +12,7 @@
     "openssl",
     {
       "name": "aws-sdk-cpp",
-      "features": ["kinesis", "apigatewaymanagementapi"]
+      "features": ["kinesis", "apigatewaymanagementapi", "dynamodb"]
     }
   ]
 }

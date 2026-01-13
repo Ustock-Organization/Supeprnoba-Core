@@ -8,6 +8,7 @@
 #include "metrics.h"
 #include "kinesis_consumer.h"
 #include "kinesis_producer.h"
+#include "dynamodb_client.h"
 
 #include <iostream>
 #include <csignal>
@@ -136,6 +137,48 @@ int main(int argc, char* argv[]) {
                 }
             }
             Logger::info("Restored", restored_count, "orderbooks from Redis");
+        }
+
+        // === DynamoDB에서 ACCEPTED 주문 복원 ===
+        // 스냅샷에 없는 주문들(엔진 재시작 중 생성된 주문 등)을 복원
+        const auto orders_table = Config::get("DYNAMODB_ORDERS_TABLE", "supernoba-orders");
+        const bool load_from_dynamodb = Config::get("LOAD_ORDERS_FROM_DYNAMODB", "true") == "true";
+
+        if (load_from_dynamodb) {
+            Logger::info("Loading ACCEPTED orders from DynamoDB...");
+            DynamoDBClient dynamodb(aws_region);
+
+            if (dynamodb.initialize()) {
+                auto accepted_orders = dynamodb.loadAcceptedOrders(orders_table);
+
+                int added_count = 0;
+                int skipped_count = 0;
+
+                for (const auto& order : accepted_orders) {
+                    // 이미 오더북에 있는 주문은 스킵 (스냅샷에서 복원된 경우)
+                    if (engine.hasOrder(order->symbol(), order->order_id())) {
+                        ++skipped_count;
+                        continue;
+                    }
+
+                    // 오더북에 주문 추가
+                    engine.addOrder(order);
+                    ++added_count;
+
+                    Logger::debug("Added order from DynamoDB:", order->order_id(),
+                                 "symbol:", order->symbol(),
+                                 "side:", (order->is_buy() ? "BUY" : "SELL"),
+                                 "price:", order->price(),
+                                 "qty:", order->order_qty());
+                }
+
+                Logger::info("DynamoDB order restore complete: added=", added_count,
+                            ", skipped (already in snapshot)=", skipped_count);
+            } else {
+                Logger::warn("DynamoDB client initialization failed - skipping order restore");
+            }
+        } else {
+            Logger::info("LOAD_ORDERS_FROM_DYNAMODB=false - skipping DynamoDB order restore");
         }
         
         // Kinesis Consumer 시작
