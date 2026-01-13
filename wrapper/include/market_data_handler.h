@@ -16,6 +16,7 @@ namespace aws_wrapper {
 
 class RedisClient;          // forward declaration
 class NotificationClient;   // forward declaration
+class EngineCore;           // forward declaration
 
 // Depth levels: 10 bid + 10 ask
 using OrderBook = liquibook::book::DepthOrderBook<OrderPtr, 10>;
@@ -77,10 +78,14 @@ public:
     int getCurrentTradingDay() const;
     void loadPrevClose(const std::string& symbol);
 
+    // EngineCore 설정 (완전 체결된 주문 제거용)
+    void setEngineCore(EngineCore* engine) { engine_ = engine; }
+
 private:
     IProducer* producer_;
     RedisClient* redis_;
     NotificationClient* notifier_;
+    EngineCore* engine_ = nullptr;
     std::unordered_map<std::string, DayData> symbol_day_data_;
     
     void updateTickerCache(const std::string& symbol, uint64_t price);

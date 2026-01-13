@@ -72,6 +72,10 @@ void NotificationClient::shutdown() {
 void NotificationClient::enqueue(const NotificationMessage& msg) {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (queue_.size() >= MAX_QUEUE_SIZE) {
+            Logger::warn("NotificationClient queue full, dropping message");
+            return;
+        }
         queue_.push(msg);
     }
     queue_cv_.notify_one();

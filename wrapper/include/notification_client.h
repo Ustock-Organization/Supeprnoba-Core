@@ -14,6 +14,9 @@
 
 namespace aws_wrapper {
 
+// 큐 최대 크기 제한 (메모리 누수 방지)
+constexpr size_t MAX_QUEUE_SIZE = 10000;
+
 class RedisClient;  // Forward declaration
 
 // 알림 메시지 구조체
