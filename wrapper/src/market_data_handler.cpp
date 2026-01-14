@@ -57,9 +57,14 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     
     // Kinesis로 REJECTED 이벤트 발행 (order-status 스트림)
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "REJECTED", reason ? reason : "");
         Logger::info("Published REJECTED event to Kinesis:", order->order_id());
+    }
+
+    // Reject된 주문을 order_maps_에서 제거 (메모리 누수 방지)
+    if (engine_) {
+        engine_->removeFilledOrder(order->symbol(), order->order_id());
     }
 }
 
@@ -193,8 +198,12 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         bool buyer_fully_filled = order->is_buy() ? order_fully_filled : matched_order_fully_filled;
         bool seller_fully_filled = order->is_buy() ? matched_order_fully_filled : order_fully_filled;
         
+        // buyer_is_maker: order is inbound (taker), matched_order is maker
+        // if order is buy, buyer is taker (not maker)
+        // if order is sell, buyer (matched_order) is maker
+        bool buyer_is_maker = !order->is_buy();
         producer_->publishFill(symbol, bo, so, buyer_id, seller_id, fill_qty, fill_price,
-                               buyer_fully_filled, seller_fully_filled);
+                               buyer_fully_filled, seller_fully_filled, buyer_is_maker);
         Logger::info("PUBLISHED_FILL:", symbol, fill_price, "x", fill_qty, 
                      "buyer_filled:", buyer_fully_filled, "seller_filled:", seller_fully_filled);
         

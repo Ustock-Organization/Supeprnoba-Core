@@ -1,0 +1,32 @@
+# Supernoba Matching Engine 로그 로테이션 설정
+# 위치: /etc/logrotate.d/supernoba-engine
+# 대상 서버: stock-streamer (EC2)
+
+/var/log/supernoba/engine/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 ubuntu ubuntu
+    dateext
+    dateformat -%Y%m%d
+    sharedscripts
+    postrotate
+        # 엔진 프로세스에 SIGHUP 전송 (로그 파일 재오픈)
+        /usr/bin/pkill -HUP -f 'matching_engine' 2>/dev/null || true
+    endscript
+}
+
+/var/log/supernoba/streamer/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 ubuntu ubuntu
+    dateext
+    dateformat -%Y%m%d
+}

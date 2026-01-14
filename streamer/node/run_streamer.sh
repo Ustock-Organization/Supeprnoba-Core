@@ -39,12 +39,18 @@ export WEBSOCKET_ENDPOINT="${WEBSOCKET_ENDPOINT:-l2ptm85wub.execute-api.ap-north
 export AWS_REGION="${AWS_REGION:-ap-northeast-2}"
 export DEBUG_MODE="$DEBUG_MODE"
 
+# Admin WebSocket (MM 상태 브로드캐스트용)
+export ADMIN_WEBSOCKET_ENDPOINT="${ADMIN_WEBSOCKET_ENDPOINT:-2qlrv92731.execute-api.ap-northeast-2.amazonaws.com/admin}"
+export BACKUP_CACHE_HOST="${BACKUP_CACHE_HOST:-master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com}"
+
 echo ""
 echo "=== 환경 설정 ==="
 echo "VALKEY_HOST: $VALKEY_HOST"
 echo "VALKEY_PORT: $VALKEY_PORT"
 echo "VALKEY_TLS: $VALKEY_TLS"
 echo "WEBSOCKET_ENDPOINT: $WEBSOCKET_ENDPOINT"
+echo "ADMIN_WEBSOCKET_ENDPOINT: $ADMIN_WEBSOCKET_ENDPOINT"
+echo "BACKUP_CACHE_HOST: $BACKUP_CACHE_HOST"
 echo "DEBUG_MODE: $DEBUG_MODE"
 echo "INIT_MODE: $INIT_MODE"
 echo "AWS_REGION: $AWS_REGION"

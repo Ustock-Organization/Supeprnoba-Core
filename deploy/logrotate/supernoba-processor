@@ -1,0 +1,20 @@
+# Supernoba Stock Processor 로그 로테이션 설정
+# 위치: /etc/logrotate.d/supernoba-processor
+# 대상 서버: stock-processor (EC2)
+
+/var/log/supernoba/processor/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 ubuntu ubuntu
+    dateext
+    dateformat -%Y%m%d
+    sharedscripts
+    postrotate
+        # stock-processor에 SIGHUP 전송
+        /usr/bin/pkill -HUP -f 'stock-processor' 2>/dev/null || true
+    endscript
+}
