@@ -93,7 +93,7 @@ fi
 # 경로 설정
 # ========================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$HOME/liquibook"
+REPO_ROOT="$HOME/Supeprnoba-Core"
 WRAPPER_DIR="$REPO_ROOT/wrapper"
 BUILD_DIR="$WRAPPER_DIR/build"
 
