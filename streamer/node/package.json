@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.0.0",
+    "@aws-sdk/client-kinesis": "^3.0.0",
     "ioredis": "^5.0.0"
   }
 }

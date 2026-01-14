@@ -1,12 +1,16 @@
 {
   "name": "supernoba-auth-layer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Supernoba Authentication Layer - JWT verification for Lambda functions",
   "type": "module",
   "main": "verifyAuth.mjs",
   "exports": {
     ".": "./verifyAuth.mjs",
     "./verifyAuth": "./verifyAuth.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
   },
   "keywords": [
     "supernoba",

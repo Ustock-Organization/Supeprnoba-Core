@@ -1,0 +1,12 @@
+{
+  "name": "supernoba-auth",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Unified authentication Lambda (X OAuth + User Init)",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.624.0",
+    "@aws-sdk/client-dynamodb": "^3.624.0",
+    "@aws-sdk/lib-dynamodb": "^3.624.0"
+  }
+}

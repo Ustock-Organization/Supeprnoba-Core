@@ -1,0 +1,13 @@
+{
+  "name": "supernoba-x-auth",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "zip -r function.zip index.mjs && aws lambda update-function-code --function-name Supernoba-x-auth --zip-file fileb://function.zip --region ap-northeast-2"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  }
+}

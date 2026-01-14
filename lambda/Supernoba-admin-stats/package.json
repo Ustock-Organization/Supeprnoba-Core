@@ -1,0 +1,14 @@
+{
+  "name": "supernoba-admin-stats",
+  "version": "1.0.0",
+  "description": "Supernoba Admin - Trading Statistics Lambda",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.400.0",
+    "@aws-sdk/lib-dynamodb": "^3.400.0",
+    "@aws-sdk/client-secrets-manager": "^3.400.0",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.0"
+  }
+}

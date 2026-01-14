@@ -97,18 +97,32 @@ std::vector<Candle> ValkeyClient::get_closed_candles(const std::string& symbol) 
     redisReply* reply = (redisReply*)redisCommand(ctx_, "LRANGE %s 0 -1", key.c_str());
     if (!reply) return candles;
     
+    // 숫자와 문자열 모두 처리하는 헬퍼 함수
+    auto get_double = [](const json& j, const std::string& key) -> double {
+        if (!j.contains(key)) return 0.0;
+        if (j[key].is_number()) return j[key].get<double>();
+        if (j[key].is_string()) return std::stod(j[key].get<std::string>());
+        return 0.0;
+    };
+    auto get_string = [](const json& j, const std::string& key) -> std::string {
+        if (!j.contains(key)) return "";
+        if (j[key].is_string()) return j[key].get<std::string>();
+        if (j[key].is_number()) return std::to_string(static_cast<long long>(j[key].get<double>()));
+        return "";
+    };
+
     if (reply->type == REDIS_REPLY_ARRAY) {
         for (size_t i = 0; i < reply->elements; i++) {
             try {
                 json j = json::parse(reply->element[i]->str);
                 Candle c;
                 c.symbol = symbol;
-                c.time = j.value("t", "");
-                c.open = std::stod(j.value("o", "0"));
-                c.high = std::stod(j.value("h", "0"));
-                c.low = std::stod(j.value("l", "0"));
-                c.close = std::stod(j.value("c", "0"));
-                c.volume = std::stod(j.value("v", "0"));
+                c.time = get_string(j, "t");
+                c.open = get_double(j, "o");
+                c.high = get_double(j, "h");
+                c.low = get_double(j, "l");
+                c.close = get_double(j, "c");
+                c.volume = get_double(j, "v");
                 
                 // t_epoch 필드가 있으면 사용 (성능 최적화)
                 // 없으면 epoch() 메서드로 변환 (하위 호환성)

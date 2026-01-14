@@ -1,7 +1,9 @@
 // Supernoba-admin-mm: 마켓메이커 관리 Lambda with Authentication
 import pg from 'pg';
-import Redis from 'ioredis';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+
+// Common Layer - Valkey, CORS
+import { getValkeyClient, CORS } from '/opt/nodejs/index.mjs';
 
 // === Auth Layer Import ===
 let verifyAdmin, authErrorResponse;
@@ -33,22 +35,25 @@ const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoc
 const RDS_PORT = parseInt(process.env.RDS_PORT || '5432');
 const DB_NAME = process.env.DB_NAME || 'postgres';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
-// MM 전용: 백업 캐시 사용 (depth cache와 분리)
-const VALKEY_HOST = process.env.VALKEY_HOST || 'master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com';
 
-const valkey = new Redis({ host: VALKEY_HOST, port: 6379, tls: {}, connectTimeout: 5000, maxRetriesPerRequest: 3 });
-valkey.on('error', (err) => console.error('Redis error:', err.message));
+// Layer를 통한 Valkey 클라이언트 (backup 캐시 사용)
+const valkey = getValkeyClient({ type: 'backup', preset: 'admin' });
 
 const secretsManager = new SecretsManagerClient({ region: 'ap-northeast-2' });
 let cachedCreds = null;
 let pgClient = null;
 
+// Layer의 CORS.STANDARD 사용
 const headers = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Content-Type': 'application/json',
+  ...CORS.STANDARD,
 };
+
+// EC2 MM Service에 제어 신호 발송
+async function sendMMControl(action, symbol = null) {
+  const message = { action, symbol, timestamp: Date.now() };
+  await valkey.publish('mm:control', JSON.stringify(message));
+  console.log(`[MM Control] Sent: ${action}`, symbol || '');
+}
 
 // 관리자 인증 체크 (JWT + API Key 병행)
 const checkAdmin = async (event) => {
@@ -132,6 +137,21 @@ export const handler = async (event) => {
         const allRunning = await db.query('SELECT symbol, current_price, order_count FROM market_maker_configs WHERE is_running = true');
         return { statusCode: 200, headers, body: JSON.stringify({ running: running === 'true', symbol: sym, basePrice: basePrice ? parseFloat(basePrice) : 100, currentPrice: currentPrice ? parseFloat(currentPrice) : null, orderCount: orderCount ? parseInt(orderCount) : 0, config: configStr ? JSON.parse(configStr) : null, runningSymbols: allRunning.rows }) };
       }
+      // 디버그: Redis 데이터 직접 확인
+      if (action === 'debug_redis') {
+        const allSymbols = await valkey.smembers('mm:all:symbols');
+        const runningSymbols = await valkey.smembers('mm:running:symbols');
+        const adminConnections = await valkey.scard('admin:connections');
+        const configs = {};
+        const startedAt = {};
+        for (const s of allSymbols) {
+          const cfgStr = await valkey.get(`mm:config:${s}`);
+          configs[s] = cfgStr ? JSON.parse(cfgStr) : null;
+          const started = await valkey.get(`mm:started_at:${s}`);
+          startedAt[s] = started || null;
+        }
+        return { statusCode: 200, headers, body: JSON.stringify({ allSymbols, runningSymbols, adminConnections, configs, startedAt }) };
+      }
       return { statusCode: 200, headers, body: JSON.stringify([]) };
     }
 
@@ -144,7 +164,8 @@ export const handler = async (event) => {
 
       if (action === 'save') {
         if (!sym) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Symbol required' }) };
-        const finalCfg = {
+        // DB용 복합 포맷
+        const dbCfg = {
           basePrice: basePrice || 100,
           weeklyAmplitude: cfg.weeklyAmplitude ?? 0.15,
           dailyAmplitude: cfg.dailyAmplitude ?? 0.08,
@@ -153,12 +174,21 @@ export const handler = async (event) => {
           noiseAmplitude: cfg.noiseAmplitude ?? 0.005,
           tickInterval: cfg.tickInterval || 500
         };
-        await db.query(`INSERT INTO market_maker_configs (symbol, base_price, weekly_amplitude, daily_amplitude, hourly_amplitude, minute_amplitude, noise_amplitude, tick_interval, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP) ON CONFLICT (symbol) DO UPDATE SET base_price=EXCLUDED.base_price, weekly_amplitude=EXCLUDED.weekly_amplitude, daily_amplitude=EXCLUDED.daily_amplitude, hourly_amplitude=EXCLUDED.hourly_amplitude, minute_amplitude=EXCLUDED.minute_amplitude, noise_amplitude=EXCLUDED.noise_amplitude, tick_interval=EXCLUDED.tick_interval, updated_at=CURRENT_TIMESTAMP`, [sym, finalCfg.basePrice, finalCfg.weeklyAmplitude, finalCfg.dailyAmplitude, finalCfg.hourlyAmplitude, finalCfg.minuteAmplitude, finalCfg.noiseAmplitude, finalCfg.tickInterval]);
-        // 실행 중인 경우 Valkey에도 즉시 반영
+        // Redis용 단순 포맷 (WebSocket 핸들러 호환)
+        const redisCfg = {
+          basePrice: basePrice || 100,
+          period: cfg.period ?? 600,
+          amplitude: cfg.amplitude ?? 0.1,
+          tickInterval: cfg.tickInterval || 1000,
+          tradeInterval: cfg.tradeInterval ?? 3,
+          tradeQuantity: cfg.tradeQuantity ?? 50
+        };
+        await db.query(`INSERT INTO market_maker_configs (symbol, base_price, weekly_amplitude, daily_amplitude, hourly_amplitude, minute_amplitude, noise_amplitude, tick_interval, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP) ON CONFLICT (symbol) DO UPDATE SET base_price=EXCLUDED.base_price, weekly_amplitude=EXCLUDED.weekly_amplitude, daily_amplitude=EXCLUDED.daily_amplitude, hourly_amplitude=EXCLUDED.hourly_amplitude, minute_amplitude=EXCLUDED.minute_amplitude, noise_amplitude=EXCLUDED.noise_amplitude, tick_interval=EXCLUDED.tick_interval, updated_at=CURRENT_TIMESTAMP`, [sym, dbCfg.basePrice, dbCfg.weeklyAmplitude, dbCfg.dailyAmplitude, dbCfg.hourlyAmplitude, dbCfg.minuteAmplitude, dbCfg.noiseAmplitude, dbCfg.tickInterval]);
+        // mm:all:symbols에 추가 (WebSocket 핸들러가 목록 조회 시 사용)
+        await valkey.sadd('mm:all:symbols', sym);
+        // Redis에 단순 포맷으로 저장 (항상)
+        await valkey.set(`mm:config:${sym}`, JSON.stringify(redisCfg));
         const isRunning = await valkey.sismember('mm:running:symbols', sym);
-        if (isRunning) {
-          await valkey.set(`mm:config:${sym}`, JSON.stringify(finalCfg));
-        }
         return { statusCode: 200, headers, body: JSON.stringify({ success: true, applied: !!isRunning }) };
       }
 
@@ -181,20 +211,59 @@ export const handler = async (event) => {
         await db.query(`INSERT INTO market_maker_configs (symbol, base_price, weekly_amplitude, daily_amplitude, hourly_amplitude, minute_amplitude, noise_amplitude, tick_interval, is_running, started_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (symbol) DO UPDATE SET base_price=EXCLUDED.base_price, weekly_amplitude=EXCLUDED.weekly_amplitude, daily_amplitude=EXCLUDED.daily_amplitude, hourly_amplitude=EXCLUDED.hourly_amplitude, minute_amplitude=EXCLUDED.minute_amplitude, noise_amplitude=EXCLUDED.noise_amplitude, tick_interval=EXCLUDED.tick_interval, is_running=true, started_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP`, [sym, finalBasePrice, finalCfg.weeklyAmplitude, finalCfg.dailyAmplitude, finalCfg.hourlyAmplitude, finalCfg.minuteAmplitude, finalCfg.noiseAmplitude, finalCfg.tickInterval]);
         await valkey.set('mm:running', 'true');
         await valkey.sadd('mm:running:symbols', sym);
-        // mm:config:SYMBOL 형식으로 저장 (market-maker가 읽는 형식)
-        await valkey.set(`mm:config:${sym}`, JSON.stringify({ basePrice: finalBasePrice, ...finalCfg }));
-        return { statusCode: 200, headers, body: JSON.stringify({ success: true, config: { basePrice: finalBasePrice, ...finalCfg } }) };
+        // mm:all:symbols에 추가 (WebSocket 핸들러가 목록 조회 시 사용)
+        await valkey.sadd('mm:all:symbols', sym);
+        // Redis용 단순 포맷으로 저장 (WebSocket 핸들러 호환)
+        const redisCfg = {
+          basePrice: finalBasePrice,
+          period: cfg.period ?? 600,
+          amplitude: cfg.amplitude ?? 0.1,
+          tickInterval: cfg.tickInterval || 1000,
+          tradeInterval: cfg.tradeInterval ?? 3,
+          tradeQuantity: cfg.tradeQuantity ?? 50
+        };
+        await valkey.set(`mm:config:${sym}`, JSON.stringify(redisCfg));
+        // EC2 MM Service에 시작 신호 발송
+        await sendMMControl('start', sym);
+        return { statusCode: 200, headers, body: JSON.stringify({ success: true, config: redisCfg }) };
       }
 
       if (action === 'stop') {
-        if (sym) { await db.query(`UPDATE market_maker_configs SET is_running=false, stopped_at=CURRENT_TIMESTAMP WHERE symbol=$1`, [sym]); await valkey.srem('mm:running:symbols', sym); const cur = await valkey.get('mm:symbol'); if (cur === sym) await valkey.set('mm:running', 'false'); }
-        else { await db.query(`UPDATE market_maker_configs SET is_running=false, stopped_at=CURRENT_TIMESTAMP WHERE is_running=true`); await valkey.set('mm:running', 'false'); await valkey.del('mm:running:symbols'); }
+        if (sym) {
+          await db.query(`UPDATE market_maker_configs SET is_running=false, stopped_at=CURRENT_TIMESTAMP WHERE symbol=$1`, [sym]);
+          await valkey.srem('mm:running:symbols', sym);
+          const cur = await valkey.get('mm:symbol');
+          if (cur === sym) await valkey.set('mm:running', 'false');
+          // EC2 MM Service에 정지 신호 발송
+          await sendMMControl('stop', sym);
+        } else {
+          await db.query(`UPDATE market_maker_configs SET is_running=false, stopped_at=CURRENT_TIMESTAMP WHERE is_running=true`);
+          await valkey.set('mm:running', 'false');
+          await valkey.del('mm:running:symbols');
+          // EC2 MM Service에 전체 정지 신호 발송
+          await sendMMControl('stopAll');
+        }
         return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
       }
 
       if (action === 'delete') {
         if (!sym) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Symbol required' }) };
-        await db.query('DELETE FROM market_maker_configs WHERE symbol=$1', [sym]); await valkey.srem('mm:running:symbols', sym);
+        // 먼저 MM 정지
+        await sendMMControl('stop', sym);
+        await db.query('DELETE FROM market_maker_configs WHERE symbol=$1', [sym]);
+        await valkey.srem('mm:running:symbols', sym);
+        await valkey.srem('mm:all:symbols', sym);
+        await valkey.del(`mm:config:${sym}`);
+        await valkey.del(`mm:price:${sym}`);
+        await valkey.del(`mm:orderCount:${sym}`);
+        await valkey.del(`mm:started_at:${sym}`);
+        return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
+      }
+
+      // 실시간 설정 반영
+      if (action === 'reload') {
+        if (!sym) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Symbol required' }) };
+        await sendMMControl('reload', sym);
         return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
       }
 
@@ -213,15 +282,22 @@ export const handler = async (event) => {
           }
           await db.query('UPDATE market_maker_configs SET is_running=true, started_at=CURRENT_TIMESTAMP WHERE symbol=$1', [row.symbol]);
           await valkey.sadd('mm:running:symbols', row.symbol);
+          // mm:all:symbols에 추가 (WebSocket 핸들러가 목록 조회 시 사용)
+          await valkey.sadd('mm:all:symbols', row.symbol);
+          // Redis용 단순 포맷으로 저장 (WebSocket 핸들러 호환)
           await valkey.set(`mm:config:${row.symbol}`, JSON.stringify({
-            basePrice: parseFloat(row.base_price), weeklyAmplitude: parseFloat(row.weekly_amplitude),
-            dailyAmplitude: parseFloat(row.daily_amplitude), hourlyAmplitude: parseFloat(row.hourly_amplitude),
-            minuteAmplitude: parseFloat(row.minute_amplitude), noiseAmplitude: parseFloat(row.noise_amplitude),
-            tickInterval: parseInt(row.tick_interval)
+            basePrice: parseFloat(row.base_price),
+            period: 600,
+            amplitude: 0.1,
+            tickInterval: parseInt(row.tick_interval) || 1000,
+            tradeInterval: 3,
+            tradeQuantity: 50
           }));
           started.push(row.symbol);
         }
         await valkey.set('mm:running', 'true');
+        // EC2 MM Service에 전체 시작 신호 발송
+        await sendMMControl('startAll');
         return { statusCode: 200, headers, body: JSON.stringify({ success: true, started, skipped, count: started.length }) };
       }
 
@@ -229,6 +305,8 @@ export const handler = async (event) => {
         await db.query('UPDATE market_maker_configs SET is_running=false, stopped_at=CURRENT_TIMESTAMP WHERE is_running=true');
         await valkey.set('mm:running', 'false');
         await valkey.del('mm:running:symbols');
+        // EC2 MM Service에 전체 정지 신호 발송
+        await sendMMControl('stopAll');
         return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
       }
     }

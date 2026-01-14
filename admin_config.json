@@ -27,12 +27,9 @@
             "TWITTER_BEARER_TOKEN": "AAAAAAAAAAAAAAAAAAAAAHs65gEAAAAAsel6zJ3PLy%2FKwg%2FRDgK9hrgcf0Q%3DPpvFj5olwMBiYVsukbcfwcghprHR6ygwD1rNDboAMGAh07fd6G",
             "VALKEY_PORT": "6379",
             "DYNAMODB_TRADE_TABEL": "trade_history",
-            "SUPABASE_SERVICE_ROLE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ibnlqdmd0ZGN3ZnV0eG1ocnVkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwMjYxMiwiZXhwIjoyMDc2ODc4NjEyfQ.2VsCHTmlqXn4ngFAo4v07-hlf8ni47oy_1d7qYLkui4",
             "DYNAMODB_TABLE": "candle_history",
             "VALKEY_HOST": "supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com",
-            "ADMIN_API_KEY": "7194",
-            "SUPABASE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ibnlqdmd0ZGN3ZnV0eG1ocnVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzMDI2MTIsImV4cCI6MjA3Njg3ODYxMn0.Mbc0fsRYqkLunsrWtlkr6B53AyBbR5KTIPhiyyYKkWo",
-            "SUPABASE_URL": "https://obnyjvgtdcwfutxmhrud.supabase.co"
+            "ADMIN_API_KEY": "7194"
         }
     },
     "TracingConfig": {

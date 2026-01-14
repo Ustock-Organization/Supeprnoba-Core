@@ -8,7 +8,7 @@ Amazon Kinesis + Valkey 기반 실시간 매칭 엔진 인프라 (2025-12-21 최
 ## 현재 운영 아키텍처 (전체 흐름)
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 flowchart TD
     Client[클라이언트<br/>Web/Mobile/Test]
     
@@ -68,7 +68,7 @@ flowchart TD
 ### 캔들 데이터 흐름 (상세)
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 sequenceDiagram
     participant Trade as 체결
     participant Handler as Handler
@@ -102,7 +102,7 @@ sequenceDiagram
 ## 🧪 테스트 클라이언트 데이터 흐름
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 flowchart TD
     TC[Test Console<br/>UI/WebSocket/주문/차트/관리자]
     
@@ -137,14 +137,14 @@ flowchart TD
 
 ### API 엔드포인트 목록
 
-| # | 기능 | 메서드 | 엔드포인트 | 데이터 예시 |
-|---|------|--------|-----------|-------------|
-| ① | **WebSocket 연결** | WSS | `wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/` | `?userId=test-user-1&testMode=true` |
-| ② | **심볼 구독** | WS Send | (WebSocket) | `{action:"subscribe", main:"TEST"}` |
-| ③ | **주문 제출** | POST | `https://4xs6g4w8l6.../restV2/orders` | `{symbol:"TEST", side:"BUY", price:1000, quantity:10}` |
-| ④ | **차트 조회** | GET | `https://4xs6g4w8l6.../restV2/chart` | `?symbol=TEST&interval=1m&limit=100` |
-| ⑤ | **종목 관리** | GET/POST | `https://0eeto6kblk.../admin/Supernoba-admin` | `{symbol:"TEST"}` (추가 시) |
-| ⑥ | **실시간 수신** | WS Recv | (WebSocket) | `{e:"d", s:"TEST", b:[[1000,10]], a:[[1001,5]]}` |
+| #   | 기능               | 메서드      | 엔드포인트                                                                   | 데이터 예시                                                 |
+| --- | ---------------- | -------- | ----------------------------------------------------------------------- | ------------------------------------------------------ |
+| ①   | **WebSocket 연결** | WSS      | `wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws.com/production/` | `?userId=test-user-1&testMode=true`                    |
+| ②   | **심볼 구독**        | WS Send  | (WebSocket)                                                             | `{action:"subscribe", main:"TEST"}`                    |
+| ③   | **주문 제출**        | POST     | `https://4xs6g4w8l6.../restV2/orders`                                   | `{symbol:"TEST", side:"BUY", price:1000, quantity:10}` |
+| ④   | **차트 조회**        | GET      | `https://4xs6g4w8l6.../restV2/chart`                                    | `?symbol=TEST&interval=1m&limit=100`                   |
+| ⑤   | **종목 관리**        | GET/POST | `https://0eeto6kblk.../admin/Supernoba-admin`                           | `{symbol:"TEST"}` (추가 시)                               |
+| ⑥   | **실시간 수신**       | WS Recv  | (WebSocket)                                                             | `{e:"d", s:"TEST", b:[[1000,10]], a:[[1001,5]]}`       |
 
 ### 테스트 클라이언트 → 차트 업데이트 흐름
 
@@ -190,55 +190,213 @@ flowchart TD
 ## 실시간 스트리밍 흐름 (JWT 인증 포함)
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d', 'activationBorderColor': '#58a6ff', 'activationBkgColor': '#1f6feb', 'sequenceNumberColor': '#ffffff', 'actorBorder': '#58a6ff', 'actorBkg': '#161b22', 'actorTextColor': '#ffffff', 'actorLineColor': '#58a6ff', 'signalColor': '#58a6ff', 'signalTextColor': '#ffffff', 'labelBoxBkgColor': '#161b22', 'labelBoxBorderColor': '#58a6ff', 'labelTextColor': '#ffffff', 'loopTextColor': '#ffffff', 'noteBorderColor': '#58a6ff' }}}%%
 sequenceDiagram
-    participant C as 클라이언트
-    participant G as Gateway WS
-    participant Conn as connect-handler
-    participant Sub as subscribe-handler
-    participant V as Valkey
+    participant C as 클라이언트<br/>WebSocketService.js
+    participant G as Gateway WS<br/>API Gateway
+    participant Conn as connect-handler<br/>Lambda
+    participant Sub as subscribe-handler<br/>Lambda
+    participant V as Valkey<br/>Depth Cache
+    participant API as Management API
     participant E as Engine
     participant S as Streamer
 
-    Note over C: 1. WebSocket 연결
-    C->>G: ?token=JWT or ?testMode=true
-    G->>Conn: $connect
-    alt 로그인
-        Conn->>V: SET ws:CONNID<br/>SADD user:USERID:connections<br/>SADD realtime:connections
-    else 익명
-        Conn->>V: SET ws:CONNID<br/>{isLoggedIn:false}
+    Note over C: ① WebSocket 연결 시작
+    C->>G: new WebSocket(url?userId=USERID)
+    Note right of C: URL에 userId만 포함<br/>token은 메시지로 전송
+    
+    G->>Conn: $connect 라우트<br/>{connectionId, queryStringParameters}
+    Conn->>Conn: connectionId 추출<br/>userId 파싱 (익명 생성 가능)
+    Conn->>V: SETEX ws:CONNID 86400<br/>{userId, isLoggedIn:false}
+    Conn->>V: SADD user:USERID:connections CONNID
+    Note right of Conn: ⚠️ realtime:connections에는<br/>아직 추가하지 않음<br/>(로그인 전이므로)
+    Conn->>V: GET ws:CONNID (검증)
+    Conn->>V: SMEMBERS user:USERID:connections (검증)
+    Conn-->>G: statusCode: 200
+    G-->>C: WebSocket 연결 완료<br/>(onopen 이벤트)
+    
+    Note over C: ② 연결 안정화 대기
+    C->>C: setTimeout(500ms)
+    Note right of C: $connect 핸들러가<br/>Valkey 저장 완료할 시간 확보
+    
+    Note over C: ③ Auth 메시지 전송
+    C->>G: {"action":"auth","token":"JWT","userId":"USERID"}
+    G->>Sub: $default 라우트<br/>{body, requestContext}
+    
+    Note right of G: ⚠️ 문제 발생 지점<br/>API Gateway가 requestContext를<br/>제대로 전달하지 않음
+    
+    alt connectionId가 requestContext에 있음 (정상)
+        Sub->>Sub: connectionId 추출
+        Note right of Sub: ✅ 정상 케이스
+    else connectionId가 없음 (라우팅 문제)
+        Note right of Sub: ❌ 현재 문제 상황<br/>hasRequestContext: false<br/>connectionId: undefined
+        Sub->>V: SMEMBERS user:USERID:connections
+        Note right of Sub: ⚠️ 재시도 로직<br/>(최대 10회, 50-200ms)
+        V-->>Sub: [CONNID]
+        Sub->>V: GET ws:CONNID (검증)
+        V-->>Sub: connectionInfo
+        Note right of Sub: ✅ connectionId 확인됨<br/>(fallback 성공)
     end
-    G-->>C: 연결 완료
     
-    Note over C: 2. 심볼 구독
+    Sub->>Sub: JWT 검증 (Supabase)
+    alt JWT 검증 성공
+        Sub->>V: GET ws:CONNID
+        Sub->>V: SETEX ws:CONNID<br/>{userId, isLoggedIn:true}
+        Sub->>V: SADD user:USERID:connections CONNID
+        Sub->>V: SADD realtime:connections CONNID
+        Note right of Sub: ✅ 로그인 사용자로<br/>업데이트 완료
+        Sub->>API: PostToConnection(CONNID)
+        API->>G: 연결 확인
+        G->>C: {"action":"auth","success":true}
+    else JWT 검증 실패
+        Sub->>API: PostToConnection(CONNID)
+        G->>C: {"action":"auth","success":false}
+    end
+    
+    Note over C: ④ Auth 응답 수신
+    C->>C: handleMessage(auth)
+    C->>C: isAuthenticated = true
+    C->>C: performSubscribe()
+    
+    Note over C: ⑤ Subscribe 메시지 전송
     C->>G: {"action":"subscribe","main":"TEST"}
-    G->>Sub: subscribe
-    Sub->>V: SADD symbol:TEST:main CONNID<br/>SADD subscribed:symbols TEST
-    G-->>C: 구독 확인
+    G->>Sub: $default 라우트
+    Sub->>V: SADD symbol:TEST:main CONNID
+    Sub->>V: SADD symbol:TEST:subscribers CONNID
+    Sub->>V: SET conn:CONNID:main TEST
+    Sub->>V: SADD subscribed:symbols TEST
+    Sub-->>G: statusCode: 200
     
-    Note over E: 3. 주문 처리
+    Note over E: ⑥ 주문 처리 및 데이터 업데이트
     E->>E: Liquibook 매칭
     E->>V: SET depth:TEST<br/>EVAL candle:1m:TEST<br/>SET ticker:TEST
     
-    Note over S: 4. 실시간 스트리밍
-    loop 50ms (로그인)
-        S->>V: SMEMBERS realtime:connections<br/>SMEMBERS symbol:TEST:main<br/>GET depth + HGETALL candle
+    Note over S: ⑦ 실시간 스트리밍
+    loop 50ms (로그인 사용자)
+        S->>V: SMEMBERS realtime:connections
+        V-->>S: [CONNID, ...]
+        S->>V: SMEMBERS symbol:TEST:main
+        V-->>S: [CONNID, ...]
+        S->>V: GET depth:TEST<br/>HGETALL candle:1m:TEST
         V-->>S: 데이터
-        S->>G: PostToConnection
-        G->>C: 실시간 푸시
+        S->>API: PostToConnection(CONNID)
+        API->>G: 연결 확인
+        G->>C: {e:"d", s:"TEST", b:[...], a:[...]}
     end
     
-    loop 500ms (익명)
+    loop 500ms (익명 사용자)
         S->>V: 캐시 조회
-        S->>G: PostToConnection
+        S->>API: PostToConnection
         G->>C: 캐시 푸시
     end
 ```
 
+### 연결 절차 상세 설명
+
+| 단계 | 컴포넌트 | 작업 | 잠재적 문제점 | CloudWatch 로그 확인 |
+|------|----------|------|---------------|---------------------|
+| **① 연결** | 클라이언트 → Gateway | `new WebSocket(url?userId=USERID)` | URL 구성 오류, 네트워크 문제 | - |
+| **①-1** | Gateway → connect-handler | `$connect` 라우트 트리거 | 라우팅 설정 오류 | `[connect] Connection request: CONNID` |
+| **①-2** | connect-handler | Valkey에 `ws:CONNID` 저장 | Valkey 연결 실패, 타임아웃 (3초) | `[connect] ✅ Saved connection info` |
+| **①-3** | connect-handler | `user:USERID:connections`에 추가 | 저장 실패 시 재시도 없음 | `[connect] ✅ Added to user:USERID:connections` |
+| **①-4** | connect-handler | 저장 검증 (GET, SMEMBERS) | 검증 실패 시 경고만 출력 | `[connect] ✅ Verified connection info saved` |
+| **② 대기** | 클라이언트 | `onopen` 후 500ms 지연 | 지연 시간 부족 시 타이밍 이슈 | 브라우저 콘솔: `Connection opened` |
+| **③ Auth** | 클라이언트 → Gateway | `{"action":"auth","token":"JWT"}` | 메시지 전송 실패, JSON 파싱 오류 | 브라우저 콘솔: `Auth message sent` |
+| **③-1** | Gateway → subscribe-handler | `$default` 라우트 | **❌ 라우팅 오류: `requestContext` 누락** | `hasRequestContext: false` |
+| **③-2** | subscribe-handler | `connectionId` 조회 (재시도 최대 10회) | **❌ 현재 문제: connectionId 조회 실패** | `connectionId: UNDEFINED` |
+| **③-3** | subscribe-handler | JWT 검증 (Supabase) | 토큰 만료, Supabase 연결 실패 | `[subscribe-handler] ✅ Authenticated user` |
+| **③-4** | subscribe-handler | Valkey 업데이트 | 업데이트 실패 시 부분 성공 상태 | `SADD realtime:connections` |
+| **③-5** | subscribe-handler → API | `PostToConnection(CONNID)` | Management API 엔드포인트 오류, 연결 끊김 (410) | `✅ Message sent successfully` |
+| **③-6** | API → 클라이언트 | Auth 응답 전송 | **❌ 응답 미수신 (타임아웃)** | 브라우저 콘솔: `Message received: auth` 없음 |
+| **④ 응답** | 클라이언트 | `handleMessage(auth)` | 응답 파싱 오류, `success` 필드 누락 | 브라우저 콘솔: `✅ Authentication successful` |
+| **⑤ Subscribe** | 클라이언트 → Gateway | `{"action":"subscribe","main":"TEST"}` | Auth 실패 후에도 구독 시도 | 브라우저 콘솔: `Sending subscribe` |
+| **⑤-1** | subscribe-handler | 구독 정보 Valkey 저장 | 저장 실패 시 구독 미등록 | `SADD symbol:TEST:main` |
+| **⑦ 스트리밍** | Streamer | 50ms/500ms 폴링 및 푸시 | `realtime:connections`에 없으면 500ms 폴링 | Streamer 로그 |
+
+### 🔴 현재 확인된 문제점 (CloudWatch 로그 기반)
+
+#### 문제 1: API Gateway 라우팅 오류
+```
+[subscribe-handler] Event structure: {
+  hasRequestContext: false,
+  requestContextKeys: [],
+  eventKeys: [ 'action', 'token', 'userId' ],
+  connectionIdInContext: undefined,
+  connectionIdInEvent: undefined
+}
+```
+
+**원인**: API Gateway의 `$default` 라우트가 `requestContext`를 제대로 전달하지 않음
+- `IntegrationType`이 `AWS`로 설정되어 있을 가능성 (정상: `AWS_PROXY`)
+- 또는 라우팅 설정 자체가 잘못됨
+
+**영향**: 
+- `connectionId`를 직접 가져올 수 없음
+- Fallback 로직으로 `user:USERID:connections`에서 조회해야 함
+- 재시도 로직이 작동하지만 지연 발생
+
+#### 문제 2: connectionId 조회 실패
+```
+[subscribe-handler] Auth action received, connectionId: UNDEFINED
+[subscribe-handler] ⚠️ No connectionId in requestContext, attempting to find from recent connections
+```
+
+**원인**: 
+- `$connect` 핸들러가 완료되기 전에 auth 메시지가 도착
+- 또는 Valkey 저장이 실패했지만 Lambda는 성공 응답 반환
+
+**해결책**:
+- 클라이언트 지연 시간 증가 (현재 500ms)
+- `subscribe-handler`의 재시도 로직 강화 (현재 최대 1초)
+
+#### 문제 3: Auth 응답 미수신
+- 클라이언트에서 `Auth message sent successfully` 로그는 있음
+- 하지만 `Message received: auth` 로그가 없음
+
+**원인**:
+- `PostToConnection`이 실패했지만 로그에 기록되지 않음
+- 또는 Management API 엔드포인트 구성 오류
+
+**확인 필요**:
+- `[subscribe-handler] ✅ Message sent successfully` 로그 확인
+- Management API 엔드포인트 구성 확인
+
+### 🔧 해결 방안
+
+#### 1. API Gateway 라우팅 설정 확인 및 수정
+```bash
+# $default 라우트의 IntegrationType 확인
+aws apigatewayv2 get-integration \
+  --api-id <API_ID> \
+  --integration-id <INTEGRATION_ID> \
+  --region ap-northeast-2
+
+# IntegrationType이 AWS_PROXY인지 확인
+# 만약 AWS라면 다음 명령으로 수정:
+aws apigatewayv2 update-integration \
+  --api-id <API_ID> \
+  --integration-id <INTEGRATION_ID> \
+  --integration-type AWS_PROXY \
+  --region ap-northeast-2
+```
+
+#### 2. 클라이언트 지연 시간 조정
+- 현재: `onopen` 후 500ms 지연
+- 권장: 500ms는 유지하되, `connect-handler`의 Valkey 저장 완료를 기다리는 로직 추가 고려
+
+#### 3. subscribe-handler 재시도 로직 강화
+- 현재: 최대 10회 재시도, 50-200ms 점진적 대기
+- 권장: 재시도 횟수는 유지하되, 첫 재시도 전 대기 시간 증가 (100ms)
+
+#### 4. Management API 엔드포인트 구성 확인
+- `getApiClient()` 함수에서 엔드포인트 구성 로직 확인
+- `requestContext.domainName`과 `requestContext.stage`가 제대로 전달되는지 확인
+- 환경 변수 `WS_ENDPOINT` 설정 확인
+
 ### 주문 상태 실시간 알림 흐름 (직접 전송)
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 sequenceDiagram
     participant C as 클라이언트
     participant WS as Gateway WS
@@ -294,7 +452,7 @@ sequenceDiagram
 > **Valkey 중심 설계**: C++ Engine에서 Lua Script로 캔들 집계, Lambda는 백그라운드 백업만 담당
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 flowchart TD
     Engine[Engine: 체결 → Handler → Lua Script]
     Active[candle:1m:SYMBOL Hash<br/>EXPIRE 300초]
@@ -661,7 +819,7 @@ cd ~/liquibook/streamer/node
 ## 체결 데이터 Fan-Out 흐름
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px' }}}%%
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '10px', 'lineColor': '#58a6ff', 'textColor': '#e6edf3', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#58a6ff', 'noteTextColor': '#ffffff', 'noteBkgColor': '#161b22', 'secondaryColor': '#30363d', 'tertiaryColor': '#21262d' }}}%%
 flowchart TD
     Engine[Engine: Liquibook 매칭<br/>체결 발생]
     Handler[MarketDataHandler<br/>on_fill]

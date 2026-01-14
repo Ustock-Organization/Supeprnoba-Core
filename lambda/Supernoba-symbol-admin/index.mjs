@@ -1,0 +1,800 @@
+/**
+ * Supernoba-symbol-admin Lambda
+ * Symbol 도메인 전용 관리 API
+ *
+ * 엔드포인트:
+ * - GET /symbols - 전체 종목 목록 (공개)
+ * - GET /symbols/{symbol} - 개별 종목 상세 (공개)
+ * - POST /symbols (action=listing) - 신규 종목 등록 (관리자)
+ * - POST /symbols (action=activate) - 종목 활성화 (관리자)
+ * - POST /symbols (action=approve) - 크리에이터 승인 + IPO 생성 (관리자)
+ * - POST /symbols (action=reject) - 크리에이터 거절 (관리자)
+ * - POST /symbols (action=restore) - 삭제된 종목 복원 (관리자)
+ * - PUT /symbols/{symbol} - 종목 수정 (관리자)
+ * - DELETE /symbols/{symbol} - 종목 삭제 (관리자)
+ * - POST /sync - Redis 동기화 (관리자)
+ * - POST /cleanChart - 차트 데이터 정리 (관리자)
+ */
+
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import pg from 'pg';
+
+// Common Layer - Valkey, CORS, Social Links
+import { getValkeyClient, CORS, response, detectPlatformFromUrl } from '/opt/nodejs/index.mjs';
+
+// Auth Layer
+const loadAuth = async () => {
+  try {
+    return await import('/opt/nodejs/verifyAuth.mjs');
+  } catch (err) {
+    console.error('[symbol-admin] Failed to load auth layer:', err.message);
+    // 프로덕션에서는 auth layer 로드 실패 시 요청 거부
+    return {
+      verifyAdmin: async () => {
+        console.error('[symbol-admin] Auth layer not available - rejecting request');
+        return { success: false, error: 'AUTH_LAYER_UNAVAILABLE' };
+      },
+      authErrorResponse: (r) => ({
+        statusCode: 503,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: r.error || 'Service temporarily unavailable' })
+      })
+    };
+  }
+};
+const { verifyAdmin, authErrorResponse } = await loadAuth();
+
+const { Client: PgClient } = pg;
+
+// 환경변수
+const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
+const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
+const CREATOR_REQUESTS_TABLE = process.env.CREATOR_REQUESTS_TABLE || 'supernoba-creator-requests';
+const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com';
+const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
+const IPO_SYSTEM_ACCOUNT = 'ipo-system';
+const CLEANUP_QUEUE_URL = process.env.CLEANUP_QUEUE_URL || 'https://sqs.ap-northeast-2.amazonaws.com/264520158196/supernoba-symbol-cleanup';
+const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
+
+// Layer를 통한 클라이언트 초기화
+const valkey = getValkeyClient({ preset: 'admin' });
+const sqs = new SQSClient({ region: 'ap-northeast-2' });
+const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+const secrets = new SecretsManagerClient({ region: 'ap-northeast-2' });
+let dbCreds = null, pgClient = null;
+
+// Layer의 CORS.FULL 사용
+const H = CORS.FULL;
+
+// 관리자 인증 체크
+const checkAdmin = async (event) => {
+  const result = await verifyAdmin(event);
+  if (!result.success) {
+    return { authorized: false, response: authErrorResponse(result, H) };
+  }
+  return { authorized: true, userId: result.userId, method: result.method };
+};
+
+// Layer의 detectPlatformFromUrl 사용
+const detectPlatform = (url) => detectPlatformFromUrl(url) || 'ETC';
+
+const ok = (d) => response.ok(d, H);
+const err = (c, m) => response.error(c, m, H);
+
+// Symbol 유효성 검증 (영문 대문자, 숫자, 2-20자)
+const SYMBOL_REGEX = /^[A-Z0-9]{2,20}$/;
+const validateSymbol = (symbol) => {
+  if (!symbol || typeof symbol !== 'string') return false;
+  const normalized = symbol.toUpperCase().trim();
+  return SYMBOL_REGEX.test(normalized);
+};
+
+// PostgreSQL 연결 풀 관리
+let pgConnectionTimeout = null;
+const PG_IDLE_TIMEOUT = 30000; // 30초 idle 후 연결 해제
+
+async function getPg() {
+  // idle 타이머 리셋
+  if (pgConnectionTimeout) {
+    clearTimeout(pgConnectionTimeout);
+    pgConnectionTimeout = null;
+  }
+
+  if (pgClient) {
+    // 기존 연결 재사용
+    pgConnectionTimeout = setTimeout(releasePg, PG_IDLE_TIMEOUT);
+    return pgClient;
+  }
+
+  if (!dbCreds) {
+    if (process.env.DB_USERNAME && process.env.DB_PASSWORD) {
+      dbCreds = { username: process.env.DB_USERNAME, password: process.env.DB_PASSWORD };
+    } else if (DB_SECRET_ARN) {
+      const r = await secrets.send(new GetSecretValueCommand({ SecretId: DB_SECRET_ARN }));
+      const s = JSON.parse(r.SecretString);
+      dbCreds = { username: s.username, password: s.password };
+    } else {
+      dbCreds = { username: 'postgres', password: 'postgres' };
+    }
+  }
+
+  pgClient = new PgClient({
+    host: RDS_HOST,
+    port: 5432,
+    database: 'postgres',
+    user: dbCreds.username,
+    password: dbCreds.password,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 5000
+  });
+  await pgClient.connect();
+
+  // idle 타이머 설정
+  pgConnectionTimeout = setTimeout(releasePg, PG_IDLE_TIMEOUT);
+
+  return pgClient;
+}
+
+// PostgreSQL 연결 해제
+async function releasePg() {
+  if (pgClient) {
+    try {
+      await pgClient.end();
+      console.log('[symbol-admin] PostgreSQL connection released');
+    } catch (e) {
+      console.warn('[symbol-admin] Error releasing PostgreSQL:', e.message);
+    }
+    pgClient = null;
+  }
+  if (pgConnectionTimeout) {
+    clearTimeout(pgConnectionTimeout);
+    pgConnectionTimeout = null;
+  }
+}
+
+export const handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
+
+  try {
+    const m = event.httpMethod;
+    const q = event.queryStringParameters || {};
+    const path = event.path || '';
+    const action = q.action;
+
+    // ==========================================
+    // GET: 종목 목록/상세 (공개)
+    // ==========================================
+    if (m === 'GET') {
+      const symbolMatch = path.match(/\/symbols\/([^\/]+)/);
+
+      // 개별 종목 상세
+      if (symbolMatch && symbolMatch[1]) {
+        const sym = symbolMatch[1].toUpperCase();
+        const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (!Item) return err(404, 'Symbol not found');
+
+        // 테스트 종목은 관리자만 조회 가능
+        if (Item.is_test) {
+          console.log('[symbol-admin] Test symbol access attempt:', sym);
+          console.log('[symbol-admin] Auth header:', event.headers?.Authorization?.substring(0, 50) + '...');
+          const adminCheck = await checkAdmin(event).catch((e) => {
+            console.error('[symbol-admin] checkAdmin error:', e.message);
+            return { authorized: false };
+          });
+          console.log('[symbol-admin] Admin check result:', JSON.stringify(adminCheck));
+          if (!adminCheck.authorized) {
+            console.log('[symbol-admin] Access denied for test symbol:', sym);
+            return err(404, 'Symbol not found');
+          }
+          console.log('[symbol-admin] Admin access granted for:', sym);
+        }
+
+        return ok({
+          symbol: Item.symbol,
+          name: Item.name || Item.symbol,
+          logo_url: Item.logoUrl || null,
+          logoUrl: Item.logoUrl || null,
+          status: Item.status || 'ACTIVE',
+          platform: Item.platform || 'ETC',
+          creatorUrl: Item.creatorUrl || null,
+          profileUrl: Item.profileUrl || null,
+          description: Item.description || null,
+          verified: Item.verified || false,
+          trustScore: Item.trustScore,
+          dividendStatus: Item.dividendStatus || 'pending',
+          dividendPerShare: Item.dividendPerShare || 0,
+          platformStats: Item.platformStats || {},
+          socialLinks: Item.socialLinks || {},
+          tags: Item.tags || [],
+          categories: Item.categories || [],
+          listingPrice: Item.listingPrice,
+          totalShares: Item.totalShares,
+          is_test: Item.is_test || false
+        });
+      }
+
+      // 전체 종목 목록
+      const search = q.q ? q.q.toUpperCase() : null;
+      const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
+      let r = Items || [];
+
+      // 관리자 여부 확인 (인증 실패해도 일반 사용자로 처리)
+      const adminCheck = await checkAdmin(event).catch(() => ({ authorized: false }));
+      const isAdmin = adminCheck.authorized;
+
+      // 일반 사용자는 테스트 종목 제외
+      if (!isAdmin) {
+        r = r.filter(s => !s.is_test);
+      }
+
+      if (search) {
+        r = r.filter(s => s.symbol.includes(search) || (s.name && s.name.toUpperCase().includes(search)));
+      }
+      return ok(r);
+    }
+
+    // ==========================================
+    // POST: 종목 관리 (관리자)
+    // ==========================================
+    if (m === 'POST') {
+      // sync - Redis 동기화
+      if (path.includes('sync')) {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
+        const deletedSymbols = await valkey.smembers('deleted:symbols');
+        const deletedSet = new Set(deletedSymbols);
+
+        if (Items?.length > 0) {
+          const p = valkey.pipeline();
+          p.del('active:symbols');
+          let syncedCount = 0;
+
+          for (const i of Items) {
+            if (deletedSet.has(i.symbol)) continue;
+            if (i.status === 'ACTIVE') {
+              p.sadd('active:symbols', i.symbol);
+              p.set(`ticker:${i.symbol}`, JSON.stringify({
+                symbol: i.symbol,
+                price: i.listingPrice || 0,
+                changePercent: 0,
+                volume: 0
+              }));
+              syncedCount++;
+            }
+          }
+          await p.exec();
+          return ok({ synced: syncedCount, skippedDeleted: deletedSymbols.length });
+        }
+        return ok({ synced: 0 });
+      }
+
+      // cleanChart - 차트 데이터 정리
+      if (action === 'cleanChart' || path.includes('cleanChart')) {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const b = JSON.parse(event.body || '{}');
+        const sym = (b.symbol || '').toLowerCase().trim();
+        const threshold = b.threshold || 10000;
+        const deleteAll = b.deleteAll === true;
+
+        if (!sym) return err(400, 'symbol is required');
+
+        try {
+          const pg = await getPg();
+          let result;
+
+          if (deleteAll) {
+            result = await pg.query('DELETE FROM candle_history WHERE symbol = $1', [sym]);
+            console.log(`[cleanChart] Deleted ALL candles for ${sym}: ${result.rowCount} rows`);
+
+            if (b.includeTrades) {
+              const tradeResult = await pg.query('DELETE FROM trade_history WHERE symbol = $1', [sym]);
+              console.log(`[cleanChart] Deleted trades for ${sym}: ${tradeResult.rowCount} rows`);
+            }
+          } else {
+            result = await pg.query(
+              'DELETE FROM candle_history WHERE symbol = $1 AND (high > $2 OR open > $2 OR close > $2)',
+              [sym, threshold]
+            );
+            console.log(`[cleanChart] Deleted corrupted candles for ${sym}: ${result.rowCount} rows`);
+          }
+
+          // Redis 캔들 캐시 정리
+          const pipe = valkey.pipeline();
+          ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => {
+            pipe.del(`candle:${tf}:${sym.toUpperCase()}`);
+          });
+          pipe.del(`candle:closed:1m:${sym.toUpperCase()}`);
+          pipe.del(`ohlc:${sym.toUpperCase()}`);
+          await pipe.exec();
+
+          return ok({
+            success: true,
+            symbol: sym,
+            deletedRows: result.rowCount,
+            action: deleteAll ? 'delete_all' : 'clean_corrupted',
+            threshold: deleteAll ? null : threshold
+          });
+        } catch (dbErr) {
+          console.error('[cleanChart] Error:', dbErr.message);
+          return err(500, 'Failed to clean chart data: ' + dbErr.message);
+        }
+      }
+
+      const b = JSON.parse(event.body || '{}');
+
+      // restore - 삭제된 종목 복원
+      if (action === 'restore') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const sym = (b.symbol || '').toUpperCase().trim();
+        if (!sym) return err(400, 'symbol is required');
+
+        const wasDeleted = await valkey.sismember('deleted:symbols', sym);
+        if (!wasDeleted) return err(400, `Symbol ${sym} is not in deleted list`);
+
+        await valkey.srem('deleted:symbols', sym);
+        console.log(`[RESTORE] Symbol ${sym} removed from deleted list`);
+
+        return ok({ message: `Symbol ${sym} restored. You can now approve or list it again.` });
+      }
+
+      // listing - 신규 종목 등록
+      if (action === 'listing') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { symbol, name, listingPrice, totalShares, platform, creatorId, ownerId, description, logoUrl, creatorUrl, profileUrl, tags, categories, is_test } = b;
+
+        if (!symbol || typeof symbol !== 'string' || symbol.trim() === '') return err(400, 'symbol is required');
+        if (!validateSymbol(symbol)) return err(400, 'Invalid symbol format. Must be 2-20 alphanumeric characters (A-Z, 0-9)');
+        if (!name || typeof name !== 'string' || name.trim() === '') return err(400, 'name is required');
+        if (typeof listingPrice !== 'number' || listingPrice <= 0) return err(400, 'listingPrice must be a positive number');
+        if (typeof totalShares !== 'number' || totalShares <= 0) return err(400, 'totalShares must be a positive number');
+        if (!platform || typeof platform !== 'string' || platform.trim() === '') return err(400, 'platform is required');
+
+        const sym = symbol.toUpperCase().trim();
+        const now = new Date().toISOString();
+
+        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        if (isDeleted) return err(400, `Symbol ${sym} was previously deleted. Use action=restore to restore it.`);
+
+        const { Item: existing } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (existing) return err(409, `Symbol ${sym} already exists`);
+
+        const item = {
+          symbol: sym,
+          name: name.trim(),
+          listingPrice,
+          totalShares,
+          platform: platform.trim(),
+          status: 'PENDING',
+          creatorId: creatorId || null,
+          ownerId: ownerId || null,
+          description: description || null,
+          logoUrl: logoUrl || null,
+          creatorUrl: creatorUrl || null,
+          profileUrl: profileUrl || null,
+          tags: tags || [],
+          categories: categories || [],
+          verified: false,
+          trustScore: 5,
+          platformStats: {},
+          socialLinks: {},
+          prevClose: null,
+          lastClose: null,
+          is_test: is_test || false,
+          createdAt: now,
+          updatedAt: now
+        };
+
+        await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: item }));
+        await valkey.set(`symbol:${sym}:listingPrice`, listingPrice.toString());
+
+        const tickerData = {
+          symbol: sym,
+          price: listingPrice,
+          open: listingPrice,
+          high: listingPrice,
+          low: listingPrice,
+          close: listingPrice,
+          prevClose: listingPrice,
+          changePercent: 0,
+          change: 0,
+          volume: 0,
+          value: 0,
+          trades: 0,
+          updatedAt: now
+        };
+        await valkey.set(`ticker:${sym}`, JSON.stringify(tickerData));
+
+        return ok({
+          success: true,
+          symbol: sym,
+          status: 'PENDING',
+          message: `Symbol ${sym} listed successfully. Use activate action to make it active.`
+        });
+      }
+
+      // activate - 종목 활성화
+      if (action === 'activate') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { symbol } = b;
+        if (!symbol || typeof symbol !== 'string') return err(400, 'symbol is required');
+        if (!validateSymbol(symbol)) return err(400, 'Invalid symbol format. Must be 2-20 alphanumeric characters (A-Z, 0-9)');
+
+        const sym = symbol.toUpperCase().trim();
+
+        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        if (isDeleted) return err(400, `Symbol ${sym} was deleted and cannot be activated`);
+
+        const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (!Item) return err(404, `Symbol ${sym} not found`);
+        if (Item.status === 'ACTIVE') return err(400, `Symbol ${sym} is already active`);
+
+        const now = new Date().toISOString();
+
+        await dynamodb.send(new UpdateCommand({
+          TableName: SYMBOLS_TABLE,
+          Key: { symbol: sym },
+          UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':status': 'ACTIVE', ':updatedAt': now }
+        }));
+
+        await valkey.sadd('subscribed:symbols', sym);
+        await valkey.sadd('active:symbols', sym);
+
+        return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
+      }
+
+      // approve - 크리에이터 승인 + IPO 생성
+      if (action === 'approve') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { requestId, symbol, name, logo_url, listingPrice = 0, totalShares = 0, platform: providedPlatform, description, createIpoOrder = true } = b;
+        if (!symbol || !name || name.trim().length === 0 || name.length > 100) return err(400, 'Invalid symbol or name');
+        if (!validateSymbol(symbol)) return err(400, 'Invalid symbol format. Must be 2-20 alphanumeric characters (A-Z, 0-9)');
+
+        if (listingPrice !== undefined && listingPrice !== 0 && (isNaN(listingPrice) || listingPrice < 0 || !isFinite(listingPrice))) return err(400, 'Invalid listingPrice');
+        if (totalShares !== undefined && totalShares !== 0 && (isNaN(totalShares) || totalShares < 0 || !isFinite(totalShares))) return err(400, 'Invalid totalShares');
+
+        const sym = symbol.toUpperCase().trim();
+        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        if (isDeleted) return err(400, `Symbol ${sym} was previously deleted and cannot be approved`);
+
+        const ipoQuantity = createIpoOrder ? totalShares : 0;
+        const ipoPrice = createIpoOrder ? listingPrice : 0;
+        console.log(`[APPROVE] Processing: ${symbol}, ReqID: ${requestId}, IPO: ${ipoQuantity}@${ipoPrice}`);
+
+        let detectedPlatform = providedPlatform || 'ETC';
+        let creatorUrl = '';
+
+        if (requestId) {
+          try {
+            // Primary Key is 'request_id', not 'id'
+            const { Item: reqData } = await dynamodb.send(new GetCommand({
+              TableName: CREATOR_REQUESTS_TABLE,
+              Key: { request_id: requestId }
+            }));
+            if (!reqData) {
+              console.error(`[APPROVE] Request not found: ${requestId}`);
+              return err(404, 'Request not found');
+            }
+            creatorUrl = reqData.creator_url || '';
+            if (!providedPlatform) detectedPlatform = reqData.platform || detectPlatform(creatorUrl);
+
+            await dynamodb.send(new UpdateCommand({
+              TableName: CREATOR_REQUESTS_TABLE,
+              Key: { request_id: requestId },
+              UpdateExpression: 'SET #status = :status, platform = :platform, processed_at = :processed_at, approved_symbol = :symbol',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: {
+                ':status': 'approved',
+                ':platform': detectedPlatform,
+                ':processed_at': new Date().toISOString(),
+                ':symbol': symbol.toUpperCase()
+              }
+            }));
+          } catch (reqErr) {
+            console.error('[APPROVE] Request update error:', reqErr.message);
+            return err(500, 'Failed to update request: ' + reqErr.message);
+          }
+        }
+
+        const now = new Date().toISOString();
+        const newSymbol = {
+          symbol: symbol.toUpperCase(),
+          name: name || symbol.toUpperCase(),
+          base_asset: symbol.toUpperCase(),
+          quote_asset: 'BOLT',
+          status: 'ACTIVE',
+          listingDate: now,
+          listingPrice: listingPrice || 0,
+          totalShares: totalShares || 0,
+          platform: detectedPlatform,
+          creatorUrl,
+          profileUrl: `/creator/${symbol.toUpperCase()}`,
+          logoUrl: logo_url || '',
+          marketCap: (listingPrice || 0) * (totalShares || 0),
+          totalSupply: totalShares || 0,
+          circulatingSupply: 0,
+          volume24h: 0,
+          priceChange24h: 0,
+          allTimeHigh: listingPrice || 0,
+          allTimeLow: listingPrice || 0,
+          platformStats: { subscribers: 0, followers: 0, views: 0, videos: 0, lastUpdated: null },
+          tags: [],
+          categories: [],
+          verified: false,
+          trustScore: 5,
+          userRating: 0,
+          ratingCount: 0,
+          description: description || `Official symbol for Creator ${name}`
+        };
+
+        await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
+        await valkey.sadd('active:symbols', symbol.toUpperCase());
+
+        // IPO 주문 처리
+        let ipoError = null;
+        let ipoOrderStatus = null;
+        if (ipoQuantity > 0 && ipoPrice > 0) {
+          console.log(`[APPROVE] Creating IPO order request: ${ipoQuantity} shares @ ${ipoPrice}`);
+
+          try {
+            // ipo-system 계정에 holdings 생성
+            await dynamodb.send(new PutCommand({
+              TableName: HOLDINGS_TABLE,
+              Item: {
+                user_id: IPO_SYSTEM_ACCOUNT,
+                symbol: symbol.toUpperCase(),
+                quantity: ipoQuantity,
+                availableQuantity: ipoQuantity,
+                averagePrice: ipoPrice,
+                totalCost: ipoQuantity * ipoPrice,
+                createdAt: now,
+                updatedAt: now,
+                source: 'IPO'
+              }
+            }));
+            console.log(`[APPROVE] IPO holdings created for ${IPO_SYSTEM_ACCOUNT}`);
+
+            // IPO 주문 생성
+            await dynamodb.send(new PutCommand({
+              TableName: IPO_ORDERS_TABLE,
+              Item: {
+                symbol: symbol.toUpperCase(),
+                status: 'PENDING',
+                quantity: ipoQuantity,
+                price: ipoPrice,
+                userId: IPO_SYSTEM_ACCOUNT,
+                createdAt: now,
+                ttl: Math.floor(Date.now() / 1000) + 86400 * 7
+              }
+            }));
+            console.log(`[APPROVE] IPO order request created (PENDING)`);
+            ipoOrderStatus = 'PENDING';
+          } catch (ipoErr) {
+            console.error('[APPROVE] IPO order creation failed:', ipoErr);
+            ipoError = `IPO order creation failed: ${ipoErr.message}`;
+          }
+        }
+
+        return ok({
+          message: `Symbol ${symbol} approved and created`,
+          symbol: newSymbol,
+          ipoOrder: ipoOrderStatus ? { status: ipoOrderStatus, quantity: ipoQuantity, price: ipoPrice } : null,
+          ...(ipoError && { ipoError })
+        });
+      }
+
+      // reject - 크리에이터 거절
+      if (action === 'reject') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { requestId, reason } = b;
+        if (!requestId) return err(400, 'requestId is required');
+
+        console.log(`[REJECT] Processing: RequestId: ${requestId}`);
+
+        try {
+          // First check if request exists (Primary Key is 'request_id')
+          const { Item: existingReq } = await dynamodb.send(new GetCommand({
+            TableName: CREATOR_REQUESTS_TABLE,
+            Key: { request_id: requestId }
+          }));
+
+          if (!existingReq) {
+            return err(404, 'Request not found');
+          }
+
+          await dynamodb.send(new UpdateCommand({
+            TableName: CREATOR_REQUESTS_TABLE,
+            Key: { request_id: requestId },
+            UpdateExpression: 'SET #status = :status, processed_at = :processed_at, admin_note = :admin_note',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':status': 'rejected',
+              ':processed_at': new Date().toISOString(),
+              ':admin_note': reason || 'Rejected by admin'
+            }
+          }));
+
+          const { Item } = await dynamodb.send(new GetCommand({
+            TableName: CREATOR_REQUESTS_TABLE,
+            Key: { request_id: requestId }
+          }));
+
+          return ok({ message: 'Request rejected', data: { ...Item, id: Item.request_id } });
+        } catch (rejectErr) {
+          console.error('[REJECT] Update Error:', rejectErr);
+          return err(500, 'Failed to reject request: ' + rejectErr.message);
+        }
+      }
+    }
+
+    // ==========================================
+    // PUT: 종목 수정 (관리자)
+    // ==========================================
+    if (m === 'PUT') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const symbolMatch = path.match(/\/symbols\/([^\/]+)/);
+      const sym = (symbolMatch?.[1] || b.symbol || '').toUpperCase().trim();
+      if (!sym) return err(400, 'symbol is required');
+
+      const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (!Item) return err(404, `Symbol ${sym} not found`);
+
+      const now = new Date().toISOString();
+      const updateExprParts = ['updatedAt = :updatedAt'];
+      const exprAttrNames = {};
+      const exprAttrValues = { ':updatedAt': now };
+
+      const updateableFields = [
+        'name', 'listingPrice', 'totalShares', 'creatorId', 'ownerId',
+        'description', 'logoUrl', 'creatorUrl', 'profileUrl', 'platform',
+        'verified', 'trustScore', 'dividendStatus', 'dividendPerShare',
+        'tags', 'categories', 'platformStats', 'socialLinks', 'prevClose', 'lastClose',
+        'is_test'
+      ];
+
+      for (const field of updateableFields) {
+        if (b[field] !== undefined) {
+          if (field === 'listingPrice' && (typeof b[field] !== 'number' || b[field] <= 0)) {
+            return err(400, 'listingPrice must be a positive number');
+          }
+          if (field === 'totalShares' && (typeof b[field] !== 'number' || b[field] <= 0)) {
+            return err(400, 'totalShares must be a positive number');
+          }
+
+          updateExprParts.push(`#${field} = :${field}`);
+          exprAttrNames[`#${field}`] = field;
+          exprAttrValues[`:${field}`] = b[field];
+        }
+      }
+
+      if (b.status !== undefined) {
+        const validStatuses = ['PENDING', 'ACTIVE', 'SUSPENDED', 'DELISTED'];
+        if (!validStatuses.includes(b.status)) return err(400, `Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+        updateExprParts.push('#status = :status');
+        exprAttrNames['#status'] = 'status';
+        exprAttrValues[':status'] = b.status;
+
+        if (b.status === 'ACTIVE') {
+          await valkey.sadd('subscribed:symbols', sym);
+          await valkey.sadd('active:symbols', sym);
+        } else if (b.status !== 'ACTIVE' && Item.status === 'ACTIVE') {
+          await valkey.srem('subscribed:symbols', sym);
+          await valkey.srem('active:symbols', sym);
+        }
+      }
+
+      await dynamodb.send(new UpdateCommand({
+        TableName: SYMBOLS_TABLE,
+        Key: { symbol: sym },
+        UpdateExpression: 'SET ' + updateExprParts.join(', '),
+        ExpressionAttributeNames: Object.keys(exprAttrNames).length > 0 ? exprAttrNames : undefined,
+        ExpressionAttributeValues: exprAttrValues
+      }));
+
+      if (b.listingPrice !== undefined) {
+        await valkey.set(`symbol:${sym}:listingPrice`, b.listingPrice.toString());
+      }
+
+      return ok({ success: true, symbol: sym, message: `Symbol ${sym} updated successfully` });
+    }
+
+    // ==========================================
+    // DELETE: 종목 삭제 (관리자)
+    // ==========================================
+    if (m === 'DELETE') {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+
+      const b = JSON.parse(event.body || '{}');
+      const sym = (b.symbol || '').toUpperCase().trim();
+      if (!sym) return err(400, 'symbol is required');
+
+      console.log(`[DELETE] Processing symbol: ${sym}`);
+
+      const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      if (!Item) return err(404, `Symbol ${sym} not found`);
+
+      await valkey.sadd('deleted:symbols', sym);
+
+      const pipe = valkey.pipeline();
+      ['ticker', 'depth', 'ohlc'].forEach(k => pipe.del(`${k}:${sym}`));
+      pipe.del(`symbol:${sym}:listingPrice`);
+      pipe.del(`symbol:${sym}:main`);
+      pipe.del(`symbol:${sym}:subscribers`);
+      pipe.del(`symbol:${sym}:sub`);
+      ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
+      ['config', 'price', 'orderCount', 'started_at'].forEach(k => pipe.del(`mm:${k}:${sym}`));
+      ['active:symbols', 'subscribed:symbols', 'mm:running:symbols'].forEach(s => pipe.srem(s, sym));
+      await pipe.exec();
+
+      try {
+        const db = await getPg();
+        await db.query('DELETE FROM market_maker_configs WHERE symbol = $1', [sym]);
+        console.log(`[DELETE] MarketMaker config deleted for ${sym}`);
+      } catch (pgErr) {
+        console.warn(`[DELETE] PostgreSQL cleanup warning: ${pgErr.message}`);
+      }
+
+      // 동기 삭제
+      await dynamodb.send(new DeleteCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+
+      try {
+        await dynamodb.send(new DeleteCommand({ TableName: IPO_ORDERS_TABLE, Key: { symbol: sym } }));
+        console.log(`[DELETE] IPO order deleted for ${sym}`);
+      } catch (ipoErr) {
+        console.warn(`[DELETE] IPO order cleanup warning: ${ipoErr.message}`);
+      }
+
+      // 비동기 정리 (SQS)
+      try {
+        await sqs.send(new SendMessageCommand({
+          QueueUrl: CLEANUP_QUEUE_URL,
+          MessageBody: JSON.stringify({
+            action: 'DELETE_SYMBOL',
+            symbol: sym,
+            timestamp: new Date().toISOString()
+          }),
+          MessageGroupId: undefined
+        }));
+        console.log(`[DELETE] Cleanup message sent to SQS for ${sym}`);
+      } catch (sqsErr) {
+        console.error(`[DELETE] SQS message failed (non-critical): ${sqsErr.message}`);
+      }
+
+      console.log(`[DELETE] Symbol ${sym} deleted successfully`);
+      return ok({
+        success: true,
+        symbol: sym,
+        message: `Symbol ${sym} deleted. Async cleanup triggered for holdings/orders/favorites.`
+      });
+    }
+
+    return err(404, 'Not found');
+  } catch (e) {
+    console.error('Error:', e);
+    // 에러 발생 시 PostgreSQL 연결 정리
+    await releasePg();
+    return err(500, e.message);
+  }
+};

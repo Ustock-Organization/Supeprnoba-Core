@@ -1,0 +1,12 @@
+{
+  "name": "supernoba-preview-handler",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-api-gateway": "^3.958.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.958.0",
+    "@aws-sdk/client-lambda": "^3.958.0",
+    "adm-zip": "^0.5.16"
+  }
+}

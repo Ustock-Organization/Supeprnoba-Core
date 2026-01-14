@@ -9,9 +9,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Kinesis 전용 빌드
 add_definitions(-DUSE_KINESIS)
 
-# Liquibook 헤더 경로
+# Liquibook 헤더 경로 (liquiLegacy로 이동됨)
 set(LIQUIBOOK_ROOT "${CMAKE_SOURCE_DIR}/..")
-include_directories(${LIQUIBOOK_ROOT}/src)
+include_directories(${LIQUIBOOK_ROOT}/liquiLegacy/src)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # 공통 의존성 (vcpkg 통해 자동 제공)

@@ -1,8 +1,12 @@
 {
+  "name": "supernoba-admin-mm",
+  "version": "1.0.0",
   "type": "module",
+  "description": "Market Maker management Lambda",
+  "main": "index.mjs",
   "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.958.0",
+    "@aws-sdk/client-secrets-manager": "^3.624.0",
     "ioredis": "^5.4.1",
-    "pg": "^8.16.3"
+    "pg": "^8.12.0"
   }
 }

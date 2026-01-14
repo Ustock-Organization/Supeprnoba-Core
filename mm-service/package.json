@@ -1,0 +1,15 @@
+{
+  "name": "supernoba-mm-service",
+  "version": "6.0.0",
+  "description": "Supernoba Market Maker Service - Admin Panel Controlled",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kinesis": "^3.0.0",
+    "ioredis": "^5.0.0",
+    "uuid": "^9.0.0"
+  }
+}

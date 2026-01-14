@@ -1,0 +1,17 @@
+{
+  "name": "supernoba-treemap-data",
+  "version": "1.0.0",
+  "description": "Treemap visualization data aggregation Lambda",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "echo \"No tests specified\""
+  },
+  "keywords": ["supernoba", "treemap", "lambda"],
+  "author": "Supernoba",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.x",
+    "@aws-sdk/lib-dynamodb": "^3.x"
+  }
+}

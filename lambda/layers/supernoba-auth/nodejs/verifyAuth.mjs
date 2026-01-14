@@ -8,10 +8,19 @@
  * - COGNITO_REGION: Cognito 리전 (기본: ap-northeast-2)
  * - SUPABASE_JWT_SECRET: Supabase JWT 시크릿 키 (HS256, 레거시)
  * - ADMIN_API_KEY: 관리자 API 키 (선택적)
+ * - USER_CACHE_TABLE: 사용자 캐시 테이블 (기본: supernoba-user-cache)
  */
 
 import { createHmac, createVerify } from 'crypto';
 import https from 'https';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+
+// DynamoDB 클라이언트 (관리자 확인용)
+const dynamodb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' })
+);
+const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
 
 // Cognito JWKS 캐시
 let cognitoJwksCache = null;
@@ -297,10 +306,18 @@ export async function verifyAuth(event, options = {}) {
       userId = payload.sub; // Cognito는 sub에 username (x_12345)
       email = payload.email;
       role = payload['custom:role'] || 'authenticated';
+      console.log('[verifyAuth] Cognito JWT decoded:', {
+        sub: payload.sub,
+        email: payload.email,
+        role: role,
+        customXUserId: payload['custom:x_user_id'],
+        username: payload['cognito:username'] || payload.username
+      });
     } else {
       userId = payload.sub;
       email = payload.email;
       role = payload.role || 'authenticated';
+      console.log('[verifyAuth] Supabase JWT decoded:', { sub: payload.sub, email, role });
     }
 
     // 5. 역할 검증 (설정된 경우)
@@ -378,11 +395,19 @@ export async function verifyAdmin(event, options = {}) {
   const { allowApiKey = true } = options;
 
   // 1. 기존 API 키 방식 확인 (하위 호환성 + Secrets Manager 지원)
+  // Authorization 헤더 또는 X-Api-Key 헤더 모두 지원
   if (allowApiKey) {
     const adminApiKey = await getSecureAdminApiKey();
     const authHeader = event.headers?.Authorization || event.headers?.authorization;
+    const xApiKey = event.headers?.['X-Api-Key'] || event.headers?.['x-api-key'];
 
+    // Authorization 헤더로 API 키 전달 (기존 방식)
     if (adminApiKey && authHeader === adminApiKey) {
+      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
+    }
+    // X-Api-Key 헤더로 API 키 전달 (Admin Console 방식)
+    if (adminApiKey && xApiKey === adminApiKey) {
+      console.log('[verifyAdmin] Admin authenticated via X-Api-Key header');
       return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
     }
   }
@@ -395,13 +420,59 @@ export async function verifyAdmin(event, options = {}) {
   }
 
   // 3. 관리자 권한 확인
-  // Supabase JWT의 app_metadata에서 admin 확인 또는 하드코딩된 관리자 이메일
-  const isAdmin =
+  // JWT 클레임 또는 DynamoDB user-cache에서 is_admin 확인
+  let isAdmin =
     authResult.role === 'admin' ||
     authResult.role === 'service_role' ||
     authResult.payload?.app_metadata?.is_admin === true ||
-    authResult.payload?.user_metadata?.is_admin === true ||
-    ['admin@supernoba.com', 'tchinnom@gmail.com'].includes(authResult.email?.toLowerCase());
+    authResult.payload?.user_metadata?.is_admin === true;
+
+  // JWT 클레임에 admin이 없으면 DynamoDB user-cache 조회
+  if (!isAdmin && authResult.userId) {
+    try {
+      // X 로그인 사용자의 경우 email 또는 custom:x_user_id에서 user_id 추출
+      let userId = authResult.userId;
+
+      // 1. custom:x_user_id가 있으면 그것을 사용 (가장 정확함)
+      const xUserId = authResult.payload?.['custom:x_user_id'];
+      if (xUserId) {
+        userId = `x_${xUserId}`;
+      }
+      // 2. email이 X 형식이면 email에서 추출 (Cognito sub는 UUID이므로 email 사용)
+      else if (authResult.email?.includes('@x.supernoba.com')) {
+        const xId = authResult.email.split('@')[0];
+        userId = `x_${xId}`;
+      }
+      // 3. userId가 이미 X 형식이면 (fallback)
+      else if (userId.includes('@x.supernoba.com')) {
+        const xId = userId.split('@')[0];
+        userId = `x_${xId}`;
+      }
+
+      console.log(`[verifyAdmin] Looking up user in DynamoDB:`, {
+        finalUserId: userId,
+        originalUserId: authResult.userId,
+        email: authResult.email,
+        customXUserId: authResult.payload?.['custom:x_user_id'],
+        table: USER_CACHE_TABLE
+      });
+
+      const { Item } = await dynamodb.send(new GetCommand({
+        TableName: USER_CACHE_TABLE,
+        Key: { user_id: userId }
+      }));
+
+      if (Item?.is_admin === true) {
+        isAdmin = true;
+        console.log(`[verifyAdmin] Admin confirmed from user-cache: ${userId}`);
+      } else {
+        console.log(`[verifyAdmin] Not admin or not found: ${userId}, is_admin=${Item?.is_admin}`);
+      }
+    } catch (dbError) {
+      console.warn('[verifyAdmin] DynamoDB lookup failed:', dbError.message);
+      // DB 조회 실패 시 admin 거부 (안전한 기본값)
+    }
+  }
 
   if (!isAdmin) {
     return {
