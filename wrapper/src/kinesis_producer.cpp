@@ -53,31 +53,44 @@ void KinesisProducer::publishFill(const std::string& symbol,
                                    uint64_t qty,
                                    uint64_t price,
                                    bool buyer_fully_filled,
-                                   bool seller_fully_filled) {
+                                   bool seller_fully_filled,
+                                   bool buyer_is_maker) {
     nlohmann::json j;
     j["event"] = "FILL";
     j["symbol"] = symbol;
     j["trade_id"] = order_id + "_" + matched_order_id;
-    
+
     // buyer 객체 명시적으로 생성
     nlohmann::json buyer_obj;
     buyer_obj["order_id"] = order_id;
     buyer_obj["user_id"] = buyer_id;
     buyer_obj["fully_filled"] = buyer_fully_filled;
+    buyer_obj["is_maker"] = buyer_is_maker;
     j["buyer"] = buyer_obj;
-    
+
     // seller 객체 명시적으로 생성
     nlohmann::json seller_obj;
     seller_obj["order_id"] = matched_order_id;
     seller_obj["user_id"] = seller_id;
     seller_obj["fully_filled"] = seller_fully_filled;
+    seller_obj["is_maker"] = !buyer_is_maker;  // opposite of buyer
     j["seller"] = seller_obj;
-    
+
     j["quantity"] = qty;
     j["price"] = price;
+
+    // timestamp in milliseconds
+    auto now = std::chrono::system_clock::now();
     j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    
+        now.time_since_epoch()).count();
+
+    // executed_at in ISO 8601 format for history storage
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_now = *std::gmtime(&time_t_now);
+    char iso_buf[30];
+    std::strftime(iso_buf, sizeof(iso_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
+    j["executed_at"] = iso_buf;
+
     produce(fills_stream_, symbol, j.dump());
     Logger::debug("Published fill:", order_id, "buyer_filled:", buyer_fully_filled, "seller_filled:", seller_fully_filled);
 }

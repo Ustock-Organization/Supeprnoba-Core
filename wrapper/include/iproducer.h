@@ -19,7 +19,8 @@ public:
                              uint64_t qty,
                              uint64_t price,
                              bool buyer_fully_filled = false,
-                             bool seller_fully_filled = false) = 0;
+                             bool seller_fully_filled = false,
+                             bool buyer_is_maker = false) = 0;
     
     // 거래 이벤트 발행
     virtual void publishTrade(const std::string& symbol,

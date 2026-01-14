@@ -22,7 +22,8 @@ public:
                      uint64_t qty,
                      uint64_t price,
                      bool buyer_fully_filled = false,
-                     bool seller_fully_filled = false) override;
+                     bool seller_fully_filled = false,
+                     bool buyer_is_maker = false) override;
     
     // 거래 이벤트 발행
     void publishTrade(const std::string& symbol,
