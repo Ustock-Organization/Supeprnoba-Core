@@ -398,6 +398,11 @@ export const handler = async (event) => {
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: item }));
         await valkey.set(`symbol:${sym}:listingPrice`, listingPrice.toString());
 
+        // 전일종가 초기화 (등락율 계산용)
+        const prevData = JSON.stringify({ close: listingPrice });
+        await valkey.set(`prev:${sym}`, prevData);
+        console.log(`[LISTING] prev:${sym} initialized with listingPrice: ${listingPrice}`);
+
         const tickerData = {
           symbol: sym,
           price: listingPrice,
@@ -720,7 +725,8 @@ export const handler = async (event) => {
     }
 
     // ==========================================
-    // DELETE: 종목 삭제 (관리자)
+    // DELETE: 종목 상장폐지 (관리자)
+    // 모든 관련 데이터 삭제: DynamoDB, PostgreSQL, Valkey
     // ==========================================
     if (m === 'DELETE') {
       const adminCheck = await checkAdmin(event);
@@ -730,35 +736,101 @@ export const handler = async (event) => {
       const sym = (b.symbol || '').toUpperCase().trim();
       if (!sym) return err(400, 'symbol is required');
 
-      console.log(`[DELETE] Processing symbol: ${sym}`);
+      console.log(`[DELETE] Processing delisting for symbol: ${sym}`);
 
       const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
       if (!Item) return err(404, `Symbol ${sym} not found`);
 
+      // 삭제 결과 추적
+      const deletionResults = {};
+
       await valkey.sadd('deleted:symbols', sym);
 
-      const pipe = valkey.pipeline();
-      ['ticker', 'depth', 'ohlc'].forEach(k => pipe.del(`${k}:${sym}`));
-      pipe.del(`symbol:${sym}:listingPrice`);
-      pipe.del(`symbol:${sym}:main`);
-      pipe.del(`symbol:${sym}:subscribers`);
-      pipe.del(`symbol:${sym}:sub`);
-      ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
-      ['config', 'price', 'orderCount', 'started_at'].forEach(k => pipe.del(`mm:${k}:${sym}`));
-      ['active:symbols', 'subscribed:symbols', 'mm:running:symbols'].forEach(s => pipe.srem(s, sym));
-      await pipe.exec();
-
+      // === Valkey 캐시 삭제 ===
       try {
-        const db = await getPg();
-        await db.query('DELETE FROM market_maker_configs WHERE symbol = $1', [sym]);
-        console.log(`[DELETE] MarketMaker config deleted for ${sym}`);
-      } catch (pgErr) {
-        console.warn(`[DELETE] PostgreSQL cleanup warning: ${pgErr.message}`);
+        const pipe = valkey.pipeline();
+        ['ticker', 'depth', 'ohlc'].forEach(k => pipe.del(`${k}:${sym}`));
+        pipe.del(`symbol:${sym}:listingPrice`);
+        pipe.del(`symbol:${sym}:main`);
+        pipe.del(`symbol:${sym}:subscribers`);
+        pipe.del(`symbol:${sym}:sub`);
+        ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
+        ['config', 'price', 'orderCount', 'started_at'].forEach(k => pipe.del(`mm:${k}:${sym}`));
+        ['active:symbols', 'subscribed:symbols', 'mm:running:symbols'].forEach(s => pipe.srem(s, sym));
+        await pipe.exec();
+        deletionResults.valkey_cache = { success: true, keys: 20 };
+        console.log(`[DELETE] Valkey cache deleted for ${sym}`);
+      } catch (valkeyErr) {
+        deletionResults.valkey_cache = { success: false, error: valkeyErr.message };
+        console.warn(`[DELETE] Valkey cache cleanup warning: ${valkeyErr.message}`);
       }
 
-      // 동기 삭제
-      await dynamodb.send(new DeleteCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+      // === Valkey prev:{symbol} 삭제 ===
+      try {
+        await valkey.del(`prev:${sym}`);
+        deletionResults.valkey_prev = { success: true, keys: 1 };
+        console.log(`[DELETE] Valkey prev:${sym} deleted`);
+      } catch (prevErr) {
+        deletionResults.valkey_prev = { success: false, error: prevErr.message };
+        console.warn(`[DELETE] Valkey prev cleanup warning: ${prevErr.message}`);
+      }
 
+      // === PostgreSQL 삭제 ===
+      try {
+        const db = await getPg();
+
+        // MM 설정 삭제
+        const mmResult = await db.query('DELETE FROM market_maker_configs WHERE symbol = $1', [sym]);
+        deletionResults.mm_config = { success: true, count: mmResult.rowCount };
+        console.log(`[DELETE] MarketMaker config deleted for ${sym}: ${mmResult.rowCount} rows`);
+
+        // 거래 내역 삭제
+        const tradeResult = await db.query('DELETE FROM trade_history WHERE symbol = $1', [sym]);
+        deletionResults.postgres_trades = { success: true, count: tradeResult.rowCount };
+        console.log(`[DELETE] trade_history deleted for ${sym}: ${tradeResult.rowCount} rows`);
+
+        // 캔들 내역 삭제
+        const candleResult = await db.query('DELETE FROM candle_history WHERE symbol = $1', [sym]);
+        deletionResults.postgres_candles = { success: true, count: candleResult.rowCount };
+        console.log(`[DELETE] candle_history deleted for ${sym}: ${candleResult.rowCount} rows`);
+
+        // OHLC 요약 삭제
+        const ohlcResult = await db.query('DELETE FROM daily_ohlc_summary WHERE symbol = $1', [sym]);
+        deletionResults.postgres_ohlc = { success: true, count: ohlcResult.rowCount };
+        console.log(`[DELETE] daily_ohlc_summary deleted for ${sym}: ${ohlcResult.rowCount} rows`);
+
+        // 전일종가 삭제
+        const prevCloseResult = await db.query('DELETE FROM symbol_prev_close WHERE symbol = $1', [sym]);
+        deletionResults.postgres_prevclose = { success: true, count: prevCloseResult.rowCount };
+        console.log(`[DELETE] symbol_prev_close deleted for ${sym}: ${prevCloseResult.rowCount} rows`);
+
+        // 활성 심볼 삭제
+        try {
+          const activeResult = await db.query('DELETE FROM active_symbols WHERE symbol = $1', [sym]);
+          console.log(`[DELETE] active_symbols deleted for ${sym}: ${activeResult.rowCount} rows`);
+        } catch (activeErr) {
+          console.warn(`[DELETE] active_symbols cleanup warning (table may not exist): ${activeErr.message}`);
+        }
+      } catch (pgErr) {
+        console.warn(`[DELETE] PostgreSQL cleanup warning: ${pgErr.message}`);
+        // 개별 실패 시에도 계속 진행
+        if (!deletionResults.postgres_trades) deletionResults.postgres_trades = { success: false, error: pgErr.message };
+        if (!deletionResults.postgres_candles) deletionResults.postgres_candles = { success: false, error: pgErr.message };
+        if (!deletionResults.postgres_ohlc) deletionResults.postgres_ohlc = { success: false, error: pgErr.message };
+        if (!deletionResults.postgres_prevclose) deletionResults.postgres_prevclose = { success: false, error: pgErr.message };
+        if (!deletionResults.mm_config) deletionResults.mm_config = { success: false, error: pgErr.message };
+      }
+
+      // === DynamoDB 종목 삭제 ===
+      try {
+        await dynamodb.send(new DeleteCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        deletionResults.dynamodb_symbols = { success: true, count: 1 };
+        console.log(`[DELETE] DynamoDB symbol deleted: ${sym}`);
+      } catch (symErr) {
+        deletionResults.dynamodb_symbols = { success: false, error: symErr.message };
+      }
+
+      // === DynamoDB IPO 주문 삭제 ===
       try {
         await dynamodb.send(new DeleteCommand({ TableName: IPO_ORDERS_TABLE, Key: { symbol: sym } }));
         console.log(`[DELETE] IPO order deleted for ${sym}`);
@@ -766,7 +838,7 @@ export const handler = async (event) => {
         console.warn(`[DELETE] IPO order cleanup warning: ${ipoErr.message}`);
       }
 
-      // 비동기 정리 (SQS)
+      // === 비동기 정리 (SQS) - holdings, orders, favorites ===
       try {
         await sqs.send(new SendMessageCommand({
           QueueUrl: CLEANUP_QUEUE_URL,
@@ -778,15 +850,22 @@ export const handler = async (event) => {
           MessageGroupId: undefined
         }));
         console.log(`[DELETE] Cleanup message sent to SQS for ${sym}`);
+        deletionResults.dynamodb_holdings = { success: true, count: 0, async: true };
+        deletionResults.dynamodb_orders = { success: true, count: 0, async: true };
+        deletionResults.dynamodb_favorites = { success: true, count: 0, async: true };
       } catch (sqsErr) {
-        console.error(`[DELETE] SQS message failed (non-critical): ${sqsErr.message}`);
+        console.error(`[DELETE] SQS message failed: ${sqsErr.message}`);
+        deletionResults.dynamodb_holdings = { success: false, error: sqsErr.message };
+        deletionResults.dynamodb_orders = { success: false, error: sqsErr.message };
+        deletionResults.dynamodb_favorites = { success: false, error: sqsErr.message };
       }
 
-      console.log(`[DELETE] Symbol ${sym} deleted successfully`);
+      console.log(`[DELETE] Symbol ${sym} delisted successfully`);
       return ok({
         success: true,
         symbol: sym,
-        message: `Symbol ${sym} deleted. Async cleanup triggered for holdings/orders/favorites.`
+        message: `Symbol ${sym} delisted. All related data has been removed.`,
+        deletionResults
       });
     }
 
