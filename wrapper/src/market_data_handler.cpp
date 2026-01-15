@@ -415,22 +415,10 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
     
     depth_json["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    
-    // 변동률 추가 (Main 데이터에도 포함) - 항상 포함
+
+    // 현재가만 추가 (변동률 c, yc, pc는 클라이언트에서 계산)
     DayData& day = getDayData(symbol);
-    depth_json["c"] = std::round(day.change_rate * 100) / 100.0;
-    depth_json["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
-    depth_json["p"] = day.last_price;  // 현재가도 추가
-    depth_json["pc"] = day.prev_close;  // 전일종가 추가 (Frontend 호환)
-    
-    // DEBUG: 저장 전 depth_json 내용 출력
-    Logger::info("DEPTH_DEBUG:", symbol, 
-                 "c=", day.change_rate, 
-                 "yc=", day.prev_change_rate, 
-                 "p=", day.last_price,
-                 "json_c=", depth_json["c"].dump(),
-                 "json_yc=", depth_json["yc"].dump(),
-                 "json_p=", depth_json["p"].dump());
+    depth_json["p"] = day.last_price;
     
     // Valkey에 depth 캐시 저장 (Streaming Server가 읽어감)
     Logger::debug("Depth cache check - redis_:", redis_ ? "exists" : "null", 
@@ -515,21 +503,16 @@ void MarketDataHandler::savePrevDayData(const std::string& symbol, const DayData
 void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t price) {
     if (!redis_ || !redis_->isConnected()) return;
 
-    const DayData& day = symbol_day_data_[symbol];
-
-    // Ticker JSON (Sub 데이터용)
+    // Ticker JSON (Sub 데이터용) - 현재가만 전송, 변동률은 클라이언트 계산
     nlohmann::json ticker;
     ticker["e"] = "t";  // event = ticker
     ticker["s"] = symbol;
     ticker["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     ticker["p"] = price;
-    ticker["c"] = std::round(day.change_rate * 100) / 100.0;  // 소수점 2자리
-    ticker["yc"] = std::round(day.prev_change_rate * 100) / 100.0;
-    ticker["pc"] = day.prev_close;  // 전일종가 추가 (Frontend 호환)
 
     redis_->set("ticker:" + symbol, ticker.dump());
-    Logger::debug("Ticker saved:", symbol, "price:", price, "change:", day.change_rate, "%");
+    Logger::debug("Ticker saved:", symbol, "price:", price);
 }
 
 void MarketDataHandler::loadPrevClose(const std::string& symbol) {
