@@ -200,4 +200,138 @@ bool ValkeyClient::trim_closed_candles(const std::string& symbol, size_t count) 
     return ok;
 }
 
+// === 진행중 캔들 관리 (증분 업데이트용) ===
+
+Candle ValkeyClient::get_candle(const std::string& key) {
+    Candle c;
+    if (!ctx_) return c;
+
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "HGETALL %s", key.c_str());
+    if (!reply) return c;
+
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2 && reply->elements % 2 == 0) {
+        for (size_t i = 0; i < reply->elements; i += 2) {
+            if (i + 1 >= reply->elements) break;
+
+            std::string field = reply->element[i]->str;
+            std::string value = reply->element[i+1]->str;
+
+            if (field == "s") c.symbol = value;
+            else if (field == "t") c.time = value;
+            else if (field == "o") c.open = std::stod(value);
+            else if (field == "h") c.high = std::stod(value);
+            else if (field == "l") c.low = std::stod(value);
+            else if (field == "c") c.close = std::stod(value);
+            else if (field == "v") c.volume = std::stod(value);
+        }
+    }
+    freeReplyObject(reply);
+    return c;
+}
+
+bool ValkeyClient::set_candle(const std::string& key, const Candle& candle, int ttl_seconds) {
+    if (!ctx_) return false;
+
+    // HMSET으로 캔들 데이터 저장
+    redisReply* reply = (redisReply*)redisCommand(ctx_,
+        "HMSET %s s %s t %s o %.8f h %.8f l %.8f c %.8f v %.8f",
+        key.c_str(),
+        candle.symbol.c_str(),
+        candle.time.c_str(),
+        candle.open,
+        candle.high,
+        candle.low,
+        candle.close,
+        candle.volume);
+
+    if (!reply) return false;
+    bool ok = (reply->type == REDIS_REPLY_STATUS && std::string(reply->str) == "OK");
+    freeReplyObject(reply);
+
+    if (!ok) return false;
+
+    // TTL 설정
+    return set_expire(key, ttl_seconds);
+}
+
+std::vector<Candle> ValkeyClient::pop_closed_candles(const std::string& symbol, size_t max_count) {
+    std::vector<Candle> candles;
+    if (!ctx_) return candles;
+
+    std::string key = "candle:closed:1m:" + symbol;
+
+    // 숫자와 문자열 모두 처리하는 헬퍼 함수
+    auto get_double = [](const json& j, const std::string& key) -> double {
+        if (!j.contains(key)) return 0.0;
+        if (j[key].is_number()) return j[key].get<double>();
+        if (j[key].is_string()) return std::stod(j[key].get<std::string>());
+        return 0.0;
+    };
+    auto get_string = [](const json& j, const std::string& key) -> std::string {
+        if (!j.contains(key)) return "";
+        if (j[key].is_string()) return j[key].get<std::string>();
+        if (j[key].is_number()) return std::to_string(static_cast<long long>(j[key].get<double>()));
+        return "";
+    };
+
+    // RPOP으로 오래된 순서로 가져오기 (리스트 끝에서 pop)
+    for (size_t i = 0; i < max_count; i++) {
+        redisReply* reply = (redisReply*)redisCommand(ctx_, "RPOP %s", key.c_str());
+        if (!reply) break;
+
+        if (reply->type == REDIS_REPLY_NIL) {
+            freeReplyObject(reply);
+            break;  // 리스트 비어있음
+        }
+
+        if (reply->type == REDIS_REPLY_STRING) {
+            try {
+                json j = json::parse(reply->str);
+                Candle c;
+                c.symbol = symbol;
+                c.time = get_string(j, "t");
+                c.open = get_double(j, "o");
+                c.high = get_double(j, "h");
+                c.low = get_double(j, "l");
+                c.close = get_double(j, "c");
+                c.volume = get_double(j, "v");
+
+                if (!c.time.empty()) {
+                    candles.push_back(c);
+                }
+            } catch (const std::exception& e) {
+                Logger::warn("Failed to parse candle JSON:", e.what());
+            }
+        }
+        freeReplyObject(reply);
+    }
+
+    return candles;
+}
+
+size_t ValkeyClient::get_list_length(const std::string& key) {
+    if (!ctx_) return 0;
+
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "LLEN %s", key.c_str());
+    if (!reply) return 0;
+
+    size_t len = 0;
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        len = static_cast<size_t>(reply->integer);
+    }
+    freeReplyObject(reply);
+    return len;
+}
+
+bool ValkeyClient::set_expire(const std::string& key, int ttl_seconds) {
+    if (!ctx_ || ttl_seconds <= 0) return false;
+
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "EXPIRE %s %d", key.c_str(), ttl_seconds);
+    if (!reply) return false;
+
+    bool ok = (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
+    freeReplyObject(reply);
+    return ok;
+}
+
 } // namespace aggregator

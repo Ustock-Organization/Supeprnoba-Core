@@ -168,4 +168,76 @@ std::map<std::string, std::vector<Candle>> Aggregator::aggregate(
     return result;
 }
 
+// epoch → 타임프레임 시작 epoch 정렬
+int64_t Aggregator::align_epoch_to_timeframe(int64_t epoch, int seconds) {
+    return (epoch / seconds) * seconds;
+}
+
+// epoch → YYYYMMDDHHmm 변환 (KST)
+std::string Aggregator::epoch_to_ymdhm(int64_t epoch) {
+    const int64_t KST_OFFSET = 9 * 3600;  // UTC+9
+    time_t kst_time = static_cast<time_t>(epoch + KST_OFFSET);
+    struct tm* tm = gmtime(&kst_time);
+
+    std::ostringstream oss;
+    oss << std::setfill('0')
+        << std::setw(4) << (tm->tm_year + 1900)
+        << std::setw(2) << (tm->tm_mon + 1)
+        << std::setw(2) << tm->tm_mday
+        << std::setw(2) << tm->tm_hour
+        << std::setw(2) << tm->tm_min;
+    return oss.str();
+}
+
+Aggregator::UpdateResult Aggregator::update_candle_incremental(
+    const Candle& source,
+    const Candle& current,
+    const Timeframe& tf)
+{
+    UpdateResult result;
+    result.is_closed = false;
+
+    // 소스 캔들의 epoch을 타임프레임 경계로 정렬
+    int64_t source_epoch = source.epoch();
+    int64_t aligned_epoch = align_epoch_to_timeframe(source_epoch, tf.seconds);
+    std::string aligned_time = epoch_to_ymdhm(aligned_epoch);
+
+    // 현재 진행중인 캔들의 epoch
+    int64_t current_epoch = current.epoch();
+
+    // 새 구간 시작인지 체크
+    if (current.time.empty() || current_epoch != aligned_epoch) {
+        // 기존 캔들 마감
+        if (!current.time.empty()) {
+            result.is_closed = true;
+            result.closed_candle = current;
+        }
+
+        // 새 캔들 시작
+        result.current_candle.symbol = source.symbol;
+        result.current_candle.time = aligned_time;
+        result.current_candle.open = source.open;
+        result.current_candle.high = source.high;
+        result.current_candle.low = source.low;
+        result.current_candle.close = source.close;
+        result.current_candle.volume = source.volume;
+
+        Logger::debug("[INC-NEW]", source.symbol, tf.interval, "@", aligned_time,
+                     "O:", source.open, "H:", source.high, "L:", source.low, "C:", source.close);
+    } else {
+        // 기존 캔들 업데이트
+        result.current_candle = current;
+        result.current_candle.high = std::max(current.high, source.high);
+        result.current_candle.low = std::min(current.low, source.low);
+        result.current_candle.close = source.close;
+        result.current_candle.volume = current.volume + source.volume;
+
+        Logger::debug("[INC-UPD]", source.symbol, tf.interval, "@", aligned_time,
+                     "H:", result.current_candle.high, "L:", result.current_candle.low,
+                     "C:", result.current_candle.close);
+    }
+
+    return result;
+}
+
 } // namespace aggregator

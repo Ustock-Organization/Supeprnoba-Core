@@ -148,144 +148,96 @@ int main(int argc, char* argv[]) {
     Logger::info("=== Aggregator Running ===");
     Logger::info("Polling for closed candles every", cfg.poll_interval_ms, "ms");
     
-    // 마지막으로 처리한 캔들 개수 (중복 로그/처리 방지)
-    std::map<std::string, size_t> last_processed_counts;
-
-    // 마지막 저장된 epoch 추적 (중복 저장 방지)
-    // key: "symbol:interval", value: last saved epoch
-    std::map<std::string, int64_t> last_saved_epochs;
-
-    // [Phase 3] 계층적 집계 상태 추적
+    // === 증분 업데이트용 상태 ===
     std::set<std::string> known_symbols;           // 알려진 심볼 목록
-    int64_t last_4h_check = 0;                     // 마지막 4h 경계 체크 시간
-    int64_t last_1d_check = 0;                     // 마지막 1d 경계 체크 시간
-    int64_t last_1w_check = 0;                     // 마지막 1w 경계 체크 시간
+    std::map<std::string, int64_t> symbol_last_seen;  // 심볼별 마지막 활동 시간
 
-    const int SECONDS_4H = 4 * 3600;               // 4시간
-    const int SECONDS_1D = 24 * 3600;              // 1일
-    const int SECONDS_1W = 7 * 24 * 3600;          // 1주
-    
+    // 1d/1w 계층적 집계 상태 추적
+    int64_t last_1d_check = 0;
+    int64_t last_1w_check = 0;
+    int64_t last_stats_time = 0;  // 통계 로깅 시간
+    int64_t last_cleanup_time = 0;  // 정리 시간
+
+    const int SECONDS_1D = 24 * 3600;
+    const int SECONDS_1W = 7 * 24 * 3600;
+
+    // 타임프레임별 TTL 헬퍼
+    auto get_ttl_for_interval = [](const std::string& interval) -> int {
+        if (interval == "3m") return 360;       // 6분
+        if (interval == "5m") return 600;       // 10분
+        if (interval == "15m") return 1800;     // 30분
+        if (interval == "30m") return 3600;     // 1시간
+        if (interval == "1h") return 7200;      // 2시간
+        if (interval == "4h") return 28800;     // 8시간
+        return 3600;  // 기본 1시간
+    };
+
+    Logger::info("=== Incremental Aggregation Mode ===");
+
     while (running) {
         try {
-            // 1. closed 캔들이 있는 심볼 목록 조회
-            auto symbols = valkey.get_closed_symbols();
-            
-            // 심볼이 발견될 때만 로그
-            static size_t last_symbol_count = 0;
-            if (!symbols.empty() && symbols.size() != last_symbol_count) {
-                Logger::info("Found", symbols.size(), "symbols with closed candles");
-                last_symbol_count = symbols.size();
-            }
-
-            for (const auto& symbol : symbols) {
-                // 2. 마감된 1분봉 가져오기
-                auto closed_candles = valkey.get_closed_candles(symbol);
-                
-                if (closed_candles.empty()) {
-                    last_processed_counts[symbol] = 0;
-                    continue;
-                }
-                
-                // 변경 사항이 없으면 스킵 (고속 폴링 방지)
-                if (last_processed_counts.find(symbol) != last_processed_counts.end() && 
-                    last_processed_counts[symbol] == closed_candles.size()) {
-                    continue;
-                }
-                
-                // 상태 업데이트
-                last_processed_counts[symbol] = closed_candles.size();
-                
-                Logger::info("Processing", symbol, "-", closed_candles.size(), "1m closed candles from Valkey");
-                
-                // 디버깅: 가져온 캔들 정보 일부 출력
-                if (!closed_candles.empty()) {
-                     const auto& first = closed_candles.front();
-                     Logger::debug("  First candle:", first.time, "O:", first.open, "C:", first.close);
-                }
-
-                // 3. 타임프레임별 집계
-                auto aggregated = aggregator.aggregate(closed_candles);
-                Logger::info("  Aggregated into", aggregated.size(), "timeframes");
-                
-                // 4. RDS 저장 (새 캔들만 저장 - epoch 기반 중복 방지)
-                for (const auto& [interval, candles] : aggregated) {
-                    if (candles.empty()) continue;
-                    
-                    // 이미 저장된 캔들 제외 (epoch 기반 필터링)
-                    std::string key = symbol + ":" + interval;
-                    int64_t last_epoch = 0;
-                    if (last_saved_epochs.find(key) != last_saved_epochs.end()) {
-                        last_epoch = last_saved_epochs[key];
-                    }
-                    
-                    std::vector<Candle> new_candles;
-                    int64_t max_epoch = last_epoch;
-                    for (const auto& c : candles) {
-                        if (c.epoch() > last_epoch) {
-                            new_candles.push_back(c);
-                            if (c.epoch() > max_epoch) {
-                                max_epoch = c.epoch();
-                            }
-                        }
-                    }
-                    
-                    if (new_candles.empty()) {
-                        Logger::debug("  [SKIP]", interval, "- no new candles (already saved)");
-                        continue;
-                    }
-                    
-                    Logger::info("  Saving", new_candles.size(), "new candles for interval", interval, "to RDS...");
-                    int saved = rds.batch_put_candles(symbol, interval, new_candles);
-                    if (saved > 0) {
-                        Logger::info("  [SUCCESS] RDS:", symbol, interval, "-", saved, "candles saved");
-                        // 저장 성공 시 마지막 epoch 업데이트
-                        last_saved_epochs[key] = max_epoch;
-                    } else {
-                        Logger::error("  [FAILURE] RDS save failed for", symbol, interval);
-                    }
-                }
-                
-                // 5. Valkey 정리 정책 (4h 집계 지원을 위해 240개 유지)
-                // [FIX] 기존 60개 → 240개로 변경 (4h = 240분)
-                // 1d/1w는 Phase 3의 RDS 기반 집계로 처리
-                const size_t VALKEY_TRIM_THRESHOLD = 240;  // 4시간 분량
-                const size_t VALKEY_KEEP_COUNT = 120;      // 최소 2시간 분량 유지
-
-                if (closed_candles.size() >= VALKEY_TRIM_THRESHOLD) {
-                    // 오래된 캔들만 정리 (최근 KEEP_COUNT개 유지)
-                    size_t trim_count = closed_candles.size() - VALKEY_KEEP_COUNT;
-
-                    if (valkey.trim_closed_candles(symbol, trim_count)) {
-                        Logger::info("[VALKEY]", symbol, "trimmed", trim_count,
-                                    "candles, keeping", VALKEY_KEEP_COUNT);
-                    }
-
-                    // 처리 후 상태 업데이트
-                    last_processed_counts[symbol] = VALKEY_KEEP_COUNT;
-                } else {
-                    Logger::debug("Valkey buffer:", closed_candles.size(), "/", VALKEY_TRIM_THRESHOLD);
-                }
-
-                // [Phase 3] 심볼 추적
-                known_symbols.insert(symbol);
-            }
-
-            // [Phase 3] 계층적 집계 - 4h, 1d, 1w
-            // 매 타임프레임 경계에서 RDS 저장된 하위 캔들로 상위 집계
             int64_t now = get_current_epoch();
 
-            // 4시간봉 집계 (1h × 4 → 4h)
-            int64_t aligned_4h = align_epoch_to_timeframe(now, SECONDS_4H);
-            if (aligned_4h > last_4h_check && !known_symbols.empty()) {
-                Logger::info("[HIER-AGG] 4h boundary reached, aggregating...");
-                for (const auto& sym : known_symbols) {
-                    aggregate_higher_timeframe(rds, aggregator, sym, "1h", "4h",
-                                              SECONDS_4H, aligned_4h);
+            // 1. closed 캔들이 있는 심볼 목록 조회
+            auto symbols = valkey.get_closed_symbols();
+
+            for (const auto& symbol : symbols) {
+                // 2. 마감된 1분봉 POP (RPOP - 오래된 순)
+                auto closed_1m = valkey.pop_closed_candles(symbol, 60);  // 최대 60개씩 처리
+
+                if (closed_1m.empty()) continue;
+
+                Logger::info("[INC]", symbol, "- processing", closed_1m.size(), "closed 1m candles");
+
+                // 심볼 활동 기록
+                symbol_last_seen[symbol] = now;
+                known_symbols.insert(symbol);
+
+                // 3. 각 1분봉에 대해 상위 타임프레임 증분 업데이트
+                for (const auto& candle_1m : closed_1m) {
+                    // 1분봉은 직접 RDS에 저장
+                    if (rds.put_candle(symbol, "1m", candle_1m)) {
+                        Logger::debug("[RDS] 1m saved:", symbol, "@", candle_1m.time);
+                    }
+
+                    // 상위 타임프레임 업데이트
+                    for (const auto& tf : HIGHER_TIMEFRAMES) {
+                        std::string key = "candle:" + tf.interval + ":" + symbol;
+
+                        // 현재 진행중인 캔들 조회
+                        Candle current = valkey.get_candle(key);
+
+                        // 증분 업데이트
+                        auto result = aggregator.update_candle_incremental(
+                            candle_1m, current, tf);
+
+                        // 구간 마감 시 RDS 저장
+                        if (result.is_closed) {
+                            if (rds.put_candle(symbol, tf.interval, result.closed_candle)) {
+                                Logger::info("[CLOSED]", symbol, tf.interval, "@",
+                                            result.closed_candle.time,
+                                            "O:", result.closed_candle.open,
+                                            "H:", result.closed_candle.high,
+                                            "L:", result.closed_candle.low,
+                                            "C:", result.closed_candle.close);
+                            }
+                        }
+
+                        // 업데이트된 캔들 Valkey에 저장 + TTL
+                        int ttl = get_ttl_for_interval(tf.interval);
+                        valkey.set_candle(key, result.current_candle, ttl);
+                    }
                 }
-                last_4h_check = aligned_4h;
+
+                // 4. 리스트 길이 체크 및 정리 (안전장치)
+                size_t list_len = valkey.get_list_length("candle:closed:1m:" + symbol);
+                if (list_len > 300) {
+                    // 300개 초과 시 경고
+                    Logger::warn("[WARN]", symbol, "closed list has", list_len, "candles");
+                }
             }
 
-            // 일봉 집계 (1h × 24 → 1d)
+            // 5. 1d/1w 계층적 집계 (RDS 기반)
             int64_t aligned_1d = align_epoch_to_timeframe(now, SECONDS_1D);
             if (aligned_1d > last_1d_check && !known_symbols.empty()) {
                 Logger::info("[HIER-AGG] 1d boundary reached, aggregating...");
@@ -296,7 +248,6 @@ int main(int argc, char* argv[]) {
                 last_1d_check = aligned_1d;
             }
 
-            // 주봉 집계 (1d × 7 → 1w)
             int64_t aligned_1w = align_epoch_to_timeframe(now, SECONDS_1W);
             if (aligned_1w > last_1w_check && !known_symbols.empty()) {
                 Logger::info("[HIER-AGG] 1w boundary reached, aggregating...");
@@ -307,10 +258,32 @@ int main(int argc, char* argv[]) {
                 last_1w_check = aligned_1w;
             }
 
+            // 6. 주기적 통계 로깅 (5분마다)
+            if (now - last_stats_time > 300) {
+                Logger::info("[STATS] Symbols:", known_symbols.size(),
+                            "Active:", symbol_last_seen.size());
+                last_stats_time = now;
+            }
+
+            // 7. 비활성 심볼 정리 (10분마다, 1시간 이상 비활성)
+            if (now - last_cleanup_time > 600) {
+                const int64_t INACTIVE_THRESHOLD = 3600;  // 1시간
+                for (auto it = symbol_last_seen.begin(); it != symbol_last_seen.end();) {
+                    if (now - it->second > INACTIVE_THRESHOLD) {
+                        Logger::info("[CLEANUP] Removing inactive symbol:", it->first);
+                        known_symbols.erase(it->first);
+                        it = symbol_last_seen.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                last_cleanup_time = now;
+            }
+
         } catch (const std::exception& e) {
             Logger::error("Processing error:", e.what());
         }
-        
+
         // 폴링 간격 대기
         std::this_thread::sleep_for(std::chrono::milliseconds(cfg.poll_interval_ms));
     }
