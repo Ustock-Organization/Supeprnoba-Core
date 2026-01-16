@@ -32,7 +32,6 @@ struct DayData {
     uint64_t last_price = 0;    // 현재가 (마지막 체결가)
     uint64_t volume = 0;        // 당일 거래량
     double change_rate = 0.0;   // 당일 변동률 (%)
-    double prev_change_rate = 0.0;  // 전일 변동률 (%)
     int trading_day = 0;        // 거래일 (YYYYMMDD)
 };
 

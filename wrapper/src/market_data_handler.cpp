@@ -481,13 +481,11 @@ void MarketDataHandler::checkDayReset(const std::string& symbol) {
             savePrevDayData(symbol, day);
         }
 
-        // 전일 종가와 변동률 보존 후 리셋
+        // 전일 종가 보존 후 리셋
         uint64_t prev_close = day.last_price;  // 전일 종가 보존
-        double prev_change = day.change_rate;
         day = DayData{};
         day.trading_day = today;
         day.prev_close = prev_close;
-        day.prev_change_rate = prev_change;
 
         Logger::info("Day reset for", symbol, "new trading day:", today, "prev_close:", prev_close);
     }
@@ -544,9 +542,6 @@ void MarketDataHandler::loadPrevClose(const std::string& symbol) {
             if (prev_json.contains("close") && !prev_json["close"].is_null()) {
                 day.prev_close = prev_json["close"].get<uint64_t>();
                 Logger::info("Loaded prev_close from prev:", symbol, "=", day.prev_close);
-            }
-            if (prev_json.contains("change_rate") && !prev_json["change_rate"].is_null()) {
-                day.prev_change_rate = prev_json["change_rate"].get<double>();
             }
         } catch (const std::exception& e) {
             Logger::warn("Failed to parse prev data for", symbol, ":", e.what());
