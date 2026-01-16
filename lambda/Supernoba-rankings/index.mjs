@@ -13,8 +13,8 @@ import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 const SNAPSHOT_KEY = 'rankings:snapshot';
 const SNAPSHOT_TTL = 15;  // 초
 
-// Layer를 통한 클라이언트 초기화 (backup cache)
-const valkey = getValkeyClient({ type: 'backup' });
+// Layer를 통한 클라이언트 초기화 (backup cache, admin preset for reliable connection)
+const valkey = getValkeyClient({ type: 'backup', preset: 'admin' });
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
