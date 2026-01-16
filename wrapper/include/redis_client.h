@@ -37,6 +37,16 @@ public:
     bool hset(const std::string& key, const std::string& field, const std::string& value);
     std::optional<std::string> hget(const std::string& key, const std::string& field);
     std::map<std::string, std::string> hgetall(const std::string& key);
+
+    // Sorted Set 연산 (랭킹용)
+    bool zadd(const std::string& key, double score, const std::string& member);
+    double zincrby(const std::string& key, double increment, const std::string& member);
+    std::vector<std::pair<std::string, double>> zrevrange(const std::string& key, long start, long stop, bool withScores = false);
+    std::vector<std::pair<std::string, double>> zrange(const std::string& key, long start, long stop, bool withScores = false);
+    bool zremrangebyrank(const std::string& key, long start, long stop);
+
+    // Pub/Sub (랭킹 브로드캐스트용)
+    long long publish(const std::string& channel, const std::string& message);
     
     // Lua Script (EVAL)
     std::string eval(const std::string& script, int numKeys, 

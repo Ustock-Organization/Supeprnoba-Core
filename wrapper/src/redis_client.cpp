@@ -226,6 +226,156 @@ std::vector<std::string> RedisClient::smembers(const std::string& key) {
     return result;
 }
 
+// === Sorted Set 연산 (랭킹용) ===
+
+bool RedisClient::zadd(const std::string& key, double score, const std::string& member) {
+    if (!context_) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZADD %s %f %s", key.c_str(), score, member.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis ZADD failed:", context_->errstr);
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+double RedisClient::zincrby(const std::string& key, double increment, const std::string& member) {
+    if (!context_) return 0.0;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZINCRBY %s %f %s", key.c_str(), increment, member.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis ZINCRBY failed:", context_->errstr);
+        return 0.0;
+    }
+
+    double result = 0.0;
+    if (reply->type == REDIS_REPLY_STRING) {
+        result = std::stod(reply->str);
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+std::vector<std::pair<std::string, double>> RedisClient::zrevrange(
+    const std::string& key, long start, long stop, bool withScores) {
+    std::vector<std::pair<std::string, double>> result;
+    if (!context_) return result;
+
+    redisReply* reply;
+    if (withScores) {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZREVRANGE %s %ld %ld WITHSCORES", key.c_str(), start, stop));
+    } else {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZREVRANGE %s %ld %ld", key.c_str(), start, stop));
+    }
+
+    if (!reply) return result;
+
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        if (withScores && reply->elements % 2 == 0) {
+            for (size_t i = 0; i < reply->elements; i += 2) {
+                std::string member(reply->element[i]->str, reply->element[i]->len);
+                double score = std::stod(reply->element[i+1]->str);
+                result.emplace_back(member, score);
+            }
+        } else if (!withScores) {
+            for (size_t i = 0; i < reply->elements; ++i) {
+                if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                    result.emplace_back(
+                        std::string(reply->element[i]->str, reply->element[i]->len), 0.0);
+                }
+            }
+        }
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+std::vector<std::pair<std::string, double>> RedisClient::zrange(
+    const std::string& key, long start, long stop, bool withScores) {
+    std::vector<std::pair<std::string, double>> result;
+    if (!context_) return result;
+
+    redisReply* reply;
+    if (withScores) {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZRANGE %s %ld %ld WITHSCORES", key.c_str(), start, stop));
+    } else {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZRANGE %s %ld %ld", key.c_str(), start, stop));
+    }
+
+    if (!reply) return result;
+
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        if (withScores && reply->elements % 2 == 0) {
+            for (size_t i = 0; i < reply->elements; i += 2) {
+                std::string member(reply->element[i]->str, reply->element[i]->len);
+                double score = std::stod(reply->element[i+1]->str);
+                result.emplace_back(member, score);
+            }
+        } else if (!withScores) {
+            for (size_t i = 0; i < reply->elements; ++i) {
+                if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                    result.emplace_back(
+                        std::string(reply->element[i]->str, reply->element[i]->len), 0.0);
+                }
+            }
+        }
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+bool RedisClient::zremrangebyrank(const std::string& key, long start, long stop) {
+    if (!context_) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZREMRANGEBYRANK %s %ld %ld", key.c_str(), start, stop));
+
+    if (!reply) {
+        Logger::error("Redis ZREMRANGEBYRANK failed:", context_->errstr);
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+// === Pub/Sub (랭킹 브로드캐스트용) ===
+
+long long RedisClient::publish(const std::string& channel, const std::string& message) {
+    if (!context_) return 0;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "PUBLISH %s %s", channel.c_str(), message.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis PUBLISH failed:", context_->errstr);
+        return 0;
+    }
+
+    long long subscribers = 0;
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        subscribers = reply->integer;
+    }
+
+    freeReplyObject(reply);
+    return subscribers;
+}
+
 // === Hash 연산 (캔들용) ===
 
 bool RedisClient::hset(const std::string& key, const std::string& field, const std::string& value) {

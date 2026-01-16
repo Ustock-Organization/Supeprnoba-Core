@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 namespace aws_wrapper {
 
@@ -47,6 +48,15 @@ public:
     std::vector<OrderPtr> loadAcceptedOrdersBySymbol(
         const std::string& symbol,
         const std::string& table_name = "supernoba-orders");
+
+    /**
+     * 모든 종목의 totalShares 로드 (랭킹 시가총액 계산용)
+     *
+     * @param table_name DynamoDB 테이블 이름 (supernoba-stocks)
+     * @return 심볼 -> totalShares 매핑
+     */
+    std::unordered_map<std::string, uint64_t> loadSymbolsTotalShares(
+        const std::string& table_name = "supernoba-stocks");
 
 private:
     struct Impl;

@@ -27,7 +27,9 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-chart-data-handler"; Path = "Supernoba-chart-data-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-connect-handler"; Path = "Supernoba-connect-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-subscribe-handler"; Path = "Supernoba-subscribe-handler"; HasPackageJson = $false; HasBuild = $false },
-    @{ Name = "Supernoba-disconnect-handler"; Path = "Supernoba-disconnect-handler"; HasPackageJson = $false; HasBuild = $false }
+    @{ Name = "Supernoba-disconnect-handler"; Path = "Supernoba-disconnect-handler"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-rankings"; Path = "Supernoba-rankings"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-treemap-data"; Path = "Supernoba-treemap-data"; HasPackageJson = $false; HasBuild = $false }
 )
 
 Write-Host "==========================================" -ForegroundColor Cyan

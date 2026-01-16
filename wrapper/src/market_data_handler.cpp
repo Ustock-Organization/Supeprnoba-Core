@@ -2,6 +2,7 @@
 #include "engine_core.h"
 #include "redis_client.h"
 #include "notification_client.h"
+#include "ranking_manager.h"
 #include "iproducer.h"
 #include "logger.h"
 #include "metrics.h"
@@ -13,10 +14,12 @@
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* redis, NotificationClient* notifier)
-    : producer_(producer), redis_(redis), notifier_(notifier) {
+MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* redis,
+                                     NotificationClient* notifier, RankingManager* ranking_manager)
+    : producer_(producer), redis_(redis), notifier_(notifier), ranking_manager_(ranking_manager) {
     Logger::info("MarketDataHandler initialized, Redis:", redis_ ? "connected" : "none",
-                 "Notifier:", notifier_ ? "enabled" : "disabled");
+                 "Notifier:", notifier_ ? "enabled" : "disabled",
+                 "RankingManager:", ranking_manager_ ? "enabled" : "disabled");
 }
 
 void MarketDataHandler::on_accept(const OrderPtr& order) {
@@ -153,7 +156,14 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         // === 1분봉 캔들 업데이트 (Lua Script) ===
         redis_->updateCandle(symbol, fill_price, fill_qty, epoch_sec);
     }
-    
+
+    // === 랭킹 업데이트 (백업용 Valkey) ===
+    if (ranking_manager_) {
+        // totalShares는 RankingManager 내부 캐시에서 조회
+        uint64_t total_shares = ranking_manager_->getTotalShares(symbol);
+        ranking_manager_->updateOnFill(symbol, fill_price, fill_qty, day.change_rate, total_shares);
+    }
+
     // buyer/seller ID 추출
     const std::string& buyer_id = order->is_buy() ? 
         order->user_id() : matched_order->user_id();

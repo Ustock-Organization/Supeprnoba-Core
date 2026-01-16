@@ -17,7 +17,11 @@ const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 
 // Layer를 통한 클라이언트 초기화
 const valkey = getValkeyClient({ preset: 'depth' });
+const backupValkey = getValkeyClient({ type: 'backup' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+
+// Rankings snapshot 캐시 키
+const RANKINGS_SNAPSHOT_KEY = 'rankings:snapshot';
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
@@ -92,7 +96,38 @@ export const handler = async (event) => {
         });
       }
 
-      // 2. Valkey에서 모든 ticker 데이터 일괄 조회 (MGET)
+      // 2. Rankings snapshot 캐시 조회 (우선)
+      let rankingsCache = null;
+      let rankingsBySymbol = new Map();
+
+      try {
+        const snapshotJson = await backupValkey.get(RANKINGS_SNAPSHOT_KEY);
+        if (snapshotJson) {
+          rankingsCache = JSON.parse(snapshotJson);
+          console.log('[treemap] Rankings cache hit, timestamp:', rankingsCache.timestamp);
+
+          // Symbol로 빠른 조회를 위한 맵 생성
+          for (const r of (rankingsCache.marketcap || [])) {
+            rankingsBySymbol.set(r.symbol, { marketCap: r.marketCap, rank: r.rank });
+          }
+          for (const r of (rankingsCache.volume || [])) {
+            const existing = rankingsBySymbol.get(r.symbol) || {};
+            rankingsBySymbol.set(r.symbol, { ...existing, volume: r.volume });
+          }
+          for (const r of (rankingsCache.gainers || [])) {
+            const existing = rankingsBySymbol.get(r.symbol) || {};
+            rankingsBySymbol.set(r.symbol, { ...existing, change: r.change });
+          }
+          for (const r of (rankingsCache.losers || [])) {
+            const existing = rankingsBySymbol.get(r.symbol) || {};
+            rankingsBySymbol.set(r.symbol, { ...existing, change: r.change });
+          }
+        }
+      } catch (cacheErr) {
+        console.warn('[treemap] Rankings cache miss or parse error:', cacheErr.message);
+      }
+
+      // 3. Valkey에서 ticker 데이터 일괄 조회 (캐시 보완용)
       const tickerKeys = symbols.map(s => `ticker:${s.symbol}`);
       let tickerDataRaw = [];
 
@@ -100,12 +135,12 @@ export const handler = async (event) => {
         tickerDataRaw = await valkey.mget(...tickerKeys);
       } catch (redisErr) {
         console.warn('[treemap] Valkey MGET failed:', redisErr.message);
-        // Redis 실패시 빈 배열로 계속 진행
         tickerDataRaw = new Array(symbols.length).fill(null);
       }
 
-      // 3. 데이터 병합 및 marketCap 계산
+      // 4. 데이터 병합 - Rankings 캐시 우선, ticker fallback
       const enrichedSymbols = symbols.map((sym, idx) => {
+        // Ticker 데이터 파싱
         let ticker = {};
         try {
           if (tickerDataRaw[idx]) {
@@ -115,9 +150,25 @@ export const handler = async (event) => {
           console.warn(`[treemap] Ticker parse error for ${sym.symbol}:`, parseErr.message);
         }
 
+        // Rankings 캐시에서 데이터 가져오기
+        const rankingData = rankingsBySymbol.get(sym.symbol) || {};
+
+        // 가격: ticker 우선 (실시간), 캐시에서 marketCap 역산 가능
         const price = ticker.price || ticker.c || sym.listingPrice || 0;
         const totalShares = sym.totalShares || 0;
-        const marketCap = price * totalShares;
+
+        // MarketCap: 캐시 우선, 계산 fallback
+        const marketCap = rankingData.marketCap || (price * totalShares);
+
+        // Change: 캐시 우선, ticker fallback
+        const change = rankingData.change !== undefined
+          ? rankingData.change
+          : (ticker.changePercent || ticker.yc || 0);
+
+        // Volume: 캐시 우선, ticker fallback
+        const volume = rankingData.volume !== undefined
+          ? rankingData.volume
+          : (ticker.volume || ticker.v || 0);
 
         return {
           symbol: sym.symbol,
@@ -126,8 +177,8 @@ export const handler = async (event) => {
           logoUrl: sym.logoUrl || null,
           totalShares,
           price,
-          change: ticker.changePercent || ticker.yc || 0,
-          volume: ticker.volume || ticker.v || 0,
+          change,
+          volume,
           marketCap,
           marketCapFormatted: formatMarketCap(marketCap),
           // 추가 메타데이터
@@ -136,7 +187,7 @@ export const handler = async (event) => {
         };
       });
 
-      // 4. 섹터별 집계
+      // 5. 섹터별 집계
       const sectorMap = new Map();
 
       for (const sym of enrichedSymbols) {
@@ -159,7 +210,7 @@ export const handler = async (event) => {
         sector.symbolCount += 1;
       }
 
-      // 5. 섹터별 가중평균 변동률 계산 및 정렬
+      // 6. 섹터별 가중평균 변동률 계산 및 정렬
       const sectors = Array.from(sectorMap.values()).map(s => ({
         sector: s.sector,
         marketCap: s.marketCap,
@@ -172,15 +223,15 @@ export const handler = async (event) => {
         symbols: s.symbols.sort((a, b) => b.marketCap - a.marketCap)
       }));
 
-      // 6. 섹터도 시가총액 기준 정렬
+      // 7. 섹터도 시가총액 기준 정렬
       sectors.sort((a, b) => b.marketCap - a.marketCap);
 
-      // 7. 전체 통계 계산
+      // 8. 전체 통계 계산
       const totalMarketCap = sectors.reduce((sum, s) => sum + s.marketCap, 0);
       const totalVolume = sectors.reduce((sum, s) => sum + s.volume, 0);
       const symbolCount = enrichedSymbols.length;
 
-      // 8. 응답 구성
+      // 9. 응답 구성
       const viewMode = q.view || 'marketCap';  // marketCap | volume | change
 
       return ok({

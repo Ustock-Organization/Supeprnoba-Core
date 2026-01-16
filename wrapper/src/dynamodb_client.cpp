@@ -269,4 +269,78 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrdersBySymbol(
     return orders;
 }
 
+std::unordered_map<std::string, uint64_t> DynamoDBClient::loadSymbolsTotalShares(
+    const std::string& table_name) {
+
+    std::unordered_map<std::string, uint64_t> result;
+
+    if (!initialized_) {
+        Logger::error("DynamoDB client not initialized");
+        return result;
+    }
+
+    try {
+        Aws::DynamoDB::Model::ScanRequest request;
+        request.SetTableName(table_name);
+
+        // symbol과 totalShares만 가져오기
+        request.SetProjectionExpression("symbol, totalShares");
+
+        int total_loaded = 0;
+
+        do {
+            auto outcome = impl_->client->Scan(request);
+
+            if (!outcome.IsSuccess()) {
+                Logger::error("DynamoDB scan stocks failed:",
+                             outcome.GetError().GetMessage());
+                break;
+            }
+
+            const auto& scan_result = outcome.GetResult();
+
+            for (const auto& item : scan_result.GetItems()) {
+                std::string symbol;
+                uint64_t total_shares = 0;
+
+                // symbol
+                auto it = item.find("symbol");
+                if (it != item.end()) {
+                    symbol = it->second.GetS();
+                }
+
+                // totalShares
+                it = item.find("totalShares");
+                if (it != item.end()) {
+                    try {
+                        total_shares = static_cast<uint64_t>(std::stoull(it->second.GetN()));
+                    } catch (...) {
+                        Logger::warn("Failed to parse totalShares for symbol:", symbol);
+                        continue;
+                    }
+                }
+
+                if (!symbol.empty() && total_shares > 0) {
+                    result[symbol] = total_shares;
+                    ++total_loaded;
+                }
+            }
+
+            // 페이지네이션 처리
+            if (scan_result.GetLastEvaluatedKey().empty()) {
+                break;
+            }
+            request.SetExclusiveStartKey(scan_result.GetLastEvaluatedKey());
+
+        } while (true);
+
+        Logger::info("DynamoDB loadSymbolsTotalShares complete:", total_loaded, "symbols loaded");
+
+    } catch (const std::exception& e) {
+        Logger::error("DynamoDB loadSymbolsTotalShares failed:", e.what());
+    }
+
+    return result;
+}
+
 } // namespace aws_wrapper

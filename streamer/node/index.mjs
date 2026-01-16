@@ -261,7 +261,23 @@ async function subscribeMMStatus() {
       console.log('[MM Pub/Sub] Subscribed to mm:status');
     }
   });
+}
 
+// === 랭킹 Pub/Sub 구독 ===
+async function subscribeRankings() {
+  console.log('[Rankings Pub/Sub] Subscribing to rankings:broadcast channel...');
+
+  backupCacheSub.subscribe('rankings:broadcast', (err) => {
+    if (err) {
+      console.error('[Rankings Pub/Sub] Subscribe error:', err.message);
+    } else {
+      console.log('[Rankings Pub/Sub] Subscribed to rankings:broadcast');
+    }
+  });
+}
+
+// === Pub/Sub 메시지 핸들러 ===
+function setupPubSubHandlers() {
   backupCacheSub.on('message', async (channel, message) => {
     if (channel === 'mm:status') {
       try {
@@ -315,6 +331,21 @@ async function subscribeMMStatus() {
       } catch (err) {
         console.error('[MM Pub/Sub] Message parse error:', err.message);
       }
+    } else if (channel === 'rankings:broadcast') {
+      // 랭킹 브로드캐스트 (10초 주기, C++ RankingManager에서 발행)
+      try {
+        const rankingsData = JSON.parse(message);
+        const formattedData = {
+          type: 'rankings',
+          data: rankingsData
+        };
+
+        // 어드민에게만 브로드캐스트 (클라이언트는 API로 조회)
+        await broadcastToAdmins(formattedData);
+        console.log('[Rankings] Broadcast to admins:', adminConnections.size, 'connections');
+      } catch (err) {
+        console.error('[Rankings Pub/Sub] Message parse error:', err.message);
+      }
     }
   });
 }
@@ -342,8 +373,14 @@ console.log('Starting Streaming Server...');
 intervalHandles.push(setInterval(syncAdminConnections, 1000));
 syncAdminConnections();
 
+// Pub/Sub 메시지 핸들러 설정
+setupPubSubHandlers();
+
 // MM 상태 Pub/Sub 구독
 subscribeMMStatus();
+
+// 랭킹 Pub/Sub 구독
+subscribeRankings();
 
 // 메인 브로드캐스트 루프
 broadcastLoop().catch(err => {

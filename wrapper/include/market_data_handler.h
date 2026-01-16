@@ -17,6 +17,7 @@ namespace aws_wrapper {
 class RedisClient;          // forward declaration
 class NotificationClient;   // forward declaration
 class EngineCore;           // forward declaration
+class RankingManager;       // forward declaration
 
 // Depth levels: 10 bid + 10 ask
 using OrderBook = liquibook::book::DepthOrderBook<OrderPtr, 10>;
@@ -43,7 +44,8 @@ class MarketDataHandler
 {
 public:
     explicit MarketDataHandler(IProducer* producer, RedisClient* redis = nullptr,
-                                NotificationClient* notifier = nullptr);
+                                NotificationClient* notifier = nullptr,
+                                RankingManager* ranking_manager = nullptr);
     
     // === OrderListener ===
     void on_accept(const OrderPtr& order) override;
@@ -85,6 +87,7 @@ private:
     IProducer* producer_;
     RedisClient* redis_;
     NotificationClient* notifier_;
+    RankingManager* ranking_manager_;
     EngineCore* engine_ = nullptr;
     std::unordered_map<std::string, DayData> symbol_day_data_;
     

@@ -3,6 +3,7 @@
 #include "engine_core.h"
 #include "market_data_handler.h"
 #include "notification_client.h"
+#include "ranking_manager.h"
 #include "grpc_service.h"
 #include "redis_client.h"
 #include "metrics.h"
@@ -112,10 +113,21 @@ int main(int argc, char* argv[]) {
         } else {
             Logger::warn("WEBSOCKET_ENDPOINT not set - notifications disabled");
         }
-        
+
+        // RankingManager 생성 (백업용 Redis 사용)
+        RankingManager ranking_manager(redis_connected ? &redis : nullptr);
+        bool ranking_enabled = redis_connected;
+        if (ranking_enabled) {
+            ranking_manager.startSnapshotThread();
+            Logger::info("RankingManager enabled (10s broadcast interval)");
+        } else {
+            Logger::warn("RankingManager disabled - Redis (backup) not connected");
+        }
+
         // 핸들러 및 엔진 생성
-        MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr, 
-                                  notifier_enabled ? &notifier : nullptr);
+        MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr,
+                                  notifier_enabled ? &notifier : nullptr,
+                                  ranking_enabled ? &ranking_manager : nullptr);
         EngineCore engine(&handler);
         
         // === 시작 시 Redis에서 스냅샷 복원 ===
@@ -149,6 +161,16 @@ int main(int argc, char* argv[]) {
             DynamoDBClient dynamodb(aws_region);
 
             if (dynamodb.initialize()) {
+                // === totalShares 로드 (RankingManager용) ===
+                if (ranking_enabled) {
+                    const auto stocks_table = Config::get("DYNAMODB_STOCKS_TABLE", "supernoba-stocks");
+                    auto total_shares_map = dynamodb.loadSymbolsTotalShares(stocks_table);
+                    for (const auto& [symbol, shares] : total_shares_map) {
+                        ranking_manager.setTotalShares(symbol, shares);
+                    }
+                    Logger::info("Loaded totalShares for", total_shares_map.size(), "symbols into RankingManager");
+                }
+
                 auto accepted_orders = dynamodb.loadAcceptedOrders(orders_table);
 
                 int added_count = 0;
@@ -258,6 +280,9 @@ int main(int argc, char* argv[]) {
         
         // 정리
         Logger::info("Shutting down...");
+        if (ranking_enabled) {
+            ranking_manager.stopSnapshotThread();
+        }
         consumer.stop();
         grpc_service.stop();
         producer.flush(5000);

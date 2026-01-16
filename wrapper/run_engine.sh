@@ -149,10 +149,29 @@ if [ "$DEV_MODE" == "true" ]; then
 fi
 
 # ========================================
+# 로그 로테이션
+# ========================================
+LOG_FILE="${HOME}/engine.log"
+MAX_LOG_SIZE=$((100 * 1024 * 1024))  # 100MB
+
+if [ -f "$LOG_FILE" ]; then
+    LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$LOG_SIZE" -gt "$MAX_LOG_SIZE" ]; then
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        BACKUP_FILE="${HOME}/engine.${TIMESTAMP}.log"
+        echo "=== 로그 로테이션: ${LOG_FILE} (${LOG_SIZE} bytes) -> ${BACKUP_FILE} ==="
+        mv "$LOG_FILE" "$BACKUP_FILE"
+        # 최근 3개만 유지
+        ls -t ${HOME}/engine.*.log 2>/dev/null | tail -n +4 | xargs -r rm -f
+    fi
+fi
+
+# ========================================
 # 실행
 # ========================================
 echo ""
 echo "[3/3] 매칭 엔진 시작..."
+echo "Started at: $(date -Iseconds)"
 echo "=========================================="
 cd "$BUILD_DIR"
 ./matching_engine

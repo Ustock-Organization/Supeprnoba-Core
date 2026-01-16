@@ -1,0 +1,14 @@
+{
+  "name": "supernoba-rankings",
+  "version": "1.0.0",
+  "description": "Market rankings data API Lambda (marketcap, volume, gainers, losers)",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "echo \"No tests specified\""
+  },
+  "keywords": ["supernoba", "rankings", "lambda"],
+  "author": "Supernoba",
+  "license": "ISC",
+  "dependencies": {}
+}
