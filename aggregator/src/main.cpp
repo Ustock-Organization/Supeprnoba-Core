@@ -137,11 +137,13 @@ int main(int argc, char* argv[]) {
     Logger::info("Connected to Valkey");
     
     RdsClient rds(cfg.rds_host, cfg.rds_port, cfg.rds_dbname, cfg.rds_user, cfg.rds_password);
-    if (!rds.connect()) {
-        Logger::error("Failed to connect to RDS");
-        return 1;
+    bool rds_connected = rds.connect();
+    if (!rds_connected) {
+        Logger::warn("Failed to connect to RDS - running in Valkey-only mode");
+        Logger::warn("RDS operations will be skipped");
+    } else {
+        Logger::info("Connected to RDS PostgreSQL");
     }
-    Logger::info("Connected to RDS PostgreSQL");
     
     Aggregator aggregator;
     
@@ -195,8 +197,8 @@ int main(int argc, char* argv[]) {
 
                 // 3. 각 1분봉에 대해 상위 타임프레임 증분 업데이트
                 for (const auto& candle_1m : closed_1m) {
-                    // 1분봉은 직접 RDS에 저장
-                    if (rds.put_candle(symbol, "1m", candle_1m)) {
+                    // 1분봉은 직접 RDS에 저장 (연결된 경우만)
+                    if (rds_connected && rds.put_candle(symbol, "1m", candle_1m)) {
                         Logger::debug("[RDS] 1m saved:", symbol, "@", candle_1m.time);
                     }
 
@@ -211,10 +213,17 @@ int main(int argc, char* argv[]) {
                         auto result = aggregator.update_candle_incremental(
                             candle_1m, current, tf);
 
-                        // 구간 마감 시 RDS 저장
+                        // 구간 마감 시 RDS 저장 (연결된 경우만)
                         if (result.is_closed) {
-                            if (rds.put_candle(symbol, tf.interval, result.closed_candle)) {
+                            if (rds_connected && rds.put_candle(symbol, tf.interval, result.closed_candle)) {
                                 Logger::info("[CLOSED]", symbol, tf.interval, "@",
+                                            result.closed_candle.time,
+                                            "O:", result.closed_candle.open,
+                                            "H:", result.closed_candle.high,
+                                            "L:", result.closed_candle.low,
+                                            "C:", result.closed_candle.close);
+                            } else if (!rds_connected) {
+                                Logger::info("[CLOSED-VALKEY]", symbol, tf.interval, "@",
                                             result.closed_candle.time,
                                             "O:", result.closed_candle.open,
                                             "H:", result.closed_candle.high,
@@ -237,25 +246,27 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // 5. 1d/1w 계층적 집계 (RDS 기반)
-            int64_t aligned_1d = align_epoch_to_timeframe(now, SECONDS_1D);
-            if (aligned_1d > last_1d_check && !known_symbols.empty()) {
-                Logger::info("[HIER-AGG] 1d boundary reached, aggregating...");
-                for (const auto& sym : known_symbols) {
-                    aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
-                                              SECONDS_1D, aligned_1d);
+            // 5. 1d/1w 계층적 집계 (RDS 기반 - 연결된 경우만)
+            if (rds_connected) {
+                int64_t aligned_1d = align_epoch_to_timeframe(now, SECONDS_1D);
+                if (aligned_1d > last_1d_check && !known_symbols.empty()) {
+                    Logger::info("[HIER-AGG] 1d boundary reached, aggregating...");
+                    for (const auto& sym : known_symbols) {
+                        aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
+                                                  SECONDS_1D, aligned_1d);
+                    }
+                    last_1d_check = aligned_1d;
                 }
-                last_1d_check = aligned_1d;
-            }
 
-            int64_t aligned_1w = align_epoch_to_timeframe(now, SECONDS_1W);
-            if (aligned_1w > last_1w_check && !known_symbols.empty()) {
-                Logger::info("[HIER-AGG] 1w boundary reached, aggregating...");
-                for (const auto& sym : known_symbols) {
-                    aggregate_higher_timeframe(rds, aggregator, sym, "1d", "1w",
-                                              SECONDS_1W, aligned_1w);
+                int64_t aligned_1w = align_epoch_to_timeframe(now, SECONDS_1W);
+                if (aligned_1w > last_1w_check && !known_symbols.empty()) {
+                    Logger::info("[HIER-AGG] 1w boundary reached, aggregating...");
+                    for (const auto& sym : known_symbols) {
+                        aggregate_higher_timeframe(rds, aggregator, sym, "1d", "1w",
+                                                  SECONDS_1W, aligned_1w);
+                    }
+                    last_1w_check = aligned_1w;
                 }
-                last_1w_check = aligned_1w;
             }
 
             // 6. 주기적 통계 로깅 (5분마다)
