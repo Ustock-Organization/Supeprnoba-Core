@@ -380,3 +380,17 @@ async function gracefulShutdown(signal) {
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// === Uncaught Exception/Rejection Handlers ===
+process.on('uncaughtException', (err, origin) => {
+  console.error(`[FATAL] Uncaught Exception at ${origin}:`, err);
+  console.error('[FATAL] Stack:', err.stack);
+  // 로그가 기록될 시간을 주고 종료
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise);
+  console.error('[FATAL] Reason:', reason);
+  // 계속 실행하되 로그 기록 (치명적이지 않은 경우 대비)
+});

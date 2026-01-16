@@ -101,8 +101,20 @@ if [ ! -d "node_modules" ]; then
     npm install
 fi
 
+# ===== 로그 로테이션 =====
+LOG_FILE="${HOME}/streamer.log"
+if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    BACKUP_FILE="${HOME}/streamer.${TIMESTAMP}.log"
+    echo "=== 기존 로그 백업: ${BACKUP_FILE} ==="
+    cp "$LOG_FILE" "$BACKUP_FILE"
+    # 최근 5개만 유지
+    ls -t ${HOME}/streamer.*.log 2>/dev/null | tail -n +6 | xargs -r rm -f
+fi
+
 # ===== 실행 =====
 echo ""
 echo "=== 스트리머 시작 ==="
+echo "Started at: $(date -Iseconds)"
 echo "=========================================="
 node index.mjs
