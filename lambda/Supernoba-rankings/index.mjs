@@ -40,12 +40,16 @@ async function getRankingsFromSnapshot(type, limit, offset) {
       const snapshot = JSON.parse(snapshotJson);
       const rankings = snapshot[type] || [];
 
-      return {
-        timestamp: snapshot.timestamp,
-        type,
-        total: rankings.length,
-        rankings: rankings.slice(offset, offset + limit)
-      };
+      // 스냅샷에 데이터가 있을 때만 사용 (빈 배열이면 fallback)
+      if (rankings.length > 0) {
+        return {
+          timestamp: snapshot.timestamp,
+          type,
+          total: rankings.length,
+          rankings: rankings.slice(offset, offset + limit)
+        };
+      }
+      console.log(`[rankings] Snapshot exists but ${type} is empty, falling back to sorted set`);
     }
   } catch (e) {
     console.warn('[rankings] Snapshot cache miss or parse error:', e.message);
