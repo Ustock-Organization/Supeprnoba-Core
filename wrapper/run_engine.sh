@@ -73,6 +73,7 @@ export WEBSOCKET_ENDPOINT="wss://l2ptm85wub.execute-api.ap-northeast-2.amazonaws
 
 # DynamoDB 설정 (ACCEPTED 주문 복원)
 export DYNAMODB_ORDERS_TABLE="supernoba-orders"
+export DYNAMODB_STOCKS_TABLE="supernoba-symbols"
 if [ "$DEV_MODE" == "true" ]; then
     # DEV 모드: DynamoDB에서 주문 로드 비활성화 (빠른 시작)
     export LOAD_ORDERS_FROM_DYNAMODB="false"
