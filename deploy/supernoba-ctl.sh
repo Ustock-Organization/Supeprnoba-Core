@@ -14,6 +14,8 @@
 #   ./supernoba-ctl.sh disable [service]  # 부팅 시 자동 시작 비활성화
 #   ./supernoba-ctl.sh deploy             # 전체 배포 (빌드 + 재시작)
 #   ./supernoba-ctl.sh health             # 헬스체크
+#   ./supernoba-ctl.sh kill [service]     # 프로세스 강제 종료 (pkill)
+#   ./supernoba-ctl.sh kill-all           # 모든 Supernoba 프로세스 강제 종료
 #
 # service: engine, streamer, mm, aggregator, processor, all
 #
@@ -152,6 +154,62 @@ build_service() {
     log_success "${SERVICE_DESC[$service]} build complete"
 }
 
+# 프로세스 강제 종료 (pkill)
+kill_service() {
+    local service=$1
+    local desc="${SERVICE_DESC[$service]}"
+
+    log_info "Force killing $service ($desc)..."
+
+    case "$service" in
+        engine)
+            pkill -9 -f 'matching_engine' 2>/dev/null && log_success "Killed matching_engine" || log_warn "No matching_engine process found"
+            ;;
+        streamer)
+            pkill -9 -f 'node.*streamer.*index\.mjs' 2>/dev/null && log_success "Killed streamer" || log_warn "No streamer process found"
+            ;;
+        mm)
+            pkill -9 -f 'node.*mm-service.*index\.mjs' 2>/dev/null && log_success "Killed mm-service" || log_warn "No mm-service process found"
+            ;;
+        aggregator)
+            pkill -9 -f 'candle_aggregator' 2>/dev/null && log_success "Killed candle_aggregator" || log_warn "No candle_aggregator process found"
+            ;;
+        processor)
+            pkill -9 -f 'stock-processor' 2>/dev/null && log_success "Killed stock-processor" || log_warn "No stock-processor process found"
+            ;;
+        *)
+            log_error "Unknown service: $service"
+            return 1
+            ;;
+    esac
+}
+
+# 모든 Supernoba 프로세스 강제 종료
+kill_all_processes() {
+    log_warn "Force killing ALL Supernoba processes..."
+    echo ""
+
+    # systemd 서비스 먼저 중지 시도
+    log_info "Stopping systemd services first..."
+    for svc in engine streamer mm aggregator processor; do
+        local systemd_name="${SERVICE_NAMES[$svc]}"
+        sudo systemctl stop "$systemd_name" 2>/dev/null || true
+    done
+
+    echo ""
+    log_info "Force killing any remaining processes..."
+
+    # 각 프로세스 강제 종료
+    pkill -9 -f 'matching_engine' 2>/dev/null && log_success "Killed matching_engine" || true
+    pkill -9 -f 'node.*streamer.*index\.mjs' 2>/dev/null && log_success "Killed streamer" || true
+    pkill -9 -f 'node.*mm-service.*index\.mjs' 2>/dev/null && log_success "Killed mm-service" || true
+    pkill -9 -f 'candle_aggregator' 2>/dev/null && log_success "Killed candle_aggregator" || true
+    pkill -9 -f 'stock-processor' 2>/dev/null && log_success "Killed stock-processor" || true
+
+    echo ""
+    log_success "All Supernoba processes terminated"
+}
+
 # 헬스체크
 health_check() {
     local service=$1
@@ -192,6 +250,8 @@ show_help() {
     echo "  disable [service]   Disable service(s) at boot"
     echo "  deploy              Full deployment (git pull + build + restart)"
     echo "  health              Health check all local services"
+    echo "  kill [service]      Force kill process (pkill -9)"
+    echo "  kill-all            Force kill ALL Supernoba processes"
     echo ""
     echo "Services:"
     echo "  engine      - Matching Engine (C++)"
@@ -335,6 +395,42 @@ case "$ACTION" in
                 health_check "$svc"
                 echo ""
             done
+        fi
+        ;;
+
+    kill)
+        if [ "$SERVICE" == "all" ]; then
+            log_info "Killing all local services..."
+            local_services=$(get_local_services)
+            if [ -z "$local_services" ]; then
+                local_services="engine streamer mm aggregator processor"
+            fi
+            for svc in $local_services; do
+                kill_service "$svc"
+            done
+        elif [ -z "$SERVICE" ]; then
+            log_error "Service name required for kill command"
+            echo "Usage: $0 kill <service>"
+            echo "       $0 kill-all  # Kill all processes"
+            exit 1
+        else
+            kill_service "$SERVICE"
+        fi
+        ;;
+
+    kill-all)
+        echo "============================================"
+        echo "  Force Kill ALL Supernoba Processes"
+        echo "  Host: $(hostname)"
+        echo "============================================"
+        echo ""
+        log_warn "This will forcefully terminate ALL Supernoba processes!"
+        echo ""
+        read -p "Are you sure? (y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            kill_all_processes
+        else
+            log_info "Aborted."
         fi
         ;;
 
