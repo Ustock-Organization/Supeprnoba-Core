@@ -10,7 +10,16 @@ namespace aws_wrapper {
 KinesisProducer::KinesisProducer(const std::string& region) {
     Aws::Client::ClientConfiguration config;
     config.region = region;
-    
+
+    // Timeout settings to prevent long blocking
+    config.connectTimeoutMs = 3000;   // 3 seconds connection timeout
+    config.requestTimeoutMs = 5000;   // 5 seconds request timeout
+    config.httpRequestTimeoutMs = 10000;  // 10 seconds total HTTP timeout
+
+    // Reduce retry attempts to fail fast instead of blocking
+    config.maxConnections = 25;  // Default is 25
+    config.enableTcpKeepAlive = true;  // Keep connections alive
+
     client_ = std::make_unique<Aws::Kinesis::KinesisClient>(config);
     
     // 스트림 이름 로드
@@ -29,19 +38,29 @@ KinesisProducer::~KinesisProducer() {
 void KinesisProducer::produce(const std::string& stream_name,
                                const std::string& partition_key,
                                const std::string& data) {
+    auto start = std::chrono::steady_clock::now();
+
     Aws::Kinesis::Model::PutRecordRequest request;
     request.SetStreamName(stream_name);
     request.SetPartitionKey(partition_key);
     request.SetData(Aws::Utils::ByteBuffer(
         reinterpret_cast<const unsigned char*>(data.c_str()), data.length()));
-    
+
     auto outcome = client_->PutRecord(request);
+
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
     if (!outcome.IsSuccess()) {
-        Logger::error("Failed to put record to", stream_name, ":", 
+        Logger::error("Failed to put record to", stream_name, "in", elapsed_ms, "ms:",
                       outcome.GetError().GetMessage());
     } else {
-        Logger::debug("Published to", stream_name, "shard:", 
-                      outcome.GetResult().GetShardId());
+        if (elapsed_ms > 1000) {
+            // Log warning if PutRecord took more than 1 second
+            Logger::warn("[SLOW] PutRecord to", stream_name, "took", elapsed_ms, "ms");
+        }
+        Logger::debug("Published to", stream_name, "shard:",
+                      outcome.GetResult().GetShardId(), "in", elapsed_ms, "ms");
     }
 }
 
