@@ -124,6 +124,14 @@ liquibook/
 │   ├── 003_pg_cron_jobs.sql
 │   └── 004_valkey_sync_functions.sql
 │
+├── deploy/                      # 배포 자동화 (systemd 기반)
+│   ├── env/                    # 환경변수 파일
+│   ├── systemd/                # systemd 서비스 파일
+│   ├── logrotate/              # 로그 로테이션 설정
+│   ├── install-services.sh     # 서비스 설치 스크립트
+│   ├── supernoba-ctl.sh       # 마스터 제어 스크립트
+│   └── reset-platform.sh      # 플랫폼 초기화 스크립트
+│
 └── .github/workflows/           # CI/CD
     ├── deploy-lambda.yml        # Lambda 자동 배포
     └── deploy-engine.yml        # Engine 자동 배포
@@ -337,16 +345,70 @@ aws ec2 describe-instances --filters "Name=tag:Name,Values=stock-*" --query 'Res
 
 ## EC2 인스턴스 구성
 
-| SSH 별칭 | 인스턴스명 | 역할 | 프로세스 |
-|----------|------------|------|----------|
-| `server` | stock-bastion | Matching Engine, **MM Service** | `matching_engine`, `node index.mjs` (mm-service) |
-| `streamer` | stock-streamer | Streamer | `node index.mjs` (streamer) |
-| `processor` | stock-processor | Stock Processor | `stock-processor` (C++) |
-| `aggregator` | stock-aggregator | Aggregator | `candle_aggregator` |
+| SSH 별칭 | 인스턴스명 | 역할 | systemd 서비스 |
+|----------|------------|------|---------------|
+| `server` | stock-bastion | Matching Engine, **MM Service** | `supernoba-engine`, `supernoba-mm` |
+| `streamer` | stock-streamer | Streamer | `supernoba-streamer` |
+| `processor` | stock-processor | Stock Processor | `supernoba-processor` |
+| `aggregator` | stock-aggregator | Aggregator | `supernoba-aggregator` |
 
-**MM Service 배포 (server 인스턴스):**
+**서비스 제어 (systemd):**
 ```bash
-ssh server "cd ~/Supeprnoba-Core/mm-service && git pull && pkill -f 'node.*mm-service' ; ./run_mm.sh"
+./supernoba-ctl.sh start all      # 시작
+./supernoba-ctl.sh stop all       # 종료
+./supernoba-ctl.sh restart all    # 재시작
+./supernoba-ctl.sh health         # 헬스체크
+./supernoba-ctl.sh kill-all       # 강제 종료
+```
+
+**전체 배포:**
+```bash
+./supernoba-ctl.sh deploy         # git pull + build + restart
+```
+
+---
+
+## 배포 자동화 (deploy/)
+
+systemd 기반 서비스 관리 및 배포 자동화. 상세: `deploy/README.md`
+
+### 디렉토리 구조
+- `env/` - 환경변수 파일 (common + 서비스별)
+- `systemd/` - systemd 서비스 파일
+- `logrotate/` - 로그 로테이션 설정
+
+### 주요 스크립트
+
+| 스크립트 | 역할 |
+|---------|------|
+| `supernoba-ctl.sh` | 마스터 제어 (start/stop/restart/logs/health/kill) |
+| `install-services.sh` | systemd 서비스 설치 (동적 메모리 할당) |
+| `reset-platform.sh` | 플랫폼 데이터 전체 초기화 |
+
+### 호스트별 서비스 자동 감지
+
+스크립트가 호스트명을 자동 감지하여 해당 서비스만 제어:
+
+| 호스트명 | 자동 실행 서비스 |
+|----------|----------------|
+| stock-bastion | engine, mm |
+| stock-streamer | streamer |
+| stock-processor | processor |
+| stock-aggregator | aggregator |
+
+### 설치 및 사용
+
+```bash
+# 최초 설치 (root 필요)
+sudo ./install-services.sh
+
+# 서비스 활성화 및 시작
+./supernoba-ctl.sh enable all
+./supernoba-ctl.sh start all
+
+# 플랫폼 초기화 (주의: 모든 데이터 삭제!)
+./reset-platform.sh --dry-run     # 삭제 대상 확인
+./reset-platform.sh --confirm     # 실제 초기화
 ```
 
 ---
@@ -539,6 +601,7 @@ Admin Panel → admin-mm Lambda → mm:control (Pub/Sub) → MM Service → Kine
 - 4개 Lambda (fill-processor, history-saver, notifier, order-status-processor)가 `stock-processor` (C++)로 이전됨
 - MM Service v7: `mm:config` HASH 타입 지원, server 인스턴스에서 실행
 - 종목 관리 기능 개선: 비활성화 종목 UI, 복구 기능
+- **배포 자동화**: systemd 서비스 관리, 동적 메모리 할당, 플랫폼 초기화 스크립트 추가
 
 ---
 
