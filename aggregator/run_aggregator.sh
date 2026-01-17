@@ -52,7 +52,7 @@ export RDS_HOST="supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaw
 export RDS_PORT="5432"
 export RDS_DBNAME="postgres"
 export RDS_USER="njg7194"
-export RDS_PASSWORD='y:7-9T2rGy#Z:5s3TAyifn1Gz8fX'
+export RDS_PASSWORD='SiONN2#!*K0ra4olAvNZte?AWPb6'
 
 # 폴링 간격 (ms)
 export POLL_INTERVAL_MS="10"
