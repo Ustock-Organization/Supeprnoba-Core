@@ -1,10 +1,13 @@
 /**
- * Supernoba Market Maker Service v7
+ * Supernoba Market Maker Service v8
  *
  * Admin Panel에서 제어하는 경량 마켓메이커
  * - Redis pub/sub으로 시작/정지 신호 수신
  * - Kinesis에 주문 발행하여 실제 오더북/캔들 데이터 생성
  * - 실시간 상태를 mm:status 채널로 브로드캐스트
+ *
+ * v8 변경사항:
+ * - mm:config 키를 STRING(JSON)과 HASH 둘 다 지원 (하위 호환)
  *
  * v7 변경사항:
  * - mm:config 키가 HASH 타입이므로 HGETALL 사용
@@ -32,7 +35,7 @@ const CONFIG = {
   statusPublishInterval: 2000,  // 2초마다 상태 발행
 };
 
-console.log("=== Supernoba Market Maker Service v7 ===");
+console.log("=== Supernoba Market Maker Service v8 ===");
 console.log("Backup Cache:", CONFIG.backupCacheHost + ":" + CONFIG.backupCachePort);
 console.log("Kinesis Stream:", CONFIG.kinesisStream);
 
@@ -134,27 +137,55 @@ async function runSymbol(symbol) {
   await backupCache.set("mm:orderCount:" + symbol, instance.orderCount.toString());
 }
 
-// === Load Config from HASH ===
+// === Load Config (supports both STRING and HASH types) ===
 async function loadConfig(symbol) {
-  // v7: mm:config is HASH type, use HGETALL
-  const hashData = await backupCache.hgetall("mm:config:" + symbol);
+  const key = "mm:config:" + symbol;
 
-  if (!hashData || Object.keys(hashData).length === 0) {
+  // Check key type first for backward compatibility
+  const keyType = await backupCache.type(key);
+
+  if (keyType === "none") {
     console.log("[Config] No config found for " + symbol + ", using defaults");
     return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
   }
 
-  // Convert string values to numbers
-  const config = {
-    basePrice: parseFloat(hashData.basePrice) || 100,
-    period: parseFloat(hashData.period) || 600,
-    amplitude: parseFloat(hashData.amplitude) || 0.1,
-    tickInterval: parseInt(hashData.tickInterval) || 1000,
-    tradeInterval: parseFloat(hashData.tradeInterval) || 1,
-    tradeQuantity: parseInt(hashData.tradeQuantity) || 10,
-  };
+  let config;
 
-  console.log("[Config] Loaded config for " + symbol + ":", JSON.stringify(config));
+  if (keyType === "string") {
+    // Legacy format: JSON string (Admin Lambda v1)
+    const jsonStr = await backupCache.get(key);
+    try {
+      const parsed = JSON.parse(jsonStr);
+      config = {
+        basePrice: parseFloat(parsed.basePrice) || 100,
+        period: parseFloat(parsed.period) || 600,
+        amplitude: parseFloat(parsed.amplitude) || 0.1,
+        tickInterval: parseInt(parsed.tickInterval) || 1000,
+        tradeInterval: parseFloat(parsed.tradeInterval) || 1,
+        tradeQuantity: parseInt(parsed.tradeQuantity) || 10,
+      };
+      console.log("[Config] Loaded STRING config for " + symbol + ":", JSON.stringify(config));
+    } catch (e) {
+      console.error("[Config] Failed to parse JSON for " + symbol + ":", e.message);
+      return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
+    }
+  } else if (keyType === "hash") {
+    // New format: HASH type (Admin Lambda v2)
+    const hashData = await backupCache.hgetall(key);
+    config = {
+      basePrice: parseFloat(hashData.basePrice) || 100,
+      period: parseFloat(hashData.period) || 600,
+      amplitude: parseFloat(hashData.amplitude) || 0.1,
+      tickInterval: parseInt(hashData.tickInterval) || 1000,
+      tradeInterval: parseFloat(hashData.tradeInterval) || 1,
+      tradeQuantity: parseInt(hashData.tradeQuantity) || 10,
+    };
+    console.log("[Config] Loaded HASH config for " + symbol + ":", JSON.stringify(config));
+  } else {
+    console.error("[Config] Unexpected key type for " + symbol + ":", keyType);
+    return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
+  }
+
   return config;
 }
 
