@@ -1,8 +1,8 @@
-# Supernoba Matching Engine 로그 로테이션 설정
-# 위치: /etc/logrotate.d/supernoba-engine
-# 대상 서버: server (stock-bastion)
+# Supernoba Streamer 로그 로테이션 설정
+# 위치: /etc/logrotate.d/supernoba-streamer
+# 대상 서버: streamer (stock-streamer)
 
-/var/log/supernoba/engine/*.log {
+/var/log/supernoba/streamer/*.log {
     daily
     rotate 7
     compress
@@ -15,7 +15,6 @@
     sharedscripts
     postrotate
         # systemd가 관리하므로 재시작 불필요
-        # 로그 파일 핸들은 systemd가 관리
         true
     endscript
 }

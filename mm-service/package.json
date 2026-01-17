@@ -1,6 +1,6 @@
 {
   "name": "supernoba-mm-service",
-  "version": "6.0.0",
+  "version": "7.0.0",
   "description": "Supernoba Market Maker Service - Admin Panel Controlled",
   "main": "index.mjs",
   "type": "module",

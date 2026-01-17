@@ -97,6 +97,12 @@ liquibook/
 │   │   └── aggregator.cpp       # 1분 → 상위 타임프레임
 │   └── CMakeLists.txt
 │
+├── mm-service/                  # Market Maker 서비스 (EC2: server/stock-bastion)
+│   ├── index.mjs               # MM 서비스 메인 (v7)
+│   ├── run_mm.sh               # 실행 스크립트
+│   ├── package.json            # 의존성
+│   └── CLAUDE.md               # MM 서비스 문서
+│
 ├── lambda/                      # AWS Lambda 함수들
 │   ├── Supernoba-order-router/  # 주문 검증 및 Kinesis 전송
 │   ├── Supernoba-admin/         # 종목 관리
@@ -331,12 +337,17 @@ aws ec2 describe-instances --filters "Name=tag:Name,Values=stock-*" --query 'Res
 
 ## EC2 인스턴스 구성
 
-| 인스턴스명 | 타입 | 역할 | 프로세스 |
-|------------|------|------|----------|
-| stock-streamer | t3.medium | 매칭 엔진 + 스트리밍 | matching_engine, node (streamer) |
-| stock-aggregator | t2.medium | 캔들 집계 | candle_aggregator |
-| stock-processor | t3.large | Lambda 통합 | stock-processor (C++) |
-| stock-bastion | t3.medium | Bastion 호스트 | SSH 접속용 |
+| SSH 별칭 | 인스턴스명 | 역할 | 프로세스 |
+|----------|------------|------|----------|
+| `server` | stock-bastion | Matching Engine, **MM Service** | `matching_engine`, `node index.mjs` (mm-service) |
+| `streamer` | stock-streamer | Streamer | `node index.mjs` (streamer) |
+| `processor` | stock-processor | Stock Processor | `stock-processor` (C++) |
+| `aggregator` | stock-aggregator | Aggregator | `candle_aggregator` |
+
+**MM Service 배포 (server 인스턴스):**
+```bash
+ssh server "cd ~/Supeprnoba-Core/mm-service && git pull && pkill -f 'node.*mm-service' ; ./run_mm.sh"
+```
 
 ---
 
@@ -360,6 +371,19 @@ prev:{SYMBOL}                    # String: 전일 종가
 user:{userId}:connections        # Set: 사용자 연결 ID 목록
 ws:{connectionId}                # String: 연결 정보
 symbol:{SYMBOL}:main             # Set: 해당 종목 구독 연결 목록
+
+# Market Maker (MM)
+mm:control                       # Pub/Sub: 제어 명령 채널 (start, stop, reload)
+mm:status                        # Pub/Sub: 상태 브로드캐스트 채널
+mm:running                       # String: 전체 실행 상태 (1/0)
+mm:running:symbols               # Set: 실행 중인 종목 목록
+mm:config:{SYMBOL}               # Hash: 종목별 MM 설정 (basePrice, period, amplitude 등)
+mm:price:{SYMBOL}                # String: 현재 MM 가격
+mm:started_at:{SYMBOL}           # String: 종목 시작 시간
+
+# 종목 관리
+subscribed:symbols               # Set: 구독 가능한 종목 목록
+deleted:symbols                  # Set: 삭제된 종목 목록 (복구 대기)
 ```
 
 ---
@@ -484,7 +508,7 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
 
 ## 보안 고려사항
 
-- **MM (Market Maker) ID 관리**: `mm-kinesis-direct-buy`, `mm-kinesis-direct-sell`은 잔고 체크를 우회
+- **MM (Market Maker) ID 관리**: `mm-buyer`, `mm-seller`는 order-router에서 잔고 체크를 우회
 - **AWS Secrets Manager**: DB 자격증명, MM ID 목록 캐싱 (5분/1시간 TTL)
 - **DynamoDB 낙관적 잠금**: `version` 필드로 동시성 제어
 - **API 인증**: AWS Cognito JWT 토큰
@@ -495,21 +519,27 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
 
 이 프로젝트는 **AWS 기반 실시간 주식 거래 플랫폼**입니다.
 
-1. **매칭 엔진** (`liquibook/wrapper`): Kinesis에서 주문을 받아 Liquibook으로 매칭, 체결 결과를 Kinesis로 발행
-2. **스트리밍** (`liquibook/streamer`): Valkey에서 호가/캔들을 폴링하여 WebSocket으로 브로드캐스트
-3. **백엔드 프로세서** (`Supernoba-back`): Kinesis 이벤트를 소비하여 DynamoDB/PostgreSQL 업데이트
-4. **프론트엔드** (`Supernoba-front`): React + Redux로 실시간 거래 UI 제공
+1. **매칭 엔진** (`wrapper/`): Kinesis에서 주문을 받아 Liquibook으로 매칭, 체결 결과를 Kinesis로 발행 (EC2: server)
+2. **스트리밍** (`streamer/node/`): Valkey에서 호가/캔들을 폴링하여 WebSocket으로 브로드캐스트 (EC2: streamer)
+3. **MM 서비스** (`mm-service/`): Admin 패널에서 제어하는 마켓메이커, Kinesis에 주문 발행 (EC2: server)
+4. **백엔드 프로세서** (`Supernoba-back`): Kinesis 이벤트를 소비하여 DynamoDB/PostgreSQL 업데이트 (EC2: processor)
+5. **프론트엔드** (`Supernoba-front`): React + Redux로 실시간 거래 UI 제공
 
 **주요 이벤트 흐름**:
 ```
 주문 → order-router → Kinesis → Matching Engine → Kinesis → stock-processor → DynamoDB/WebSocket
 ```
 
-**현재 상태** (2026-01-12):
+**MM 이벤트 흐름**:
+```
+Admin Panel → admin-mm Lambda → mm:control (Pub/Sub) → MM Service → Kinesis → Matching Engine
+```
+
+**현재 상태** (2026-01-18):
 - 4개 Lambda (fill-processor, history-saver, notifier, order-status-processor)가 `stock-processor` (C++)로 이전됨
-- 해당 Lambda들은 `@deprecated` 처리되었고 배포에서 제외됨
-- 전일종가 집계는 RDS의 `pg_cron`으로 처리하도록 SQL 스크립트 작성됨
+- MM Service v7: `mm:config` HASH 타입 지원, server 인스턴스에서 실행
+- 종목 관리 기능 개선: 비활성화 종목 UI, 복구 기능
 
 ---
 
-*마지막 업데이트: 2026-01-12 by Claude Opus 4.5*
+*마지막 업데이트: 2026-01-18 by Claude Opus 4.5*

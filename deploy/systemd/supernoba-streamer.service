@@ -1,0 +1,46 @@
+[Unit]
+Description=Supernoba Streaming Server
+Documentation=https://github.com/user/Supeprnoba-Core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/Supeprnoba-Core/streamer/node
+
+# 환경변수
+EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/streamer.env
+
+# Node.js 메모리 제한
+Environment="NODE_OPTIONS=--max-old-space-size=1024"
+
+# 실행
+ExecStart=/usr/bin/node index.mjs
+
+# 재시작 정책
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# 메모리 제한 (누수 방지)
+MemoryMax=1536M
+MemoryHigh=1024M
+
+# 프로세스 제한
+LimitNOFILE=65535
+
+# 로깅
+StandardOutput=append:/var/log/supernoba/streamer/streamer.log
+StandardError=append:/var/log/supernoba/streamer/streamer.log
+
+# Graceful shutdown
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

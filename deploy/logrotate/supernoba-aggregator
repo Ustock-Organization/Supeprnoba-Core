@@ -1,6 +1,6 @@
 # Supernoba Candle Aggregator 로그 로테이션 설정
 # 위치: /etc/logrotate.d/supernoba-aggregator
-# 대상 서버: stock-aggregator (EC2)
+# 대상 서버: aggregator (stock-aggregator)
 
 /var/log/supernoba/aggregator/*.log {
     daily
@@ -9,11 +9,12 @@
     delaycompress
     missingok
     notifempty
-    create 0644 ubuntu ubuntu
+    create 0644 ec2-user ec2-user
     dateext
     dateformat -%Y%m%d
     sharedscripts
     postrotate
-        /usr/bin/pkill -HUP -f 'candle_aggregator' 2>/dev/null || true
+        # systemd가 관리하므로 재시작 불필요
+        true
     endscript
 }
