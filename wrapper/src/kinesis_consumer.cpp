@@ -111,8 +111,14 @@ void KinesisConsumer::consumeLoop() {
             if (!running_) break; // 빠른 종료를 위한 체크
 
             if (iterator.empty()) {
-                if (poll_count % 100 == 0) {
-                     Logger::warn("Shard iterator empty for:", shard_id);
+                // 빈 iterator 자동 갱신 시도
+                if (poll_count % 50 == 0) {
+                    Logger::warn("Shard iterator empty for:", shard_id, "- attempting refresh...");
+                    std::string new_iterator = getShardIterator(shard_id);
+                    if (!new_iterator.empty()) {
+                        iterator = new_iterator;
+                        Logger::info("Iterator recovered for", shard_id);
+                    }
                 }
                 continue;
             }
@@ -123,8 +129,24 @@ void KinesisConsumer::consumeLoop() {
             
             auto outcome = client_->GetRecords(request);
             if (!outcome.IsSuccess()) {
-                Logger::error("GetRecords failed for", shard_id, ":", 
-                              outcome.GetError().GetMessage());
+                const auto& error = outcome.GetError();
+                std::string error_msg = error.GetMessage();
+
+                // Iterator 만료 감지 및 자동 갱신
+                if (error_msg.find("Iterator expired") != std::string::npos ||
+                    error_msg.find("ExpiredIterator") != std::string::npos) {
+                    Logger::warn("Iterator expired for", shard_id, "- refreshing...");
+                    std::string new_iterator = getShardIterator(shard_id);
+                    if (!new_iterator.empty()) {
+                        iterator = new_iterator;
+                        Logger::info("Iterator refreshed for", shard_id);
+                    } else {
+                        Logger::error("Failed to refresh iterator for", shard_id);
+                    }
+                } else {
+                    Logger::error("GetRecords failed for", shard_id, ":", error_msg);
+                }
+
                 // 에러 발생 시 잠시 대기하되 running_ 체크
                 for (int i = 0; i < 5 && running_; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
