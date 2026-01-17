@@ -26,6 +26,9 @@ public:
 
     // 완전 체결된 주문을 order_maps_에서 제거 (메모리 누수 방지)
     void removeFilledOrder(const std::string& symbol, const std::string& order_id);
+
+    // 콜백 내에서 호출용 (락 이미 보유된 상태)
+    void removeFilledOrderUnsafe(const std::string& symbol, const std::string& order_id);
     
     // === 스냅샷 API (gRPC용) ===
     std::string snapshotOrderBook(const std::string& symbol);

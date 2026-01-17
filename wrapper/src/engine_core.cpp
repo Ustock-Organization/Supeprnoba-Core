@@ -123,7 +123,12 @@ bool EngineCore::replaceOrder(const std::string& symbol,
 void EngineCore::removeFilledOrder(const std::string& symbol,
                                     const std::string& order_id) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    removeFilledOrderUnsafe(symbol, order_id);
+}
 
+void EngineCore::removeFilledOrderUnsafe(const std::string& symbol,
+                                          const std::string& order_id) {
+    // 락이 이미 보유된 상태에서 호출됨 (콜백 컨텍스트)
     auto sym_it = order_maps_.find(symbol);
     if (sym_it == order_maps_.end()) return;
 

@@ -66,8 +66,9 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     }
 
     // Reject된 주문을 order_maps_에서 제거 (메모리 누수 방지)
+    // 콜백 컨텍스트에서는 락이 이미 보유된 상태이므로 Unsafe 버전 사용
     if (engine_) {
-        engine_->removeFilledOrder(order->symbol(), order->order_id());
+        engine_->removeFilledOrderUnsafe(order->symbol(), order->order_id());
     }
 }
 
@@ -237,12 +238,13 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     updateTickerCache(symbol, fill_price);
 
     // 완전 체결된 주문을 order_maps_에서 제거 (메모리 누수 방지)
+    // 콜백 컨텍스트에서는 락이 이미 보유된 상태이므로 Unsafe 버전 사용
     if (engine_) {
         if (order_fully_filled) {
-            engine_->removeFilledOrder(symbol, order->order_id());
+            engine_->removeFilledOrderUnsafe(symbol, order->order_id());
         }
         if (matched_order_fully_filled) {
-            engine_->removeFilledOrder(symbol, matched_order->order_id());
+            engine_->removeFilledOrderUnsafe(symbol, matched_order->order_id());
         }
     }
 }
