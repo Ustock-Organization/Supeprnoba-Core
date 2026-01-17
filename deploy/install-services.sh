@@ -3,6 +3,7 @@
 # Supernoba Service Installation Script
 #
 # systemd 서비스 파일 설치 및 로그 디렉토리 설정
+# 인스턴스 메모리 기반으로 동적 메모리 제한 설정
 #
 # 사용법:
 #   sudo ./install-services.sh
@@ -17,6 +18,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -36,6 +38,60 @@ HOST_SERVICES["stock-bastion"]="supernoba-engine supernoba-mm"
 HOST_SERVICES["stock-streamer"]="supernoba-streamer"
 HOST_SERVICES["stock-processor"]="supernoba-processor"
 HOST_SERVICES["stock-aggregator"]="supernoba-aggregator"
+
+# 서비스별 메모리 비율 (총 메모리의 %)
+# 동일 호스트에서 여러 서비스 실행 시 합이 90% 이하가 되도록 설정
+declare -A SERVICE_MEMORY_PERCENT
+SERVICE_MEMORY_PERCENT["supernoba-engine"]=60      # server: 60%
+SERVICE_MEMORY_PERCENT["supernoba-mm"]=20          # server: 20% (engine과 함께)
+SERVICE_MEMORY_PERCENT["supernoba-streamer"]=80    # streamer: 80%
+SERVICE_MEMORY_PERCENT["supernoba-processor"]=80   # processor: 80%
+SERVICE_MEMORY_PERCENT["supernoba-aggregator"]=80  # aggregator: 80%
+
+# Node.js 서비스별 V8 힙 메모리 비율 (서비스 메모리의 %)
+declare -A NODEJS_HEAP_PERCENT
+NODEJS_HEAP_PERCENT["supernoba-mm"]=70
+NODEJS_HEAP_PERCENT["supernoba-streamer"]=70
+
+#===== 시스템 정보 함수 =====
+
+# 총 시스템 메모리 (MB 단위)
+get_total_memory_mb() {
+    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    echo $((mem_kb / 1024))
+}
+
+# 총 디스크 용량 (MB 단위)
+get_total_disk_mb() {
+    local disk_kb=$(df / | tail -1 | awk '{print $2}')
+    echo $((disk_kb / 1024))
+}
+
+# 메모리 값 계산 (MB)
+calculate_memory() {
+    local total_mb=$1
+    local percent=$2
+    echo $((total_mb * percent / 100))
+}
+
+# MB를 systemd 형식으로 변환 (예: 1536M, 2G)
+format_memory() {
+    local mb=$1
+    if [ $mb -ge 1024 ]; then
+        # 1G 이상이면 G 단위 사용 (소수점 없이)
+        local gb=$((mb / 1024))
+        local remainder=$((mb % 1024))
+        if [ $remainder -eq 0 ]; then
+            echo "${gb}G"
+        else
+            echo "${mb}M"
+        fi
+    else
+        echo "${mb}M"
+    fi
+}
+
+#===== 디렉토리 설정 함수 =====
 
 # 로그 디렉토리 생성
 create_log_dirs() {
@@ -81,20 +137,61 @@ EOF
     fi
 }
 
-# 서비스 파일 설치
+#===== 서비스 설치 함수 =====
+
+# 서비스 파일 설치 (메모리 제한 동적 적용)
 install_service() {
     local service=$1
+    local total_mem_mb=$2
     local service_file="$SCRIPT_DIR/systemd/$service.service"
 
-    if [ -f "$service_file" ]; then
-        log_info "Installing $service..."
-        cp "$service_file" "$SYSTEMD_DIR/"
-        chmod 644 "$SYSTEMD_DIR/$service.service"
-        log_success "Installed $service"
-    else
+    if [ ! -f "$service_file" ]; then
         log_error "Service file not found: $service_file"
         return 1
     fi
+
+    log_info "Installing $service..."
+
+    # 메모리 계산
+    local mem_percent=${SERVICE_MEMORY_PERCENT[$service]:-80}
+    local mem_max_mb=$(calculate_memory $total_mem_mb $mem_percent)
+    local mem_high_mb=$(calculate_memory $mem_max_mb 75)  # MemoryHigh = MemoryMax의 75%
+
+    local mem_max_fmt=$(format_memory $mem_max_mb)
+    local mem_high_fmt=$(format_memory $mem_high_mb)
+
+    log_info "  Memory: ${mem_percent}% of ${total_mem_mb}MB = ${mem_max_fmt} (High: ${mem_high_fmt})"
+
+    # Node.js V8 힙 크기 계산
+    local nodejs_heap=""
+    if [ -n "${NODEJS_HEAP_PERCENT[$service]}" ]; then
+        local heap_percent=${NODEJS_HEAP_PERCENT[$service]}
+        local heap_mb=$(calculate_memory $mem_max_mb $heap_percent)
+        nodejs_heap="--max-old-space-size=$heap_mb"
+        log_info "  Node.js V8 Heap: ${heap_mb}MB"
+    fi
+
+    # 서비스 파일 복사 및 메모리 값 치환
+    local tmp_file=$(mktemp)
+    cp "$service_file" "$tmp_file"
+
+    # MemoryMax 치환
+    sed -i "s/^MemoryMax=.*/MemoryMax=$mem_max_fmt/" "$tmp_file"
+
+    # MemoryHigh 치환
+    sed -i "s/^MemoryHigh=.*/MemoryHigh=$mem_high_fmt/" "$tmp_file"
+
+    # Node.js V8 힙 크기 치환 (해당하는 경우)
+    if [ -n "$nodejs_heap" ]; then
+        sed -i "s/--max-old-space-size=[0-9]*/$nodejs_heap/" "$tmp_file"
+    fi
+
+    # 최종 서비스 파일 설치
+    cp "$tmp_file" "$SYSTEMD_DIR/$service.service"
+    chmod 644 "$SYSTEMD_DIR/$service.service"
+    rm "$tmp_file"
+
+    log_success "Installed $service (MemoryMax=$mem_max_fmt, MemoryHigh=$mem_high_fmt)"
 }
 
 # 현재 호스트에 맞는 서비스 찾기
@@ -112,7 +209,8 @@ get_host_services() {
     echo ""
 }
 
-# 메인
+#===== 메인 =====
+
 main() {
     echo "============================================"
     echo "  Supernoba Service Installation Script"
@@ -124,6 +222,15 @@ main() {
         log_error "This script must be run as root (use sudo)"
         exit 1
     fi
+
+    # 시스템 정보 수집
+    local total_mem_mb=$(get_total_memory_mb)
+    local total_disk_mb=$(get_total_disk_mb)
+
+    echo -e "${CYAN}=== System Information ===${NC}"
+    echo "  Total Memory: ${total_mem_mb}MB ($((total_mem_mb / 1024))GB)"
+    echo "  Total Disk:   ${total_disk_mb}MB ($((total_disk_mb / 1024))GB)"
+    echo ""
 
     # 로그 디렉토리 생성
     create_log_dirs
@@ -145,8 +252,25 @@ main() {
     log_info "Installing services: $services"
     echo ""
 
+    # 서비스별 메모리 할당 계획 표시
+    echo -e "${CYAN}=== Memory Allocation Plan ===${NC}"
+    local total_percent=0
     for svc in $services; do
-        install_service "$svc"
+        local pct=${SERVICE_MEMORY_PERCENT[$svc]:-80}
+        local mem_mb=$(calculate_memory $total_mem_mb $pct)
+        echo "  $svc: ${pct}% = $(format_memory $mem_mb)"
+        total_percent=$((total_percent + pct))
+    done
+    echo "  ----------------------------------------"
+    echo "  Total: ${total_percent}% of system memory"
+    if [ $total_percent -gt 90 ]; then
+        log_warn "Total memory allocation exceeds 90%!"
+    fi
+    echo ""
+
+    # 서비스 설치
+    for svc in $services; do
+        install_service "$svc" "$total_mem_mb"
     done
 
     # Logrotate 설치
@@ -164,6 +288,8 @@ main() {
     echo "============================================"
     echo "  Installation Complete!"
     echo "============================================"
+    echo ""
+    echo "Memory limits applied based on system memory (${total_mem_mb}MB)"
     echo ""
     echo "Next steps:"
     echo "  1. Create RDS password file (if needed):"
