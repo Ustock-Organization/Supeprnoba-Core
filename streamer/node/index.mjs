@@ -284,6 +284,12 @@ function setupPubSubHandlers() {
         const rawData = JSON.parse(message);
         console.log('[MM Raw] symbols count:', rawData.symbols?.length, 'running:', rawData.running);
 
+        // 빈 symbols 배열은 무시 (깜빡임 방지)
+        if (!rawData.symbols || rawData.symbols.length === 0) {
+          console.log('[MM Status] Ignoring empty symbols message');
+          return;
+        }
+
         // 각 심볼의 실제 체결가(ohlc.c) 조회
         const symbolsWithPrice = await Promise.all(
           (rawData.symbols || []).map(async (s) => {
