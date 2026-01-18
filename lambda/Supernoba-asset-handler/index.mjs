@@ -342,11 +342,23 @@ async function getTradeHistory(userId) {
             timestamp: item.updated_at || item.created_at // 체결 시간으로 updated_at 사용
         }));
 
-        // timestamp 기준 내림차순 정렬 (최신순)
+        // timestamp 기준 정렬: 유효한 timestamp가 있는 항목 우선, 최신순
+        const getValidTimestamp = (trade) => {
+            const ts = trade.timestamp || trade.updated_at || trade.created_at;
+            if (!ts) return null;
+            const time = new Date(ts).getTime();
+            return isNaN(time) ? null : time;
+        };
+
         trades.sort((a, b) => {
-            const timeA = new Date(a.timestamp || 0).getTime();
-            const timeB = new Date(b.timestamp || 0).getTime();
-            return timeB - timeA;
+            const timeA = getValidTimestamp(a);
+            const timeB = getValidTimestamp(b);
+            // 둘 다 유효하면 시간순 (최신 먼저)
+            if (timeA !== null && timeB !== null) return timeB - timeA;
+            // 유효한 timestamp가 있는 항목을 앞으로
+            if (timeA !== null) return -1;
+            if (timeB !== null) return 1;
+            return 0;
         });
 
         return {
