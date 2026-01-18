@@ -341,7 +341,14 @@ async function getTradeHistory(userId) {
             updated_at: item.updated_at,
             timestamp: item.updated_at || item.created_at // 체결 시간으로 updated_at 사용
         }));
-        
+
+        // timestamp 기준 내림차순 정렬 (최신순)
+        trades.sort((a, b) => {
+            const timeA = new Date(a.timestamp || 0).getTime();
+            const timeB = new Date(b.timestamp || 0).getTime();
+            return timeB - timeA;
+        });
+
         return {
             statusCode: 200,
             headers: HEADERS,
