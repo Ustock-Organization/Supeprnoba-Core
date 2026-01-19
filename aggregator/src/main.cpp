@@ -248,9 +248,14 @@ int main(int argc, char* argv[]) {
 
             // 5. 1d/1w 계층적 집계 (RDS 기반 - 연결된 경우만)
             if (rds_connected) {
-                int64_t aligned_1d = align_epoch_to_timeframe(now, SECONDS_1D);
+                // 1d 경계: KST 자정 기준 (UTC 15:00 = KST 00:00)
+                const int64_t KST_OFFSET = 9 * 3600;
+                int64_t now_kst = now + KST_OFFSET;
+                int64_t aligned_1d_kst = (now_kst / SECONDS_1D) * SECONDS_1D;
+                int64_t aligned_1d = aligned_1d_kst - KST_OFFSET;  // UTC epoch으로 변환
+
                 if (aligned_1d > last_1d_check && !known_symbols.empty()) {
-                    Logger::info("[HIER-AGG] 1d boundary reached, aggregating...");
+                    Logger::info("[HIER-AGG] 1d boundary reached (KST midnight), aggregating...");
                     for (const auto& sym : known_symbols) {
                         aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
                                                   SECONDS_1D, aligned_1d);
