@@ -1,6 +1,7 @@
 #!/bin/bash
 # Supernoba logrotate 설치 스크립트
-# 사용법: sudo ./install-logrotate.sh [engine|streamer|mm|processor|aggregator|all]
+# 사용법: sudo ./install-logrotate.sh [engine|streamer|mm|aggregator|all]
+# NOTE: processor는 Supernoba-back 저장소에서 관리됩니다.
 
 set -e
 
@@ -21,9 +22,6 @@ create_log_dirs() {
             ;;
         mm)
             mkdir -p "$LOG_DIR/mm-service"
-            ;;
-        processor)
-            mkdir -p "$LOG_DIR/processor"
             ;;
         aggregator)
             mkdir -p "$LOG_DIR/aggregator"
@@ -77,22 +75,18 @@ main() {
             create_log_dirs mm
             install_logrotate mm
             ;;
-        processor)
-            create_log_dirs processor
-            install_logrotate processor
-            ;;
         aggregator)
             create_log_dirs aggregator
             install_logrotate aggregator
             ;;
         all)
-            for c in engine streamer mm processor aggregator; do
+            for c in engine streamer mm aggregator; do
                 create_log_dirs $c
                 install_logrotate $c
             done
             ;;
         *)
-            echo "Usage: $0 [engine|streamer|mm|processor|aggregator|all]"
+            echo "Usage: $0 [engine|streamer|mm|aggregator|all]"
             exit 1
             ;;
     esac

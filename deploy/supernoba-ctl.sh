@@ -17,7 +17,8 @@
 #   ./supernoba-ctl.sh kill [service]     # 프로세스 강제 종료 (pkill)
 #   ./supernoba-ctl.sh kill-all           # 모든 Supernoba 프로세스 강제 종료
 #
-# service: engine, streamer, mm, aggregator, processor, all
+# service: engine, streamer, mm, aggregator, all
+# NOTE: processor는 Supernoba-back 저장소에서 관리됩니다.
 #
 
 set -e
@@ -35,17 +36,16 @@ HOSTNAME=$(hostname)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 호스트별 서비스 정의
+# NOTE: processor는 Supernoba-back 저장소에서 관리됩니다.
 declare -A HOST_SERVICES
 HOST_SERVICES["stock-bastion"]="engine mm"
 HOST_SERVICES["stock-streamer"]="streamer"
-HOST_SERVICES["stock-processor"]="processor"
 HOST_SERVICES["stock-aggregator"]="aggregator"
 
 # Private IP 기반 서비스 매핑 (호스트명 인식 실패 시 fallback)
 declare -A IP_SERVICES
 IP_SERVICES["172.31.47.97"]="engine mm"        # stock-bastion
 IP_SERVICES["172.31.57.219"]="streamer"        # stock-streamer
-IP_SERVICES["172.31.53.217"]="processor"       # stock-processor
 IP_SERVICES["172.31.35.62"]="aggregator"       # stock-aggregator
 
 # 서비스명 매핑 (short -> systemd name)
@@ -54,7 +54,6 @@ SERVICE_NAMES["engine"]="supernoba-engine"
 SERVICE_NAMES["streamer"]="supernoba-streamer"
 SERVICE_NAMES["mm"]="supernoba-mm"
 SERVICE_NAMES["aggregator"]="supernoba-aggregator"
-SERVICE_NAMES["processor"]="supernoba-processor"
 
 # 로그 경로
 declare -A LOG_PATHS
@@ -62,7 +61,6 @@ LOG_PATHS["engine"]="/var/log/supernoba/engine/engine.log"
 LOG_PATHS["streamer"]="/var/log/supernoba/streamer/streamer.log"
 LOG_PATHS["mm"]="/var/log/supernoba/mm-service/mm-service.log"
 LOG_PATHS["aggregator"]="/var/log/supernoba/aggregator/aggregator.log"
-LOG_PATHS["processor"]="/var/log/supernoba/processor/processor.log"
 
 # 빌드 경로
 declare -A BUILD_PATHS
@@ -70,7 +68,6 @@ BUILD_PATHS["engine"]="$HOME/Supeprnoba-Core/wrapper"
 BUILD_PATHS["streamer"]="$HOME/Supeprnoba-Core/streamer/node"
 BUILD_PATHS["mm"]="$HOME/Supeprnoba-Core/mm-service"
 BUILD_PATHS["aggregator"]="$HOME/Supeprnoba-Core/aggregator"
-BUILD_PATHS["processor"]="$HOME/Supernoba-back"
 
 # 서비스 설명
 declare -A SERVICE_DESC
@@ -78,7 +75,6 @@ SERVICE_DESC["engine"]="Matching Engine (C++)"
 SERVICE_DESC["streamer"]="Streaming Server (Node.js)"
 SERVICE_DESC["mm"]="Market Maker Service (Node.js)"
 SERVICE_DESC["aggregator"]="Candle Aggregator (C++)"
-SERVICE_DESC["processor"]="Stock Processor (C++)"
 
 #===== 유틸리티 함수 =====
 
@@ -174,16 +170,6 @@ build_service() {
             # 빌드 후 vcpkg 아티팩트 정리
             cleanup_vcpkg
             ;;
-        processor)
-            if [ ! -d "build" ]; then
-                cmake -B build -S . \
-                    -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
-            fi
-            cmake --build build -j$(nproc)
-            # 빌드 후 vcpkg 아티팩트 정리
-            cleanup_vcpkg
-            ;;
         streamer|mm)
             if [ ! -d "node_modules" ]; then
                 npm install
@@ -214,9 +200,6 @@ kill_service() {
         aggregator)
             pkill -9 -f 'candle_aggregator' 2>/dev/null && log_success "Killed candle_aggregator" || log_warn "No candle_aggregator process found"
             ;;
-        processor)
-            pkill -9 -f 'stock-processor' 2>/dev/null && log_success "Killed stock-processor" || log_warn "No stock-processor process found"
-            ;;
         *)
             log_error "Unknown service: $service"
             return 1
@@ -231,7 +214,7 @@ kill_all_processes() {
 
     # systemd 서비스 먼저 중지 시도
     log_info "Stopping systemd services first..."
-    for svc in engine streamer mm aggregator processor; do
+    for svc in engine streamer mm aggregator; do
         local systemd_name="${SERVICE_NAMES[$svc]}"
         sudo systemctl stop "$systemd_name" 2>/dev/null || true
     done
@@ -244,7 +227,6 @@ kill_all_processes() {
     pkill -9 -f 'node.*streamer.*index\.mjs' 2>/dev/null && log_success "Killed streamer" || true
     pkill -9 -f 'node.*mm-service.*index\.mjs' 2>/dev/null && log_success "Killed mm-service" || true
     pkill -9 -f 'candle_aggregator' 2>/dev/null && log_success "Killed candle_aggregator" || true
-    pkill -9 -f 'stock-processor' 2>/dev/null && log_success "Killed stock-processor" || true
 
     echo ""
     log_success "All Supernoba processes terminated"
@@ -298,8 +280,9 @@ show_help() {
     echo "  streamer    - Streaming Server (Node.js)"
     echo "  mm          - Market Maker Service (Node.js)"
     echo "  aggregator  - Candle Aggregator (C++)"
-    echo "  processor   - Stock Processor (C++)"
     echo "  all         - All services on this host"
+    echo ""
+    echo "NOTE: processor는 Supernoba-back 저장소에서 관리됩니다."
     echo ""
     echo "Examples:"
     echo "  $0 start all       # Start all services on this host"
@@ -342,7 +325,7 @@ case "$ACTION" in
             local_services=$(get_local_services)
             if [ -z "$local_services" ]; then
                 # 모든 서비스 상태 표시
-                for svc in engine streamer mm aggregator processor; do
+                for svc in engine streamer mm aggregator; do
                     health_check "$svc"
                 done
             else
@@ -426,7 +409,7 @@ case "$ACTION" in
         local_services=$(get_local_services)
         if [ -z "$local_services" ]; then
             # 모든 서비스 확인
-            for svc in engine streamer mm aggregator processor; do
+            for svc in engine streamer mm aggregator; do
                 health_check "$svc"
                 echo ""
             done
@@ -443,7 +426,7 @@ case "$ACTION" in
             log_info "Killing all local services..."
             local_services=$(get_local_services)
             if [ -z "$local_services" ]; then
-                local_services="engine streamer mm aggregator processor"
+                local_services="engine streamer mm aggregator"
             fi
             for svc in $local_services; do
                 kill_service "$svc"

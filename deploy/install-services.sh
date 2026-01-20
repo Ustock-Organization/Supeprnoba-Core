@@ -33,10 +33,10 @@ LOG_BASE="/var/log/supernoba"
 SECRETS_DIR="/home/ec2-user/.secrets"
 
 # 호스트별 서비스 매핑
+# NOTE: processor는 Supernoba-back 저장소에서 관리됩니다.
 declare -A HOST_SERVICES
 HOST_SERVICES["stock-bastion"]="supernoba-engine supernoba-mm"
 HOST_SERVICES["stock-streamer"]="supernoba-streamer"
-HOST_SERVICES["stock-processor"]="supernoba-processor"
 HOST_SERVICES["stock-aggregator"]="supernoba-aggregator"
 
 # 서비스별 메모리 비율 (총 메모리의 %)
@@ -45,7 +45,6 @@ declare -A SERVICE_MEMORY_PERCENT
 SERVICE_MEMORY_PERCENT["supernoba-engine"]=60      # server: 60%
 SERVICE_MEMORY_PERCENT["supernoba-mm"]=20          # server: 20% (engine과 함께)
 SERVICE_MEMORY_PERCENT["supernoba-streamer"]=80    # streamer: 80%
-SERVICE_MEMORY_PERCENT["supernoba-processor"]=80   # processor: 80%
 SERVICE_MEMORY_PERCENT["supernoba-aggregator"]=80  # aggregator: 80%
 
 # Node.js 서비스별 V8 힙 메모리 비율 (서비스 메모리의 %)
@@ -114,7 +113,7 @@ install_cronie() {
 create_log_dirs() {
     log_info "Creating log directories..."
 
-    local services=("engine" "streamer" "mm-service" "aggregator" "processor")
+    local services=("engine" "streamer" "mm-service" "aggregator")
     for svc in "${services[@]}"; do
         if [ ! -d "$LOG_BASE/$svc" ]; then
             mkdir -p "$LOG_BASE/$svc"
@@ -322,7 +321,7 @@ main() {
 
     if [ -z "$services" ]; then
         log_warn "Unknown host. Installing all services..."
-        services="supernoba-engine supernoba-mm supernoba-streamer supernoba-processor supernoba-aggregator"
+        services="supernoba-engine supernoba-mm supernoba-streamer supernoba-aggregator"
     fi
 
     log_info "Installing services: $services"
