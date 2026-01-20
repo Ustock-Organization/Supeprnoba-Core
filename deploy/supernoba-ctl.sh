@@ -41,6 +41,13 @@ HOST_SERVICES["stock-streamer"]="streamer"
 HOST_SERVICES["stock-processor"]="processor"
 HOST_SERVICES["stock-aggregator"]="aggregator"
 
+# Private IP 기반 서비스 매핑 (호스트명 인식 실패 시 fallback)
+declare -A IP_SERVICES
+IP_SERVICES["172.31.47.97"]="engine mm"        # stock-bastion
+IP_SERVICES["172.31.57.219"]="streamer"        # stock-streamer
+IP_SERVICES["172.31.53.217"]="processor"       # stock-processor
+IP_SERVICES["172.31.35.62"]="aggregator"       # stock-aggregator
+
 # 서비스명 매핑 (short -> systemd name)
 declare -A SERVICE_NAMES
 SERVICE_NAMES["engine"]="supernoba-engine"
@@ -82,12 +89,27 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # 현재 호스트의 로컬 서비스 목록
 get_local_services() {
+    # 1. 환경 변수 우선
+    if [ -n "$SUPERNOBA_SERVICES" ]; then
+        echo "$SUPERNOBA_SERVICES"
+        return
+    fi
+
+    # 2. 호스트명 매칭
     for host in "${!HOST_SERVICES[@]}"; do
         if [[ "$HOSTNAME" == *"$host"* ]]; then
             echo "${HOST_SERVICES[$host]}"
             return
         fi
     done
+
+    # 3. IP 주소 기반 fallback
+    local my_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$my_ip" ] && [ -n "${IP_SERVICES[$my_ip]}" ]; then
+        echo "${IP_SERVICES[$my_ip]}"
+        return
+    fi
+
     echo ""
 }
 
@@ -104,6 +126,18 @@ service_action() {
 
     log_info "Running: systemctl $action $systemd_name"
     sudo systemctl "$action" "$systemd_name"
+}
+
+# vcpkg 빌드 아티팩트 정리
+cleanup_vcpkg() {
+    if [ -d "$HOME/vcpkg/buildtrees" ]; then
+        local size=$(du -sh "$HOME/vcpkg/buildtrees" 2>/dev/null | cut -f1)
+        if [ -n "$size" ] && [ "$size" != "0" ]; then
+            log_info "Cleaning vcpkg buildtrees ($size)..."
+            rm -rf "$HOME/vcpkg/buildtrees"/*
+            log_success "vcpkg buildtrees cleaned"
+        fi
+    fi
 }
 
 # 서비스 빌드
@@ -127,6 +161,8 @@ build_service() {
                     -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
             fi
             cmake --build build -j$(nproc)
+            # 빌드 후 vcpkg 아티팩트 정리
+            cleanup_vcpkg
             ;;
         aggregator)
             if [ ! -d "build" ]; then
@@ -135,6 +171,8 @@ build_service() {
                     -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
             fi
             cmake --build build -j$(nproc)
+            # 빌드 후 vcpkg 아티팩트 정리
+            cleanup_vcpkg
             ;;
         processor)
             if [ ! -d "build" ]; then
@@ -143,6 +181,8 @@ build_service() {
                     -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
             fi
             cmake --build build -j$(nproc)
+            # 빌드 후 vcpkg 아티팩트 정리
+            cleanup_vcpkg
             ;;
         streamer|mm)
             if [ ! -d "node_modules" ]; then

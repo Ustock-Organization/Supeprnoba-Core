@@ -91,6 +91,23 @@ format_memory() {
     fi
 }
 
+#===== 사전 요구사항 설치 =====
+
+# cronie 설치 확인 및 설치
+install_cronie() {
+    log_info "Checking cronie (cron daemon)..."
+
+    if command -v crontab &> /dev/null; then
+        log_success "cronie already installed"
+    else
+        log_warn "cronie not found, installing..."
+        yum install -y cronie
+        systemctl enable crond
+        systemctl start crond
+        log_success "cronie installed and started"
+    fi
+}
+
 #===== 디렉토리 설정 함수 =====
 
 # 로그 디렉토리 생성
@@ -134,6 +151,62 @@ EOF
         chown ec2-user:ec2-user "$SECRETS_DIR/rds.env.template"
         chmod 600 "$SECRETS_DIR/rds.env.template"
         log_info "Created template: $SECRETS_DIR/rds.env.template"
+    fi
+}
+
+# 디스크 모니터링 스크립트 설치
+setup_disk_monitoring() {
+    log_info "Setting up disk monitoring..."
+
+    local script_path="/home/ec2-user/check-disk.sh"
+    local log_path="/var/log/supernoba/disk-check.log"
+
+    # 모니터링 스크립트 생성
+    cat > "$script_path" << 'SCRIPT'
+#!/bin/bash
+# Disk usage monitor - alerts when usage exceeds 80%
+USAGE=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
+HOSTNAME=$(hostname)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+if [ "$USAGE" -gt 80 ]; then
+    echo "[$TIMESTAMP] WARNING: Disk usage at ${USAGE}% on $HOSTNAME"
+fi
+SCRIPT
+    chown ec2-user:ec2-user "$script_path"
+    chmod +x "$script_path"
+    log_success "Created disk monitoring script: $script_path"
+
+    # cron job 설정 (매시간 실행)
+    local cron_entry="0 * * * * $script_path >> $log_path 2>&1"
+
+    # 기존 cron job 확인 및 추가
+    if crontab -u ec2-user -l 2>/dev/null | grep -q "check-disk.sh"; then
+        log_info "Disk monitoring cron job already exists"
+    else
+        (crontab -u ec2-user -l 2>/dev/null || true; echo "$cron_entry") | crontab -u ec2-user -
+        log_success "Added disk monitoring cron job (hourly)"
+    fi
+}
+
+# vcpkg 정리 cron job 설정 (aggregator 전용)
+setup_vcpkg_cleanup() {
+    local hostname=$(hostname)
+
+    # aggregator 인스턴스에서만 설정
+    if [[ "$hostname" != *"stock-aggregator"* ]]; then
+        return
+    fi
+
+    log_info "Setting up vcpkg cleanup cron job..."
+
+    local cron_entry="0 3 * * 0 rm -rf /home/ec2-user/vcpkg/buildtrees/* 2>/dev/null"
+
+    if crontab -u ec2-user -l 2>/dev/null | grep -q "vcpkg/buildtrees"; then
+        log_info "vcpkg cleanup cron job already exists"
+    else
+        (crontab -u ec2-user -l 2>/dev/null || true; echo "$cron_entry") | crontab -u ec2-user -
+        log_success "Added vcpkg cleanup cron job (weekly, Sunday 3AM)"
     fi
 }
 
@@ -232,6 +305,9 @@ main() {
     echo "  Total Disk:   ${total_disk_mb}MB ($((total_disk_mb / 1024))GB)"
     echo ""
 
+    # 사전 요구사항 설치
+    install_cronie
+
     # 로그 디렉토리 생성
     create_log_dirs
 
@@ -278,6 +354,12 @@ main() {
         log_info "Installing logrotate configurations..."
         bash "$SCRIPT_DIR/logrotate/install-logrotate.sh" all
     fi
+
+    # 디스크 모니터링 설정
+    setup_disk_monitoring
+
+    # vcpkg 정리 cron job 설정 (aggregator만)
+    setup_vcpkg_cleanup
 
     # systemd 리로드
     log_info "Reloading systemd daemon..."
