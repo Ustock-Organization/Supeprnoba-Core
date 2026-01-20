@@ -7,6 +7,10 @@
     "hiredis",
     "curl",
     "openssl",
-    "libpq"
+    "libpq",
+    {
+      "name": "aws-sdk-cpp",
+      "features": ["secretsmanager"]
+    }
   ]
 }

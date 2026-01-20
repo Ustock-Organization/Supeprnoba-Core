@@ -16,7 +16,10 @@ find_package(CURL REQUIRED)
 
 # PostgreSQL (libpq)
 find_package(PostgreSQL REQUIRED)
-message(STATUS "Building Candle Aggregator with RDS PostgreSQL support")
+
+# AWS SDK for C++ (Secrets Manager)
+find_package(AWSSDK CONFIG COMPONENTS secretsmanager REQUIRED)
+message(STATUS "Building Candle Aggregator with RDS PostgreSQL and AWS Secrets Manager support")
 
 # 소스 파일
 set(SOURCES
@@ -26,6 +29,7 @@ set(SOURCES
     src/valkey_client.cpp
     src/aggregator.cpp
     src/rds_client.cpp
+    src/secrets_manager.cpp
 )
 
 # 메인 실행파일
@@ -39,4 +43,5 @@ target_link_libraries(candle_aggregator PRIVATE
     OpenSSL::Crypto
     CURL::libcurl
     PostgreSQL::PostgreSQL
+    ${AWSSDK_LINK_LIBRARIES}
 )

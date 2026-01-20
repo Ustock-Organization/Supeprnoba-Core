@@ -6,7 +6,9 @@
 #include "valkey_client.h"
 #include "aggregator.h"
 #include "rds_client.h"
+#include "secrets_manager.h"
 
+#include <aws/core/Aws.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -101,11 +103,18 @@ void print_banner() {
 
 int main(int argc, char* argv[]) {
     print_banner();
-    
+
+    // AWS SDK 초기화
+    Aws::SDKOptions options;
+    options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Warn;
+    Aws::InitAPI(options);
+
+    int exit_code = 0;
+
     // 시그널 핸들러 등록
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
-    
+
     // 설정 로드
     Config cfg = Config::from_env();
     Logger::set_level(cfg.log_level);
@@ -118,25 +127,41 @@ int main(int argc, char* argv[]) {
             Logger::info("Debug mode enabled via command line flag");
         }
     }
-    
+
     Logger::info("=== Configuration ===");
     Logger::info("Valkey Host:", cfg.valkey_host);
     Logger::info("Valkey Port:", cfg.valkey_port);
-    Logger::info("RDS Host:", cfg.rds_host);
-    Logger::info("RDS Port:", cfg.rds_port);
-    Logger::info("RDS DB:", cfg.rds_dbname);
+    Logger::info("AWS Region:", cfg.aws_region);
+    Logger::info("DB Secret:", cfg.db_credentials_secret_name);
     Logger::info("Poll Interval:", cfg.poll_interval_ms, "ms");
     Logger::info("=====================");
-    
+
+    // Secrets Manager에서 DB credentials 가져오기
+    SecretsManager secrets(cfg);
+    auto db_creds = secrets.getDbCredentials();
+    if (!db_creds.has_value()) {
+        Logger::error("Failed to get database credentials from Secrets Manager");
+        Logger::error("Please ensure the secret", cfg.db_credentials_secret_name, "exists");
+        Aws::ShutdownAPI(options);
+        return 1;
+    }
+
+    Logger::info("DB credentials loaded from Secrets Manager");
+    Logger::info("RDS Host:", db_creds->host);
+    Logger::info("RDS Port:", db_creds->port);
+    Logger::info("RDS DB:", db_creds->database);
+
     // 클라이언트 초기화
     ValkeyClient valkey(cfg.valkey_host, cfg.valkey_port);
     if (!valkey.connect()) {
         Logger::error("Failed to connect to Valkey");
+        Aws::ShutdownAPI(options);
         return 1;
     }
     Logger::info("Connected to Valkey");
-    
-    RdsClient rds(cfg.rds_host, cfg.rds_port, cfg.rds_dbname, cfg.rds_user, cfg.rds_password);
+
+    RdsClient rds(db_creds->host, db_creds->port, db_creds->database,
+                  db_creds->username, db_creds->password);
     bool rds_connected = rds.connect();
     if (!rds_connected) {
         Logger::warn("Failed to connect to RDS - running in Valkey-only mode");
@@ -306,6 +331,9 @@ int main(int argc, char* argv[]) {
     
     Logger::info("Aggregator stopped");
     rds.disconnect();
-    
-    return 0;
+
+    // AWS SDK 종료
+    Aws::ShutdownAPI(options);
+
+    return exit_code;
 }

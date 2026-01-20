@@ -47,12 +47,8 @@ export AWS_REGION="ap-northeast-2"
 export VALKEY_HOST="supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com"
 export VALKEY_PORT="6379"
 
-# RDS PostgreSQL
-export RDS_HOST="supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com"
-export RDS_PORT="5432"
-export RDS_DBNAME="postgres"
-export RDS_USER="njg7194"
-export RDS_PASSWORD='SiONN2#!*K0ra4olAvNZte?AWPb6'
+# AWS Secrets Manager (RDS 비밀번호는 여기서 가져옴)
+export DB_CREDENTIALS_SECRET_NAME="supernoba/db-credentials"
 
 # 폴링 간격 (ms)
 export POLL_INTERVAL_MS="10"
@@ -101,8 +97,7 @@ cmake --build "$BUILD_DIR" -j$(nproc)
 echo ""
 echo "[2/3] 현재 설정:"
 echo "  - VALKEY_HOST: $VALKEY_HOST"
-echo "  - RDS_HOST: $RDS_HOST"
-echo "  - RDS_DBNAME: $RDS_DBNAME"
+echo "  - DB_CREDENTIALS_SECRET: $DB_CREDENTIALS_SECRET_NAME"
 echo "  - POLL_INTERVAL: ${POLL_INTERVAL_MS}ms"
 echo "  - LOG_LEVEL: $LOG_LEVEL"
 echo "  - DEV_MODE: $DEV_MODE"
