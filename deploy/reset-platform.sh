@@ -10,9 +10,9 @@
 #   ./reset-platform.sh --confirm     # 실제 삭제 실행
 #
 # 초기화 대상:
-#   - DynamoDB: supernoba-orders, supernoba-holdings, supernoba-wallets
+#   - DynamoDB: supernoba-orders, supernoba-holdings, supernoba-wallets, supernoba-symbols
 #   - PostgreSQL: trade_history, candle_history
-#   - Valkey: depth:*, candle:*, ticker:*, mm:*, subscribed:symbols 등
+#   - Valkey: depth:*, candle:*, ticker:*, mm:*, subscribed:symbols, snapshot:*, orderbook:*, ranking:*, backup:* 등
 #
 
 set -e
@@ -59,7 +59,7 @@ RDS_DBNAME="${RDS_DBNAME:-postgres}"
 RDS_USER="${RDS_USER:-njg7194}"
 
 # DynamoDB 테이블 목록
-DYNAMODB_TABLES=("supernoba-orders" "supernoba-holdings" "supernoba-wallets")
+DYNAMODB_TABLES=("supernoba-orders" "supernoba-holdings" "supernoba-wallets" "supernoba-symbols")
 
 # Valkey 키 패턴
 VALKEY_KEY_PATTERNS=(
@@ -73,6 +73,11 @@ VALKEY_KEY_PATTERNS=(
     "symbol:*"
     "subscribed:symbols"
     "deleted:symbols"
+    # 백업 관련 키
+    "snapshot:*"
+    "orderbook:*"
+    "ranking:*"
+    "backup:*"
 )
 
 # 모드 설정
@@ -419,9 +424,9 @@ main() {
         echo -e "${RED}⚠️  WARNING: This will DELETE ALL DATA!${NC}"
         echo ""
         echo "The following will be cleared:"
-        echo "  - DynamoDB: orders, holdings, wallets"
+        echo "  - DynamoDB: orders, holdings, wallets, symbols"
         echo "  - PostgreSQL: trade_history, candle_history"
-        echo "  - Valkey: depth, candle, ticker, mm keys"
+        echo "  - Valkey: depth, candle, ticker, mm, snapshot, orderbook, ranking, backup keys"
         echo ""
         read -p "Type 'DELETE ALL' to confirm: " confirm
         if [ "$confirm" != "DELETE ALL" ]; then
