@@ -27,7 +27,7 @@ console.log(`Backup Cache: ${BACKUP_CACHE_HOST}`);
 const valkey = new Redis({
   host: VALKEY_HOST,
   port: VALKEY_PORT,
-  tls: VALKEY_TLS ? {} : undefined,
+  tls: VALKEY_TLS ? { rejectUnauthorized: false } : undefined,
   connectTimeout: 5000,
 });
 
