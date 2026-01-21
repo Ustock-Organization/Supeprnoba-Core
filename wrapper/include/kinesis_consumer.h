@@ -27,6 +27,7 @@ public:
 private:
     void consumeLoop();
     std::string getShardIterator(const std::string& shard_id);
+    int countActiveIterators() const;
     
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::string stream_name_;

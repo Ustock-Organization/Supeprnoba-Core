@@ -88,13 +88,21 @@ void KinesisConsumer::start() {
 
 void KinesisConsumer::stop() {
     if (!running_) return;
-    
+
     running_ = false;
     if (worker_.joinable()) {
         worker_.join();
     }
-    
+
     Logger::info("KinesisConsumer stopped");
+}
+
+int KinesisConsumer::countActiveIterators() const {
+    int count = 0;
+    for (const auto& [shard_id, iterator] : shard_iterators_) {
+        if (!iterator.empty()) count++;
+    }
+    return count;
 }
 
 void KinesisConsumer::consumeLoop() {
@@ -104,21 +112,23 @@ void KinesisConsumer::consumeLoop() {
         poll_count++;
         
         if (poll_count % 100 == 0) {
-            Logger::info("KinesisConsumer heartbeat: polling shards...");
+            Logger::info("KinesisConsumer heartbeat: polling", shard_iterators_.size(),
+                         "shards, active iterators:", countActiveIterators());
         }
         
         for (auto& [shard_id, iterator] : shard_iterators_) {
             if (!running_) break; // 빠른 종료를 위한 체크
 
             if (iterator.empty()) {
-                // 빈 iterator 자동 갱신 시도
-                if (poll_count % 50 == 0) {
-                    Logger::warn("Shard iterator empty for:", shard_id, "- attempting refresh...");
-                    std::string new_iterator = getShardIterator(shard_id);
-                    if (!new_iterator.empty()) {
-                        iterator = new_iterator;
-                        Logger::info("Iterator recovered for", shard_id);
-                    }
+                // 빈 iterator 즉시 갱신 시도 (지연 없음)
+                Logger::warn("Shard iterator empty for:", shard_id, "- immediate refresh");
+                std::string new_iterator = getShardIterator(shard_id);
+                if (!new_iterator.empty()) {
+                    iterator = new_iterator;
+                    Logger::info("Iterator recovered for", shard_id);
+                } else {
+                    Logger::error("Failed to refresh iterator for", shard_id);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
                 continue;
             }
@@ -130,21 +140,20 @@ void KinesisConsumer::consumeLoop() {
             auto outcome = client_->GetRecords(request);
             if (!outcome.IsSuccess()) {
                 const auto& error = outcome.GetError();
+                std::string error_type = error.GetExceptionName();
                 std::string error_msg = error.GetMessage();
 
-                // Iterator 만료 감지 및 자동 갱신
-                if (error_msg.find("Iterator expired") != std::string::npos ||
-                    error_msg.find("ExpiredIterator") != std::string::npos) {
-                    Logger::warn("Iterator expired for", shard_id, "- refreshing...");
-                    std::string new_iterator = getShardIterator(shard_id);
-                    if (!new_iterator.empty()) {
-                        iterator = new_iterator;
-                        Logger::info("Iterator refreshed for", shard_id);
-                    } else {
-                        Logger::error("Failed to refresh iterator for", shard_id);
-                    }
+                // 모든 에러 케이스에서 상세 로깅 및 iterator 갱신 시도
+                Logger::warn("GetRecords failed for", shard_id,
+                             "type:", error_type, "msg:", error_msg);
+
+                // 모든 실패 케이스에서 Iterator 갱신 시도
+                std::string new_iterator = getShardIterator(shard_id);
+                if (!new_iterator.empty()) {
+                    iterator = new_iterator;
+                    Logger::info("Iterator refreshed after error for", shard_id);
                 } else {
-                    Logger::error("GetRecords failed for", shard_id, ":", error_msg);
+                    Logger::error("Failed to refresh iterator for", shard_id);
                 }
 
                 // 에러 발생 시 잠시 대기하되 running_ 체크
@@ -158,12 +167,22 @@ void KinesisConsumer::consumeLoop() {
             std::string next_iterator = result.GetNextShardIterator();
             
             if (next_iterator.empty()) {
-                Logger::warn("Shard iterator ended explicitly for:", shard_id); // This is important
-            } else if (poll_count % 100 == 0 && shard_id == shard_iterators_.begin()->first) {
-                 Logger::debug("Shard polling active, records:", result.GetRecords().size());
+                // next_iterator가 빈 문자열이면 즉시 새 iterator 획득
+                Logger::warn("NextIterator empty for:", shard_id, "- refreshing immediately");
+                std::string fresh_iterator = getShardIterator(shard_id);
+                if (!fresh_iterator.empty()) {
+                    iterator = fresh_iterator;
+                    Logger::info("Iterator refreshed after empty next for", shard_id);
+                } else {
+                    Logger::error("Failed to get fresh iterator for", shard_id);
+                    iterator = "";  // 다음 루프에서 즉시 복구 시도
+                }
+            } else {
+                if (poll_count % 100 == 0 && shard_id == shard_iterators_.begin()->first) {
+                    Logger::debug("Shard polling active, records:", result.GetRecords().size());
+                }
+                iterator = next_iterator;
             }
-
-            iterator = next_iterator;
             
             for (const auto& record : result.GetRecords()) {
                 any_records = true;
