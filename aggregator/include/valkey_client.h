@@ -61,6 +61,17 @@ public:
     // TTL 설정
     bool set_expire(const std::string& key, int ttl_seconds);
 
+    // === 전일종가 및 랭킹 관리 ===
+
+    // prev:{symbol} 키에 전일종가 저장
+    bool set_prev_close(const std::string& symbol, double close_price);
+
+    // prev:{symbol} 키에서 전일종가 조회
+    double get_prev_close(const std::string& symbol);
+
+    // 급등/급락 랭킹 업데이트 (ranking:gainers, ranking:losers)
+    bool update_ranking(const std::string& symbol, double change_pct);
+
 private:
     std::string host_;
     int port_;

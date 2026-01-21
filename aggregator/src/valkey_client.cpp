@@ -334,4 +334,84 @@ bool ValkeyClient::set_expire(const std::string& key, int ttl_seconds) {
     return ok;
 }
 
+// === 전일종가 및 랭킹 관리 ===
+
+bool ValkeyClient::set_prev_close(const std::string& symbol, double close_price) {
+    if (!ctx_) return false;
+
+    // prev:{symbol} 키에 JSON 형태로 저장
+    json prev;
+    prev["close"] = static_cast<uint64_t>(close_price);
+
+    std::string key = "prev:" + symbol;
+    std::string value = prev.dump();
+
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "SET %s %s", key.c_str(), value.c_str());
+    if (!reply) return false;
+
+    bool ok = (reply->type == REDIS_REPLY_STATUS && std::string(reply->str) == "OK");
+    freeReplyObject(reply);
+
+    if (ok) {
+        Logger::info("[PREV-CLOSE] Set prev:", symbol, "=", close_price);
+    }
+    return ok;
+}
+
+double ValkeyClient::get_prev_close(const std::string& symbol) {
+    if (!ctx_) return 0.0;
+
+    std::string key = "prev:" + symbol;
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "GET %s", key.c_str());
+    if (!reply) return 0.0;
+
+    double close_price = 0.0;
+    if (reply->type == REDIS_REPLY_STRING && reply->str) {
+        try {
+            json j = json::parse(reply->str);
+            if (j.contains("close")) {
+                if (j["close"].is_number()) {
+                    close_price = j["close"].get<double>();
+                } else if (j["close"].is_string()) {
+                    close_price = std::stod(j["close"].get<std::string>());
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to parse prev close for", symbol, ":", e.what());
+        }
+    }
+    freeReplyObject(reply);
+    return close_price;
+}
+
+bool ValkeyClient::update_ranking(const std::string& symbol, double change_pct) {
+    if (!ctx_) return false;
+
+    // 급등/급락 점수 = 등락률 × 1,000,000 (정밀도 유지)
+    int64_t change_score = static_cast<int64_t>(change_pct * 1000000.0);
+
+    // gainers: 등락률 내림차순 (높은 순)
+    redisReply* reply1 = (redisReply*)redisCommand(ctx_,
+        "ZADD ranking:gainers %lld %s", change_score, symbol.c_str());
+    if (reply1) freeReplyObject(reply1);
+
+    // losers: 등락률 오름차순 (낮은 순, 음수 점수로 저장)
+    redisReply* reply2 = (redisReply*)redisCommand(ctx_,
+        "ZADD ranking:losers %lld %s", -change_score, symbol.c_str());
+    if (reply2) freeReplyObject(reply2);
+
+    // 급등/급락은 상위 100개만 유지
+    const int MAX_GAINERS_LOSERS = 100;
+    redisReply* reply3 = (redisReply*)redisCommand(ctx_,
+        "ZREMRANGEBYRANK ranking:gainers 0 %d", -MAX_GAINERS_LOSERS - 1);
+    if (reply3) freeReplyObject(reply3);
+
+    redisReply* reply4 = (redisReply*)redisCommand(ctx_,
+        "ZREMRANGEBYRANK ranking:losers 0 %d", -MAX_GAINERS_LOSERS - 1);
+    if (reply4) freeReplyObject(reply4);
+
+    Logger::debug("[RANKING] Updated ranking for", symbol, "change:", change_pct, "%");
+    return true;
+}
+
 } // namespace aggregator

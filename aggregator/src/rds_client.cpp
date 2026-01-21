@@ -217,4 +217,45 @@ std::vector<Candle> RdsClient::get_candles_by_interval(
     return candles;
 }
 
+// === 전일종가 관리 ===
+
+bool RdsClient::update_prev_close(const std::string& symbol, double close_price,
+                                   const std::string& trading_date) {
+    if (!connected_ || !conn_) return false;
+
+    // 대문자로 변환 (symbol_prev_close는 대문자 사용)
+    std::string upper_symbol = symbol;
+    for (auto& c : upper_symbol) c = std::toupper(c);
+
+    std::string sql = R"(
+        INSERT INTO symbol_prev_close (symbol, prev_close, prev_trading_date, last_close, last_trading_date)
+        VALUES ($1, $2, $3::DATE, $2, $3::DATE)
+        ON CONFLICT (symbol)
+        DO UPDATE SET
+            prev_close = EXCLUDED.prev_close,
+            prev_trading_date = EXCLUDED.prev_trading_date,
+            last_close = EXCLUDED.last_close,
+            last_trading_date = EXCLUDED.last_trading_date,
+            updated_at = now()
+    )";
+
+    std::string close_str = std::to_string(close_price);
+
+    const char* params[3] = {
+        upper_symbol.c_str(), close_str.c_str(), trading_date.c_str()
+    };
+
+    PGresult* res = PQexecParams(conn_, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        Logger::error("RDS update_prev_close failed:", PQerrorMessage(conn_));
+        PQclear(res);
+        return false;
+    }
+
+    PQclear(res);
+    Logger::info("[PREV-CLOSE] RDS updated:", upper_symbol, "=", close_price, "date:", trading_date);
+    return true;
+}
+
 } // namespace aggregator

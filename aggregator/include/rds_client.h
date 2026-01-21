@@ -39,6 +39,13 @@ public:
         int64_t start_epoch,
         int64_t end_epoch);
 
+    // === 전일종가 관리 ===
+
+    // symbol_prev_close 테이블에 전일종가 업데이트
+    // trading_date: YYYY-MM-DD 형식
+    bool update_prev_close(const std::string& symbol, double close_price,
+                           const std::string& trading_date);
+
 private:
     std::string host_;
     int port_;

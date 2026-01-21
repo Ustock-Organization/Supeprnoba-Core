@@ -23,15 +23,13 @@ class RankingManager;       // forward declaration
 using OrderBook = liquibook::book::DepthOrderBook<OrderPtr, 10>;
 using BookDepth = liquibook::book::Depth<10>;
 
-// 일일 시장 데이터 (OHLC + 변동률)
+// 일일 시장 데이터 (OHLC)
 struct DayData {
-    uint64_t prev_close = 0;    // 전일 종가 (변동률 계산 기준)
     uint64_t open_price = 0;    // 당일 시가 (첫 체결가)
     uint64_t high_price = 0;    // 당일 고가
     uint64_t low_price = 0;     // 당일 저가
     uint64_t last_price = 0;    // 현재가 (마지막 체결가)
     uint64_t volume = 0;        // 당일 거래량
-    double change_rate = 0.0;   // 당일 변동률 (%)
     int trading_day = 0;        // 거래일 (YYYYMMDD)
 };
 
@@ -77,7 +75,6 @@ public:
     DayData& getDayData(const std::string& symbol);
     void checkDayReset(const std::string& symbol);
     int getCurrentTradingDay() const;
-    void loadPrevClose(const std::string& symbol);
 
     // EngineCore 설정 (완전 체결된 주문 제거용)
     void setEngineCore(EngineCore* engine) { engine_ = engine; }
@@ -91,7 +88,6 @@ private:
     std::unordered_map<std::string, DayData> symbol_day_data_;
     
     void updateTickerCache(const std::string& symbol, uint64_t price);
-    void savePrevDayData(const std::string& symbol, const DayData& data);
 };
 
 } // namespace aws_wrapper

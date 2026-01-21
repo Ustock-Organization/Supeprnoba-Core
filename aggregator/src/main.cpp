@@ -43,6 +43,18 @@ std::string epoch_to_ymdhm(int64_t epoch) {
     return std::string(buf);
 }
 
+// epoch → YYYY-MM-DD 문자열 변환 (KST 기준, RDS용)
+std::string epoch_to_date(int64_t epoch) {
+    const int64_t KST_OFFSET = 9 * 3600;  // UTC+9
+    time_t kst_time = static_cast<time_t>(epoch + KST_OFFSET);
+    struct tm* tm = gmtime(&kst_time);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+    return std::string(buf);
+}
+
 // [Phase 3] 계층적 집계 수행 (4h, 1d, 1w)
 // source_interval에서 데이터를 읽어 target_interval로 집계
 void aggregate_higher_timeframe(
@@ -281,9 +293,41 @@ int main(int argc, char* argv[]) {
 
                 if (aligned_1d > last_1d_check && !known_symbols.empty()) {
                     Logger::info("[HIER-AGG] 1d boundary reached (KST midnight), aggregating...");
+
+                    // 마감 일자 계산 (전일 KST 기준)
+                    std::string trading_date = epoch_to_date(aligned_1d - SECONDS_1D);
+
                     for (const auto& sym : known_symbols) {
+                        // 1. 1d 캔들 집계
                         aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
                                                   SECONDS_1D, aligned_1d);
+
+                        // 2. 방금 저장된 1d 캔들 조회
+                        auto candles_1d = rds.get_candles_by_interval(
+                            sym, "1d", aligned_1d - SECONDS_1D, aligned_1d);
+
+                        if (!candles_1d.empty()) {
+                            double close_price = candles_1d.back().close;
+
+                            // 3. 이전 prev_close 조회 (변동률 계산용)
+                            double old_prev_close = valkey.get_prev_close(sym);
+
+                            // 4. Valkey prev:{symbol} 업데이트
+                            valkey.set_prev_close(sym, close_price);
+
+                            // 5. RDS symbol_prev_close 업데이트
+                            rds.update_prev_close(sym, close_price, trading_date);
+
+                            // 6. 변동률 계산 및 ranking 업데이트
+                            if (old_prev_close > 0) {
+                                double change_pct = (close_price - old_prev_close) / old_prev_close * 100.0;
+                                valkey.update_ranking(sym, change_pct);
+                                Logger::info("[DAILY-CLOSE]", sym, "close:", close_price,
+                                            "prev:", old_prev_close, "change:", change_pct, "%");
+                            } else {
+                                Logger::info("[DAILY-CLOSE]", sym, "close:", close_price, "(no prev)");
+                            }
+                        }
                     }
                     last_1d_check = aligned_1d;
                 }
