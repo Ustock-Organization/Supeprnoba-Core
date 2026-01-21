@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <chrono>
 
 namespace aws_wrapper {
 
@@ -36,6 +37,10 @@ private:
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::unordered_map<std::string, std::string> shard_iterators_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> shard_iterator_created_;
+
+    // Iterator 선제적 갱신 주기 (4분 = 240초, 만료는 5분)
+    static constexpr int ITERATOR_REFRESH_SECONDS = 240;
 };
 
 } // namespace aws_wrapper

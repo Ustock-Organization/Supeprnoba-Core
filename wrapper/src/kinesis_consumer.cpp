@@ -72,6 +72,7 @@ void KinesisConsumer::start() {
         std::string it = getShardIterator(shard.GetShardId());
         if (!it.empty()) {
             shard_iterators_[shard.GetShardId()] = it;
+            shard_iterator_created_[shard.GetShardId()] = std::chrono::steady_clock::now();
         }
     }
     
@@ -119,12 +120,31 @@ void KinesisConsumer::consumeLoop() {
         for (auto& [shard_id, iterator] : shard_iterators_) {
             if (!running_) break; // 빠른 종료를 위한 체크
 
+            // 선제적 Iterator 갱신 (만료 전 4분마다)
+            auto now = std::chrono::steady_clock::now();
+            auto created_it = shard_iterator_created_.find(shard_id);
+            if (created_it != shard_iterator_created_.end()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - created_it->second).count();
+                if (elapsed >= ITERATOR_REFRESH_SECONDS) {
+                    Logger::info("Proactive iterator refresh for", shard_id, "after", elapsed, "seconds");
+                    std::string new_iterator = getShardIterator(shard_id);
+                    if (!new_iterator.empty()) {
+                        iterator = new_iterator;
+                        shard_iterator_created_[shard_id] = now;
+                        Logger::info("Iterator proactively refreshed for", shard_id);
+                    } else {
+                        Logger::warn("Failed to proactively refresh iterator for", shard_id);
+                    }
+                }
+            }
+
             if (iterator.empty()) {
                 // 빈 iterator 즉시 갱신 시도 (지연 없음)
                 Logger::warn("Shard iterator empty for:", shard_id, "- immediate refresh");
                 std::string new_iterator = getShardIterator(shard_id);
                 if (!new_iterator.empty()) {
                     iterator = new_iterator;
+                    shard_iterator_created_[shard_id] = std::chrono::steady_clock::now();
                     Logger::info("Iterator recovered for", shard_id);
                 } else {
                     Logger::error("Failed to refresh iterator for", shard_id);
@@ -151,6 +171,7 @@ void KinesisConsumer::consumeLoop() {
                 std::string new_iterator = getShardIterator(shard_id);
                 if (!new_iterator.empty()) {
                     iterator = new_iterator;
+                    shard_iterator_created_[shard_id] = std::chrono::steady_clock::now();
                     Logger::info("Iterator refreshed after error for", shard_id);
                 } else {
                     Logger::error("Failed to refresh iterator for", shard_id);
@@ -172,6 +193,7 @@ void KinesisConsumer::consumeLoop() {
                 std::string fresh_iterator = getShardIterator(shard_id);
                 if (!fresh_iterator.empty()) {
                     iterator = fresh_iterator;
+                    shard_iterator_created_[shard_id] = std::chrono::steady_clock::now();
                     Logger::info("Iterator refreshed after empty next for", shard_id);
                 } else {
                     Logger::error("Failed to get fresh iterator for", shard_id);
