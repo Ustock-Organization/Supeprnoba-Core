@@ -115,11 +115,12 @@ int main(int argc, char* argv[]) {
         }
 
         // RankingManager 생성 (백업용 Redis 사용)
+        // 주의: 스레드 시작은 snapshot 복원 후로 지연 (RedisClient thread-safety 문제 방지)
         RankingManager ranking_manager(redis_connected ? &redis : nullptr);
         bool ranking_enabled = redis_connected;
+        // ranking_manager.startSnapshotThread()는 나중에 호출됨
         if (ranking_enabled) {
-            ranking_manager.startSnapshotThread();
-            Logger::info("RankingManager enabled (10s broadcast interval)");
+            Logger::info("RankingManager created (thread will start after snapshot restore)");
         } else {
             Logger::warn("RankingManager disabled - Redis (backup) not connected");
         }
@@ -149,6 +150,12 @@ int main(int argc, char* argv[]) {
                 }
             }
             Logger::info("Restored", restored_count, "orderbooks from Redis");
+        }
+
+        // Snapshot 복원 완료 후 RankingManager 스레드 시작 (Redis 동시 접근 방지)
+        if (ranking_enabled) {
+            ranking_manager.startSnapshotThread();
+            Logger::info("RankingManager snapshot thread started (10s interval)");
         }
 
         // === DynamoDB에서 ACCEPTED 주문 복원 ===
