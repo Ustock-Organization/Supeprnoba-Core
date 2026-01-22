@@ -1,10 +1,13 @@
 /**
- * Supernoba Market Maker Service v8
+ * Supernoba Market Maker Service v9
  *
  * Admin Panel에서 제어하는 경량 마켓메이커
  * - Redis pub/sub으로 시작/정지 신호 수신
  * - Kinesis에 주문 발행하여 실제 오더북/캔들 데이터 생성
  * - 실시간 상태를 mm:status 채널로 브로드캐스트
+ *
+ * v9 변경사항:
+ * - SELL을 먼저 발행하여 잔존 매수호가에 체결되는 문제 해결
  *
  * v8 변경사항:
  * - mm:config 키를 STRING(JSON)과 HASH 둘 다 지원 (하위 호환)
@@ -35,7 +38,7 @@ const CONFIG = {
   statusPublishInterval: 2000,  // 2초마다 상태 발행
 };
 
-console.log("=== Supernoba Market Maker Service v8 ===");
+console.log("=== Supernoba Market Maker Service v9 ===");
 console.log("Backup Cache:", CONFIG.backupCacheHost + ":" + CONFIG.backupCachePort);
 console.log("Kinesis Stream:", CONFIG.kinesisStream);
 
@@ -123,9 +126,10 @@ async function runSymbol(symbol) {
   const t = (Date.now() - instance.startedAt) / 1000;
   const price = calculatePrice(basePrice, config, t);
 
-  // BUY와 SELL 주문을 같은 가격에 발행 (자체 체결)
-  const buySuccess = await sendOrder(symbol, "BUY", price, quantity);
+  // SELL을 먼저 발행 → BUY가 방금 발행한 SELL과 체결 (잔존 매수호가에 체결 방지)
+  // Kinesis 파티션 키가 같으므로 순서 보장됨
   const sellSuccess = await sendOrder(symbol, "SELL", price, quantity);
+  const buySuccess = await sendOrder(symbol, "BUY", price, quantity);
 
   if (buySuccess && sellSuccess) {
     instance.orderCount += 2;
