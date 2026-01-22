@@ -45,18 +45,8 @@ BACKUP_CACHE_PORT="${BACKUP_CACHE_PORT:-6379}"
 DEPTH_CACHE_HOST="${DEPTH_CACHE_HOST:-supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com}"
 DEPTH_CACHE_PORT="${DEPTH_CACHE_PORT:-6379}"
 
-# RDS 환경변수 (aggregator.env 또는 secrets에서 로드)
-if [ -f "$SCRIPT_DIR/env/aggregator.env" ]; then
-    source "$SCRIPT_DIR/env/aggregator.env"
-fi
-if [ -f "$HOME/.secrets/rds.env" ]; then
-    source "$HOME/.secrets/rds.env"
-fi
-
-RDS_HOST="${RDS_HOST:-supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com}"
-RDS_PORT="${RDS_PORT:-5432}"
-RDS_DBNAME="${RDS_DBNAME:-postgres}"
-RDS_USER="${RDS_USER:-njg7194}"
+# RDS: run-sql.sh가 AWS Secrets Manager에서 자격증명을 자동으로 가져옴
+# 테이블 목록은 sql/ops/reset_platform.sql에서 중앙 관리
 
 # DynamoDB 테이블 목록
 DYNAMODB_TABLES=("supernoba-orders" "supernoba-holdings" "supernoba-wallets" "supernoba-symbols")
@@ -178,49 +168,41 @@ reset_all_dynamodb() {
 
 #===== PostgreSQL 함수 =====
 
-# PostgreSQL 테이블 행 수 조회
-count_postgres_rows() {
-    local table=$1
-    PGPASSWORD="$RDS_PASSWORD" psql \
-        -h "$RDS_HOST" \
-        -p "$RDS_PORT" \
-        -U "$RDS_USER" \
-        -d "$RDS_DBNAME" \
-        -t -c "SELECT COUNT(*) FROM $table;" 2>/dev/null | tr -d ' ' || echo "0"
-}
-
-# PostgreSQL 테이블 초기화
+# PostgreSQL 초기화 (run-sql.sh 사용)
+# 자격증명은 run-sql.sh가 AWS Secrets Manager에서 자동으로 가져옴
+# 테이블 목록은 sql/ops/reset_platform.sql에서 중앙 관리
 reset_postgresql() {
     echo ""
     echo -e "${CYAN}=== PostgreSQL Reset ===${NC}"
 
-    if [ -z "$RDS_PASSWORD" ]; then
-        log_error "RDS_PASSWORD not set. Please set it in ~/.secrets/rds.env"
+    # run-sql.sh 존재 확인
+    if [ ! -x "$SCRIPT_DIR/run-sql.sh" ]; then
+        log_error "run-sql.sh not found or not executable"
         return 1
     fi
 
-    local tables=("trade_history" "candle_history")
-
-    for table in "${tables[@]}"; do
-        local count=$(count_postgres_rows "$table")
-        log_info "$table: $count rows"
-    done
+    # reset_platform.sql 존재 확인
+    if [ ! -f "$SCRIPT_DIR/sql/ops/reset_platform.sql" ]; then
+        log_error "sql/ops/reset_platform.sql not found"
+        return 1
+    fi
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would truncate: ${tables[*]}"
+        log_info "[DRY-RUN] Would execute: run-sql.sh ops/reset_platform.sql"
+        log_info "Tables to truncate: market_maker_configs, trade_history, candle_history,"
+        log_info "                    daily_ohlc_summary, symbol_prev_close, active_symbols,"
+        log_info "                    daily_close_job_log"
         return 0
     fi
 
     if $CONFIRMED; then
-        log_info "Truncating PostgreSQL tables..."
-        PGPASSWORD="$RDS_PASSWORD" psql \
-            -h "$RDS_HOST" \
-            -p "$RDS_PORT" \
-            -U "$RDS_USER" \
-            -d "$RDS_DBNAME" \
-            -c "TRUNCATE TABLE trade_history, candle_history CASCADE;" 2>/dev/null
-
-        log_success "PostgreSQL tables truncated"
+        log_info "Executing SQL reset via run-sql.sh..."
+        if "$SCRIPT_DIR/run-sql.sh" ops/reset_platform.sql; then
+            log_success "PostgreSQL tables truncated"
+        else
+            log_error "PostgreSQL reset failed"
+            return 1
+        fi
     fi
 }
 
