@@ -197,8 +197,7 @@ Candle ValkeyClient::get_active_candle(const std::string& symbol) {
             else if (field == "l") c.low = std::stod(value);
             else if (field == "c") c.close = std::stod(value);
             else if (field == "v") c.volume = std::stod(value);
-            // t_epoch 필드는 현재 Candle 구조체에 없으므로 무시
-            // 나중에 구조체에 epoch 필드 추가 시 활용 가능
+            else if (field == "t_epoch") c.cached_epoch = std::stoll(value);
         }
     }
     freeReplyObject(reply);
