@@ -18,11 +18,12 @@ RedisClient::~RedisClient() {
 bool RedisClient::connect() {
     if (context_) {
         redisFree(context_);
+        context_ = nullptr;
     }
-    
+
     struct timeval timeout = {1, 500000};  // 1.5초
     context_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
-    
+
     if (context_ == nullptr || context_->err) {
         if (context_) {
             Logger::error("Redis connection failed:", context_->errstr);
@@ -31,57 +32,251 @@ bool RedisClient::connect() {
         } else {
             Logger::error("Redis connection failed: can't allocate context");
         }
+        state_ = ConnectionState::DISCONNECTED;
         return false;
     }
-    
+
     Logger::info("Redis connected to:", host_, ":", port_);
+    state_ = ConnectionState::CONNECTED;
+    current_reconnect_attempts_ = 0;  // Reset on successful connection
+    last_health_check_ = std::chrono::steady_clock::now();
     return true;
 }
 
-bool RedisClient::set(const std::string& key, const std::string& value) {
-    if (!context_) return false;
-    
-    auto reply = static_cast<redisReply*>(
-        redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
-    
-    if (!reply) {
-        Logger::error("Redis SET failed:", context_->errstr);
+// === Connection Management Methods ===
+
+void RedisClient::setAutoReconnect(bool enabled) {
+    auto_reconnect_enabled_ = enabled;
+    Logger::info("Redis auto-reconnect:", enabled ? "enabled" : "disabled");
+}
+
+void RedisClient::setMaxReconnectAttempts(int attempts) {
+    max_reconnect_attempts_ = attempts;
+    Logger::info("Redis max reconnect attempts set to:", attempts);
+}
+
+void RedisClient::setReconnectDelay(int initial_ms, int max_ms) {
+    reconnect_delay_ms_ = initial_ms;
+    max_reconnect_delay_ms_ = max_ms;
+    Logger::info("Redis reconnect delay:", initial_ms, "ms to", max_ms, "ms");
+}
+
+void RedisClient::setHealthCheckInterval(int interval_ms) {
+    health_check_interval_ms_ = interval_ms;
+    Logger::info("Redis health check interval:", interval_ms, "ms");
+}
+
+bool RedisClient::isHealthy() {
+    if (!context_) {
         return false;
     }
-    
+    return performHealthCheck();
+}
+
+int RedisClient::calculateBackoffDelay() {
+    if (current_reconnect_attempts_ == 0) {
+        return 0;  // First attempt - no delay
+    }
+
+    // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, ...
+    int delay = reconnect_delay_ms_ * (1 << (current_reconnect_attempts_ - 1));
+    return std::min(delay, max_reconnect_delay_ms_);
+}
+
+void RedisClient::markDisconnected() {
+    if (state_ == ConnectionState::CONNECTED) {
+        Logger::warn("Redis connection lost - marking disconnected");
+        state_ = ConnectionState::DISCONNECTED;
+    }
+
+    if (context_) {
+        redisFree(context_);
+        context_ = nullptr;
+    }
+}
+
+bool RedisClient::attemptReconnect() {
+    auto now = std::chrono::steady_clock::now();
+
+    // Check if circuit breaker is open
+    if (state_ == ConnectionState::CIRCUIT_OPEN) {
+        auto time_since_circuit_opened =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - circuit_breaker_opened_at_).count();
+
+        if (time_since_circuit_opened < circuit_breaker_timeout_ms_) {
+            return false;  // Circuit still open
+        }
+
+        // Close circuit and retry
+        Logger::info("Redis circuit breaker closed - attempting reconnect");
+        state_ = ConnectionState::DISCONNECTED;
+        current_reconnect_attempts_ = 0;
+    }
+
+    // Calculate backoff delay
+    int backoff_delay = calculateBackoffDelay();
+
+    // Check if enough time has passed since last attempt
+    auto time_since_last_attempt =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_reconnect_attempt_).count();
+
+    if (time_since_last_attempt < backoff_delay) {
+        return false;  // Too soon to retry
+    }
+
+    // Check if we've exceeded max attempts
+    if (current_reconnect_attempts_ >= max_reconnect_attempts_) {
+        Logger::warn("Redis reconnect attempts exceeded - opening circuit breaker for",
+                     circuit_breaker_timeout_ms_, "ms");
+        state_ = ConnectionState::CIRCUIT_OPEN;
+        circuit_breaker_opened_at_ = now;
+        return false;
+    }
+
+    // Attempt reconnection
+    last_reconnect_attempt_ = now;
+    current_reconnect_attempts_++;
+
+    Logger::info("Redis reconnect attempt", current_reconnect_attempts_, "/",
+                 max_reconnect_attempts_, "after", backoff_delay, "ms backoff");
+
+    bool success = connect();
+
+    if (success) {
+        Logger::info("Redis reconnected successfully after", current_reconnect_attempts_, "attempts");
+        return true;
+    } else {
+        Logger::warn("Redis reconnect failed, attempt", current_reconnect_attempts_);
+        return false;
+    }
+}
+
+bool RedisClient::isHealthCheckDue() {
+    auto now = std::chrono::steady_clock::now();
+    auto time_since_check =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_health_check_).count();
+    return time_since_check >= health_check_interval_ms_;
+}
+
+bool RedisClient::performHealthCheck() {
+    last_health_check_ = std::chrono::steady_clock::now();
+
+    if (!context_) {
+        return false;
+    }
+
+    // Use PING command for health check
+    auto reply = static_cast<redisReply*>(redisCommand(context_, "PING"));
+
+    if (!reply) {
+        Logger::warn("Redis health check failed - connection appears dead:",
+                     context_->errstr);
+        markDisconnected();
+        return false;
+    }
+
+    bool healthy = (reply->type == REDIS_REPLY_STATUS &&
+                    std::string(reply->str) == "PONG");
+    freeReplyObject(reply);
+
+    if (!healthy) {
+        Logger::warn("Redis health check failed - unexpected PING response");
+        markDisconnected();
+        return false;
+    }
+
+    return true;
+}
+
+bool RedisClient::ensureConnection() {
+    // If already connected and healthy, do nothing
+    if (context_ && state_ == ConnectionState::CONNECTED) {
+        // Periodic health check
+        if (isHealthCheckDue()) {
+            if (!performHealthCheck()) {
+                // Health check failed, will try to reconnect below
+                Logger::warn("Redis health check failed during ensureConnection");
+            } else {
+                return true;  // Healthy connection
+            }
+        } else {
+            return true;  // Skip health check, assume connected
+        }
+    }
+
+    // If disconnected and auto-reconnect enabled, try to reconnect
+    if (!context_ && auto_reconnect_enabled_) {
+        return attemptReconnect();
+    }
+
+    return context_ != nullptr;
+}
+
+bool RedisClient::set(const std::string& key, const std::string& value) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis SET failed:", context_->errstr);
+        markDisconnected();
+
+        // Try one immediate reconnect
+        if (auto_reconnect_enabled_ && attemptReconnect()) {
+            reply = static_cast<redisReply*>(
+                redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
+            if (reply) {
+                bool success = (reply->type != REDIS_REPLY_ERROR);
+                freeReplyObject(reply);
+                return success;
+            }
+        }
+        return false;
+    }
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;
 }
 
-bool RedisClient::setEx(const std::string& key, const std::string& value, 
+bool RedisClient::setEx(const std::string& key, const std::string& value,
                          int ttl_seconds) {
-    if (!context_) return false;
-    
+    if (!ensureConnection()) return false;
+
     auto reply = static_cast<redisReply*>(
-        redisCommand(context_, "SETEX %s %d %s", 
+        redisCommand(context_, "SETEX %s %d %s",
                      key.c_str(), ttl_seconds, value.c_str()));
-    
-    if (!reply) return false;
-    
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;
 }
 
 std::optional<std::string> RedisClient::get(const std::string& key) {
-    if (!context_) return std::nullopt;
-    
+    if (!ensureConnection()) return std::nullopt;
+
     auto reply = static_cast<redisReply*>(
         redisCommand(context_, "GET %s", key.c_str()));
-    
-    if (!reply) return std::nullopt;
-    
+
+    if (!reply) {
+        markDisconnected();
+        return std::nullopt;
+    }
+
     std::optional<std::string> result;
     if (reply->type == REDIS_REPLY_STRING) {
         result = std::string(reply->str, reply->len);
     }
-    
+
     freeReplyObject(reply);
     return result;
 }
@@ -153,16 +348,17 @@ std::vector<std::string> RedisClient::keys(const std::string& pattern) {
 }
 
 bool RedisClient::lpush(const std::string& key, const std::string& value) {
-    if (!context_) return false;
-    
+    if (!ensureConnection()) return false;
+
     auto reply = static_cast<redisReply*>(
         redisCommand(context_, "LPUSH %s %s", key.c_str(), value.c_str()));
-    
+
     if (!reply) {
         Logger::error("Redis LPUSH failed:", context_->errstr);
+        markDisconnected();
         return false;
     }
-    
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;
@@ -379,13 +575,16 @@ long long RedisClient::publish(const std::string& channel, const std::string& me
 // === Hash 연산 (캔들용) ===
 
 bool RedisClient::hset(const std::string& key, const std::string& field, const std::string& value) {
-    if (!context_) return false;
-    
+    if (!ensureConnection()) return false;
+
     auto reply = static_cast<redisReply*>(
         redisCommand(context_, "HSET %s %s %s", key.c_str(), field.c_str(), value.c_str()));
-    
-    if (!reply) return false;
-    
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;

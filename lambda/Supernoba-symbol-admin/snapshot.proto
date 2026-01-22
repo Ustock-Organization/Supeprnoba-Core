@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package aws_wrapper;
+
+service SnapshotService {
+    // 오더북 스냅샷 생성
+    rpc CreateSnapshot(SnapshotRequest) returns (SnapshotResponse);
+    
+    // 오더북 복원
+    rpc RestoreSnapshot(RestoreRequest) returns (RestoreResponse);
+    
+    // 오더북 제거 (마이그레이션 완료 후)
+    rpc RemoveOrderBook(RemoveRequest) returns (RemoveResponse);
+    
+    // 헬스체크
+    rpc HealthCheck(Empty) returns (HealthResponse);
+}
+
+message SnapshotRequest {
+    string symbol = 1;
+}
+
+message SnapshotResponse {
+    bool success = 1;
+    string data = 2;  // JSON 직렬화된 오더북
+    string error = 3;
+}
+
+message RestoreRequest {
+    string symbol = 1;
+    string data = 2;
+}
+
+message RestoreResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RemoveRequest {
+    string symbol = 1;
+}
+
+message RemoveResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message Empty {}
+
+message HealthResponse {
+    bool healthy = 1;
+    int64 uptime_seconds = 2;
+    int32 symbol_count = 3;
+    int64 orders_processed = 4;
+    int64 trades_executed = 5;
+}

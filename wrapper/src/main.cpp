@@ -14,6 +14,7 @@
 
 #include <iostream>
 #include <csignal>
+#include <set>
 #include <nlohmann/json.hpp>
 #include <aws/core/Aws.h>
 
@@ -142,16 +143,35 @@ int main(int argc, char* argv[]) {
         EngineCore engine(&handler);
         
         // === 시작 시 Redis에서 스냅샷 복원 ===
+        // 먼저 deleted:symbols 로드 (상장폐지된 종목 필터링용)
+        std::set<std::string> deleted_symbols;
+        if (redis_connected) {
+            auto deleted_vec = redis.smembers("deleted:symbols");
+            deleted_symbols = std::set<std::string>(deleted_vec.begin(), deleted_vec.end());
+            if (!deleted_symbols.empty()) {
+                Logger::info("Loaded", deleted_symbols.size(), "deleted symbols to filter");
+            }
+        }
+
         if (redis_connected) {
             Logger::info("Restoring snapshots from Redis...");
             auto snapshot_keys = redis.keys("snapshot:*");
             int restored_count = 0;
+            int skipped_deleted = 0;
             for (const auto& key : snapshot_keys) {
                 // :timestamp 키는 제외 (타임스탬프 메타데이터)
                 if (key.find(":timestamp") != std::string::npos) {
                     continue;
                 }
                 std::string symbol = key.substr(9);  // "snapshot:" 제거
+
+                // 삭제된 종목은 스킵
+                if (deleted_symbols.count(symbol) > 0) {
+                    Logger::warn("Skipping deleted symbol snapshot:", symbol);
+                    ++skipped_deleted;
+                    continue;
+                }
+
                 auto snapshot_data = redis.get(key);
                 if (snapshot_data.has_value()) {
                     engine.restoreOrderBook(symbol, snapshot_data.value());
@@ -159,7 +179,7 @@ int main(int argc, char* argv[]) {
                     ++restored_count;
                 }
             }
-            Logger::info("Restored", restored_count, "orderbooks from Redis");
+            Logger::info("Restored", restored_count, "orderbooks from Redis (skipped", skipped_deleted, "deleted)");
         }
 
         // Snapshot 복원 완료 후 RankingManager 스레드 시작 (Redis 동시 접근 방지)
@@ -192,8 +212,15 @@ int main(int argc, char* argv[]) {
 
                 int added_count = 0;
                 int skipped_count = 0;
+                int skipped_deleted = 0;
 
                 for (const auto& order : accepted_orders) {
+                    // 삭제된 종목의 주문은 스킵
+                    if (deleted_symbols.count(order->symbol()) > 0) {
+                        ++skipped_deleted;
+                        continue;
+                    }
+
                     // 이미 오더북에 있는 주문은 스킵 (스냅샷에서 복원된 경우)
                     if (engine.hasOrder(order->symbol(), order->order_id())) {
                         ++skipped_count;
@@ -212,7 +239,8 @@ int main(int argc, char* argv[]) {
                 }
 
                 Logger::info("DynamoDB order restore complete: added=", added_count,
-                            ", skipped (already in snapshot)=", skipped_count);
+                            ", skipped (snapshot)=", skipped_count,
+                            ", skipped (deleted)=", skipped_deleted);
             } else {
                 Logger::warn("DynamoDB client initialization failed - skipping order restore");
             }

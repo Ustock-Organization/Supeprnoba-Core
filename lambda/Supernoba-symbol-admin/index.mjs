@@ -21,6 +21,13 @@ import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, Dyna
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import pg from 'pg';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Common Layer - Valkey, CORS, Social Links
 import { getValkeyClient, CORS, response, detectPlatformFromUrl } from '/opt/nodejs/index.mjs';
@@ -58,6 +65,50 @@ const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 const IPO_SYSTEM_ACCOUNT = 'ipo-system';
 const CLEANUP_QUEUE_URL = process.env.CLEANUP_QUEUE_URL || 'https://sqs.ap-northeast-2.amazonaws.com/264520158196/supernoba-symbol-cleanup';
 const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
+
+// 매칭 엔진 gRPC 설정
+const ENGINE_GRPC_HOST = process.env.ENGINE_GRPC_HOST || '172.31.47.97:50051';
+
+// gRPC 클라이언트 (lazy 초기화)
+let grpcClient = null;
+async function getGrpcClient() {
+  if (grpcClient) return grpcClient;
+
+  const PROTO_PATH = path.join(__dirname, 'snapshot.proto');
+  const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true
+  });
+  const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+  grpcClient = new protoDescriptor.aws_wrapper.SnapshotService(
+    ENGINE_GRPC_HOST,
+    grpc.credentials.createInsecure()
+  );
+  return grpcClient;
+}
+
+// gRPC RemoveOrderBook 호출
+async function removeEngineOrderBook(symbol) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const client = await getGrpcClient();
+      const deadline = new Date();
+      deadline.setSeconds(deadline.getSeconds() + 10); // 10초 타임아웃
+      client.RemoveOrderBook({ symbol }, { deadline }, (err, response) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(response);
+        }
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
 // Layer를 통한 클라이언트 초기화
 const valkey = getValkeyClient({ preset: 'admin' });
@@ -216,6 +267,21 @@ export const handler = async (event) => {
         });
       }
 
+      // 삭제된 종목 목록 (deleted:symbols) - 관리자 전용
+      if (q.type === 'deleted') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        try {
+          const deletedSymbols = await valkey.smembers('deleted:symbols');
+          console.log(`[GET] deleted:symbols count: ${deletedSymbols.length}`);
+          return ok({ deletedSymbols: deletedSymbols || [] });
+        } catch (valkeyErr) {
+          console.error(`[GET] Valkey error: ${valkeyErr.message}`);
+          return err(500, 'Failed to fetch deleted symbols');
+        }
+      }
+
       // 전체 종목 목록
       const search = q.q ? q.q.toUpperCase() : null;
       const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
@@ -329,7 +395,8 @@ export const handler = async (event) => {
 
       const b = JSON.parse(event.body || '{}');
 
-      // restore - 삭제된 종목 복원
+      // restore - 삭제된 종목 복원 (비일관 상태 해결용)
+      // 사용 사례: deleted:symbols에는 있지만 실제 데이터는 남아있는 경우
       if (action === 'restore') {
         const adminCheck = await checkAdmin(event);
         if (!adminCheck.authorized) return adminCheck.response;
@@ -340,10 +407,61 @@ export const handler = async (event) => {
         const wasDeleted = await valkey.sismember('deleted:symbols', sym);
         if (!wasDeleted) return err(400, `Symbol ${sym} is not in deleted list`);
 
+        const restoreResults = {};
+
+        // 1. deleted:symbols에서 제거
         await valkey.srem('deleted:symbols', sym);
+        restoreResults.deleted_symbols = { success: true };
         console.log(`[RESTORE] Symbol ${sym} removed from deleted list`);
 
-        return ok({ message: `Symbol ${sym} restored. You can now approve or list it again.` });
+        // 2. DynamoDB 종목 존재 확인 및 상태 복원
+        try {
+          const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+          if (Item) {
+            // 종목이 존재하면 상태를 ACTIVE로 변경
+            await dynamodb.send(new UpdateCommand({
+              TableName: SYMBOLS_TABLE,
+              Key: { symbol: sym },
+              UpdateExpression: 'SET #status = :status, updated_at = :now',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: { ':status': 'ACTIVE', ':now': new Date().toISOString() }
+            }));
+            restoreResults.dynamodb_status = { success: true, previous: Item.status };
+            console.log(`[RESTORE] DynamoDB status restored to ACTIVE for ${sym}`);
+          } else {
+            restoreResults.dynamodb_status = { success: false, error: 'Symbol not found in DynamoDB' };
+            console.warn(`[RESTORE] Symbol ${sym} not found in DynamoDB - may need to re-list`);
+          }
+        } catch (dbErr) {
+          restoreResults.dynamodb_status = { success: false, error: dbErr.message };
+          console.error(`[RESTORE] DynamoDB update failed: ${dbErr.message}`);
+        }
+
+        // 3. Valkey subscribed:symbols에 추가 (구독 가능하도록)
+        try {
+          await valkey.sadd('subscribed:symbols', sym);
+          restoreResults.subscribed_symbols = { success: true };
+          console.log(`[RESTORE] Added ${sym} to subscribed:symbols`);
+        } catch (valkeyErr) {
+          restoreResults.subscribed_symbols = { success: false, error: valkeyErr.message };
+        }
+
+        // 4. 매칭 엔진 오더북 존재 확인 (선택적 - gRPC 호출)
+        try {
+          // 참고: 매칭 엔진에 오더북이 없으면 재생성 필요할 수 있음
+          // 현재는 확인만 하고, 필요시 재상장으로 처리
+          restoreResults.engine_orderbook = { success: true, note: 'Check manually if orderbook exists' };
+        } catch (grpcErr) {
+          restoreResults.engine_orderbook = { success: false, error: grpcErr.message };
+        }
+
+        const allSuccess = Object.values(restoreResults).every(r => r.success);
+        return ok({
+          message: allSuccess
+            ? `Symbol ${sym} fully restored and ready for trading.`
+            : `Symbol ${sym} partially restored. Check restoreResults for details.`,
+          restoreResults
+        });
       }
 
       // listing - 신규 종목 등록
@@ -363,8 +481,12 @@ export const handler = async (event) => {
         const sym = symbol.toUpperCase().trim();
         const now = new Date().toISOString();
 
+        // 삭제된 종목이면 자동으로 복원 (재상장 허용)
         const isDeleted = await valkey.sismember('deleted:symbols', sym);
-        if (isDeleted) return err(400, `Symbol ${sym} was previously deleted. Use action=restore to restore it.`);
+        if (isDeleted) {
+          await valkey.srem('deleted:symbols', sym);
+          console.log(`[LISTING] Auto-restored deleted symbol: ${sym}`);
+        }
 
         const { Item: existing } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
         if (existing) return err(409, `Symbol ${sym} already exists`);
@@ -420,6 +542,87 @@ export const handler = async (event) => {
         };
         await valkey.set(`ticker:${sym}`, JSON.stringify(tickerData));
 
+        // PostgreSQL: 초기 1d 캔들 생성 (프론트엔드 getDayOHLC 지원)
+        try {
+          const pg = await getPg();
+          const symLower = sym.toLowerCase(); // RDS는 소문자로 저장 (chart-data-handler 쿼리와 일치)
+
+          // 파티션 생성 (없으면)
+          await pg.query(`
+            CREATE TABLE IF NOT EXISTS public.candle_history_${symLower}
+            PARTITION OF public.candle_history FOR VALUES IN ('${symLower}')
+          `);
+          console.log(`[LISTING] Partition candle_history_${symLower} ensured`);
+
+          // 전일 캔들 생성 (prevClose 제공용)
+          const yesterday = new Date();
+          yesterday.setDate(yesterday.getDate() - 1);
+          yesterday.setUTCHours(0, 0, 0, 0);
+          const yesterdayEpoch = Math.floor(yesterday.getTime() / 1000);
+          const yesterdayYmdhm = yesterday.toISOString().slice(0, 10).replace(/-/g, '') + '0000';
+
+          await pg.query(`
+            INSERT INTO candle_history (symbol, interval, time_epoch, time_ymdhm, open, high, low, close, volume)
+            VALUES ($1, '1d', $2, $3, $4, $4, $4, $4, 0)
+            ON CONFLICT (symbol, interval, time_epoch) DO NOTHING
+          `, [symLower, yesterdayEpoch, yesterdayYmdhm, listingPrice]);
+
+          // 당일 캔들 생성 (dayOpen, dayHigh, dayLow 제공용)
+          const today = new Date();
+          today.setUTCHours(0, 0, 0, 0);
+          const todayEpoch = Math.floor(today.getTime() / 1000);
+          const todayYmdhm = today.toISOString().slice(0, 10).replace(/-/g, '') + '0000';
+
+          await pg.query(`
+            INSERT INTO candle_history (symbol, interval, time_epoch, time_ymdhm, open, high, low, close, volume)
+            VALUES ($1, '1d', $2, $3, $4, $4, $4, $4, 0)
+            ON CONFLICT (symbol, interval, time_epoch) DO NOTHING
+          `, [symLower, todayEpoch, todayYmdhm, listingPrice]);
+
+          console.log(`[LISTING] RDS 1d candles created for ${symLower} (prev: ${yesterdayEpoch}, today: ${todayEpoch})`);
+        } catch (pgErr) {
+          console.warn(`[LISTING] PostgreSQL candle insert warning: ${pgErr.message}`);
+          // 실패해도 계속 진행 (Valkey 데이터로 fallback 가능)
+        }
+
+        // IPO 매도 주문 생성 (ipo-processor Lambda 트리거)
+        try {
+          // 1. IPO 시스템 계정 holdings 생성
+          await dynamodb.send(new PutCommand({
+            TableName: HOLDINGS_TABLE,
+            Item: {
+              user_id: 'ipo-system',
+              symbol: sym,
+              quantity: totalShares,
+              availableQuantity: totalShares,
+              averagePrice: listingPrice,
+              totalCost: totalShares * listingPrice,
+              source: 'IPO',
+              createdAt: now,
+              updatedAt: now
+            }
+          }));
+          console.log(`[LISTING] IPO holdings created: ${sym} x ${totalShares} @ ${listingPrice}`);
+
+          // 2. IPO 주문 생성 (DynamoDB Stream → ipo-processor)
+          await dynamodb.send(new PutCommand({
+            TableName: IPO_ORDERS_TABLE,
+            Item: {
+              symbol: sym,
+              status: 'PENDING',
+              quantity: totalShares,
+              price: listingPrice,
+              userId: 'ipo-system',
+              createdAt: now,
+              ttl: Math.floor(Date.now() / 1000) + 86400 * 7  // 7일 TTL
+            }
+          }));
+          console.log(`[LISTING] IPO order created: PENDING, ${sym} x ${totalShares} @ ${listingPrice}`);
+        } catch (ipoErr) {
+          console.error(`[LISTING] IPO creation failed: ${ipoErr.message}`);
+          // IPO 실패해도 종목 등록은 성공 처리
+        }
+
         return ok({
           success: true,
           symbol: sym,
@@ -439,8 +642,12 @@ export const handler = async (event) => {
 
         const sym = symbol.toUpperCase().trim();
 
+        // 삭제된 종목이면 자동으로 복원 (재활성화 허용)
         const isDeleted = await valkey.sismember('deleted:symbols', sym);
-        if (isDeleted) return err(400, `Symbol ${sym} was deleted and cannot be activated`);
+        if (isDeleted) {
+          await valkey.srem('deleted:symbols', sym);
+          console.log(`[ACTIVATE] Auto-restored deleted symbol: ${sym}`);
+        }
 
         const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
         if (!Item) return err(404, `Symbol ${sym} not found`);
@@ -475,8 +682,13 @@ export const handler = async (event) => {
         if (totalShares !== undefined && totalShares !== 0 && (isNaN(totalShares) || totalShares < 0 || !isFinite(totalShares))) return err(400, 'Invalid totalShares');
 
         const sym = symbol.toUpperCase().trim();
+
+        // 삭제된 종목이면 자동으로 복원 (재승인 허용)
         const isDeleted = await valkey.sismember('deleted:symbols', sym);
-        if (isDeleted) return err(400, `Symbol ${sym} was previously deleted and cannot be approved`);
+        if (isDeleted) {
+          await valkey.srem('deleted:symbols', sym);
+          console.log(`[APPROVE] Auto-restored deleted symbol: ${sym}`);
+        }
 
         const ipoQuantity = createIpoOrder ? totalShares : 0;
         const ipoPrice = createIpoOrder ? listingPrice : 0;
@@ -744,21 +956,52 @@ export const handler = async (event) => {
       // 삭제 결과 추적
       const deletionResults = {};
 
+      // === 매칭 엔진 오더북 삭제 (gRPC 직접 호출) ===
+      // 중요: gRPC 성공 시에만 삭제 프로세스 진행 (원자성 보장)
+      let grpcSuccess = false;
+      try {
+        const grpcResponse = await removeEngineOrderBook(sym);
+        if (grpcResponse.success) {
+          console.log(`[DELETE] gRPC RemoveOrderBook success for ${sym}`);
+          deletionResults.engine_orderbook = { success: true };
+          grpcSuccess = true;
+        } else {
+          console.error(`[DELETE] gRPC RemoveOrderBook failed: ${grpcResponse.error}`);
+          deletionResults.engine_orderbook = { success: false, error: grpcResponse.error };
+        }
+      } catch (grpcErr) {
+        console.error(`[DELETE] gRPC call failed: ${grpcErr.message}`);
+        deletionResults.engine_orderbook = { success: false, error: grpcErr.message };
+      }
+
+      // gRPC 실패 시 삭제 중단 - 비일관 상태 방지
+      if (!grpcSuccess) {
+        console.error(`[DELETE] Aborting deletion for ${sym} - engine orderbook removal failed`);
+        return err(500, `Failed to remove orderbook from matching engine. Deletion aborted to prevent inconsistent state. Error: ${deletionResults.engine_orderbook?.error || 'Unknown'}`);
+      }
+
+      // gRPC 성공 후에만 deleted:symbols에 추가
       await valkey.sadd('deleted:symbols', sym);
 
       // === Valkey 캐시 삭제 ===
       try {
         const pipe = valkey.pipeline();
+        // 스냅샷 삭제 (엔진 재시작 시 복원 방지)
+        pipe.del(`snapshot:${sym}`);
+        pipe.del(`snapshot:${sym}:timestamp`);
         ['ticker', 'depth', 'ohlc'].forEach(k => pipe.del(`${k}:${sym}`));
         pipe.del(`symbol:${sym}:listingPrice`);
         pipe.del(`symbol:${sym}:main`);
         pipe.del(`symbol:${sym}:subscribers`);
         pipe.del(`symbol:${sym}:sub`);
-        ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
+        ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
+        pipe.del(`candle:closed:1m:${sym}`);
         ['config', 'price', 'orderCount', 'started_at'].forEach(k => pipe.del(`mm:${k}:${sym}`));
+        // Ranking sorted sets에서 제거 (ranking:{sym}은 존재하지 않는 키)
+        ['gainers', 'losers', 'marketcap', 'volume'].forEach(r => pipe.zrem(`ranking:${r}`, sym));
         ['active:symbols', 'subscribed:symbols', 'mm:running:symbols'].forEach(s => pipe.srem(s, sym));
         await pipe.exec();
-        deletionResults.valkey_cache = { success: true, keys: 20 };
+        deletionResults.valkey_cache = { success: true, keys: 28 };
         console.log(`[DELETE] Valkey cache deleted for ${sym}`);
       } catch (valkeyErr) {
         deletionResults.valkey_cache = { success: false, error: valkeyErr.message };

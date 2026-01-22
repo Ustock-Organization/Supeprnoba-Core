@@ -71,6 +71,7 @@ VALKEY_KEY_PATTERNS=(
     "user:*"
     "ws:*"
     "symbol:*"
+    "active:symbols"
     "subscribed:symbols"
     "deleted:symbols"
     # 백업 관련 키

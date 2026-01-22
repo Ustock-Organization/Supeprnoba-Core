@@ -9,6 +9,8 @@
     "@aws-sdk/client-secrets-manager": "^3.624.0",
     "@aws-sdk/client-sqs": "^3.624.0",
     "@aws-sdk/lib-dynamodb": "^3.624.0",
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.0",
     "ioredis": "^5.4.1",
     "pg": "^8.12.0"
   }
