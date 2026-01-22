@@ -10,28 +10,57 @@ using json = nlohmann::json;
 
 namespace aggregator {
 
-// YYYYMMDDHHmm → epoch 초 변환 (KST 기준)
+// 타임존 독립적 YYYYMMDDHHmm (KST) → UTC epoch 변환
+// mktime()은 시스템 타임존에 의존하므로 수동 계산
+int64_t Candle::ymdhm_to_utc_epoch(const std::string& ymdhm_kst) {
+    if (ymdhm_kst.empty() || ymdhm_kst.length() < 12) return 0;
+
+    try {
+        int year = std::stoi(ymdhm_kst.substr(0, 4));
+        int month = std::stoi(ymdhm_kst.substr(4, 2));
+        int day = std::stoi(ymdhm_kst.substr(6, 2));
+        int hour = std::stoi(ymdhm_kst.substr(8, 2));
+        int min = std::stoi(ymdhm_kst.substr(10, 2));
+
+        // 1970년부터 일수 계산 (타임존 독립)
+        int64_t days = 0;
+        for (int y = 1970; y < year; ++y) {
+            bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            days += leap ? 366 : 365;
+        }
+
+        // 해당 년도의 월까지 일수
+        static const int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+        for (int m = 1; m < month; ++m) {
+            days += days_in_month[m - 1];
+            if (m == 2 && leap) days += 1;
+        }
+
+        // 해당 월의 일수
+        days += day - 1;
+
+        // 초로 변환 (KST 기준)
+        int64_t kst_epoch = days * 86400 + hour * 3600 + min * 60;
+
+        // KST → UTC 변환 (9시간 차감)
+        const int64_t KST_OFFSET = 9 * 3600;
+        return kst_epoch - KST_OFFSET;
+    } catch (const std::exception& e) {
+        Logger::warn("ymdhm_to_utc_epoch parse error:", e.what(), "input:", ymdhm_kst);
+        return 0;
+    }
+}
+
+// epoch 반환 (cached_epoch 우선, 없으면 수동 계산)
 int64_t Candle::epoch() const {
-    if (time.empty() || time.length() < 12) return 0;
-    
-    struct tm tm = {};
-    tm.tm_year = std::stoi(time.substr(0, 4)) - 1900;
-    tm.tm_mon = std::stoi(time.substr(4, 2)) - 1;
-    tm.tm_mday = std::stoi(time.substr(6, 2));
-    tm.tm_hour = std::stoi(time.substr(8, 2));
-    tm.tm_min = std::stoi(time.substr(10, 2));
-    tm.tm_sec = 0;
-    tm.tm_isdst = -1;  // DST 정보 없음
-    
-    // mktime()은 시스템 로컬 타임존을 사용하므로,
-    // 서버가 UTC라면 KST 시간을 UTC로 잘못 해석함
-    // 따라서 9시간을 빼서 올바른 UTC epoch를 얻음
-    // 예: KST "202512171700" → mktime()은 UTC 17:00로 해석 → 9시간 빼면 UTC 08:00 (정확)
-    time_t local_epoch = mktime(&tm);
-    
-    // KST = UTC + 9시간이므로, KST 시간에서 9시간을 빼야 UTC epoch가 됨
-    const int64_t KST_OFFSET = 9 * 3600;  // 9시간 (초)
-    return static_cast<int64_t>(local_epoch) - KST_OFFSET;
+    // Engine에서 전달된 t_epoch 우선 사용
+    if (cached_epoch > 0) {
+        return cached_epoch;
+    }
+
+    // 폴백: 타임존 독립 수동 계산
+    return ymdhm_to_utc_epoch(time);
 }
 
 ValkeyClient::ValkeyClient(const std::string& host, int port)
@@ -123,12 +152,16 @@ std::vector<Candle> ValkeyClient::get_closed_candles(const std::string& symbol) 
                 c.low = get_double(j, "l");
                 c.close = get_double(j, "c");
                 c.volume = get_double(j, "v");
-                
-                // t_epoch 필드가 있으면 사용 (성능 최적화)
-                // 없으면 epoch() 메서드로 변환 (하위 호환성)
-                // 현재는 epoch() 메서드 사용하므로 t_epoch는 무시해도 됨
-                // 하지만 나중에 Candle 구조체에 epoch 필드 추가 시 활용 가능
-                
+
+                // t_epoch 필드 파싱 (Engine에서 전달된 UTC epoch)
+                if (j.contains("t_epoch")) {
+                    if (j["t_epoch"].is_number()) {
+                        c.cached_epoch = j["t_epoch"].get<int64_t>();
+                    } else if (j["t_epoch"].is_string()) {
+                        c.cached_epoch = std::stoll(j["t_epoch"].get<std::string>());
+                    }
+                }
+
                 if (!c.time.empty()) {
                     candles.push_back(c);
                 }
@@ -295,6 +328,15 @@ std::vector<Candle> ValkeyClient::pop_closed_candles(const std::string& symbol, 
                 c.low = get_double(j, "l");
                 c.close = get_double(j, "c");
                 c.volume = get_double(j, "v");
+
+                // t_epoch 필드 파싱 (Engine에서 전달된 UTC epoch)
+                if (j.contains("t_epoch")) {
+                    if (j["t_epoch"].is_number()) {
+                        c.cached_epoch = j["t_epoch"].get<int64_t>();
+                    } else if (j["t_epoch"].is_string()) {
+                        c.cached_epoch = std::stoll(j["t_epoch"].get<std::string>());
+                    }
+                }
 
                 if (!c.time.empty()) {
                     candles.push_back(c);

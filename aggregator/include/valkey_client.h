@@ -11,14 +11,18 @@ namespace aggregator {
 
 struct Candle {
     std::string symbol;
-    std::string time;      // YYYYMMDDHHmm 형식
+    std::string time;      // YYYYMMDDHHmm 형식 (KST)
     double open;
     double high;
     double low;
     double close;
     double volume;
-    
-    int64_t epoch() const;  // epoch 초 변환
+    int64_t cached_epoch = 0;  // Engine에서 전달된 t_epoch (UTC)
+
+    int64_t epoch() const;  // epoch 초 변환 (UTC)
+
+    // 타임존 독립적 epoch 계산 (static helper)
+    static int64_t ymdhm_to_utc_epoch(const std::string& ymdhm_kst);
 };
 
 class ValkeyClient {

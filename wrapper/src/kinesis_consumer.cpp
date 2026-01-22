@@ -1,4 +1,5 @@
 #include "kinesis_consumer.h"
+#include "checkpoint_manager.h"
 #include "logger.h"
 #include "config.h"
 #include <aws/core/Aws.h>
@@ -13,14 +14,14 @@ namespace aws_wrapper {
 KinesisConsumer::KinesisConsumer(const std::string& stream_name,
                                   const std::string& region)
     : stream_name_(stream_name), region_(region) {
-    
+
     Aws::Client::ClientConfiguration config;
     config.region = region_;
     config.connectTimeoutMs = 5000;
     config.requestTimeoutMs = 10000;
-    
+
     client_ = std::make_unique<Aws::Kinesis::KinesisClient>(config);
-    
+
     Logger::info("KinesisConsumer created, stream:", stream_name_, "region:", region_);
 }
 
@@ -29,45 +30,92 @@ KinesisConsumer::~KinesisConsumer() {
 }
 
 std::string KinesisConsumer::getShardIterator(const std::string& shard_id) {
+    // 체크포인트가 활성화되어 있으면 체크포인트 기반 복구 시도
+    if (checkpoint_enabled_ && checkpoint_manager_) {
+        return getShardIteratorWithCheckpoint(shard_id);
+    }
+
+    // 기본: LATEST
     Aws::Kinesis::Model::GetShardIteratorRequest request;
     request.SetStreamName(stream_name_);
     request.SetShardId(shard_id);
-    // LATEST: 새 레코드만 읽음 (운영용)
     request.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::LATEST);
-    
+
     auto outcome = client_->GetShardIterator(request);
     if (!outcome.IsSuccess()) {
-        Logger::error("Failed to get shard iterator for", shard_id, ":", 
+        Logger::error("Failed to get shard iterator for", shard_id, ":",
                       outcome.GetError().GetMessage());
         return "";
     }
-    
-    Logger::debug("Got shard iterator for:", shard_id);
+
+    Logger::info("Got LATEST shard iterator for:", shard_id);
+    return outcome.GetResult().GetShardIterator();
+}
+
+std::string KinesisConsumer::getShardIteratorWithCheckpoint(const std::string& shard_id) {
+    Aws::Kinesis::Model::GetShardIteratorRequest request;
+    request.SetStreamName(stream_name_);
+    request.SetShardId(shard_id);
+
+    // 체크포인트에서 마지막 시퀀스 번호 조회
+    std::string last_seq = checkpoint_manager_->getLastCheckpoint(shard_id);
+
+    if (!last_seq.empty()) {
+        // 체크포인트 복구: AFTER_SEQUENCE_NUMBER
+        request.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::AFTER_SEQUENCE_NUMBER);
+        request.SetStartingSequenceNumber(last_seq);
+        Logger::info("Resuming shard", shard_id, "from checkpoint:", last_seq.substr(0, 30) + "...");
+    } else {
+        // 체크포인트 없음: LATEST (첫 시작)
+        request.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::LATEST);
+        Logger::info("Starting shard", shard_id, "from LATEST (no checkpoint)");
+    }
+
+    auto outcome = client_->GetShardIterator(request);
+    if (!outcome.IsSuccess()) {
+        Logger::error("Failed to get shard iterator for", shard_id, ":",
+                      outcome.GetError().GetMessage());
+
+        // 체크포인트 기반 복구 실패 시 LATEST로 폴백
+        if (!last_seq.empty()) {
+            Logger::warn("Checkpoint recovery failed, falling back to LATEST for", shard_id);
+            request.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::LATEST);
+            request.SetStartingSequenceNumber("");
+
+            outcome = client_->GetShardIterator(request);
+            if (outcome.IsSuccess()) {
+                return outcome.GetResult().GetShardIterator();
+            }
+        }
+        return "";
+    }
+
     return outcome.GetResult().GetShardIterator();
 }
 
 void KinesisConsumer::start() {
     if (running_) return;
-    
+
     // 스트림 정보 가져오기
     Aws::Kinesis::Model::DescribeStreamRequest desc_request;
     desc_request.SetStreamName(stream_name_);
-    
+
     auto desc_outcome = client_->DescribeStream(desc_request);
     if (!desc_outcome.IsSuccess()) {
         Logger::error("Failed to describe stream:", desc_outcome.GetError().GetMessage());
         return;
     }
-    
+
     // 모든 샤드의 iterator 가져오기
     const auto& shards = desc_outcome.GetResult().GetStreamDescription().GetShards();
     if (shards.empty()) {
         Logger::error("No shards found in stream:", stream_name_);
         return;
     }
-    
+
     Logger::info("Found", shards.size(), "shard(s) in stream:", stream_name_);
-    
+    Logger::info("Checkpoint enabled:", checkpoint_enabled_ ? "YES" : "NO");
+
     for (const auto& shard : shards) {
         std::string it = getShardIterator(shard.GetShardId());
         if (!it.empty()) {
@@ -75,27 +123,111 @@ void KinesisConsumer::start() {
             shard_iterator_created_[shard.GetShardId()] = std::chrono::steady_clock::now();
         }
     }
-    
+
     if (shard_iterators_.empty()) {
         Logger::error("Failed to get any shard iterators");
         return;
     }
-    
+
     running_ = true;
+    draining_ = false;
     worker_ = std::thread(&KinesisConsumer::consumeLoop, this);
-    
+
     Logger::info("KinesisConsumer started, stream:", stream_name_);
 }
 
 void KinesisConsumer::stop() {
     if (!running_) return;
 
+    Logger::info("KinesisConsumer stopping - initiating graceful shutdown");
+
+    // 1. 새 레코드 수신 중단
+    draining_ = true;
     running_ = false;
+
+    // 2. 워커 스레드 종료 대기
     if (worker_.joinable()) {
         worker_.join();
     }
 
-    Logger::info("KinesisConsumer stopped");
+    // 3. 마지막 체크포인트 저장
+    if (checkpoint_enabled_ && checkpoint_manager_) {
+        Logger::info("Flushing final checkpoints...");
+        for (const auto& [shard_id, seq] : last_sequence_numbers_) {
+            if (!seq.empty()) {
+                checkpoint_manager_->checkpointImmediate(shard_id, seq);
+            }
+        }
+        checkpoint_manager_->flush();
+        Logger::info("Final checkpoints saved");
+    }
+
+    Logger::info("KinesisConsumer stopped gracefully, records processed:", records_processed_.load());
+}
+
+void KinesisConsumer::drainQueue() {
+    // Graceful shutdown 시 잔여 메시지 처리
+    Logger::info("Draining queue (timeout:", drain_timeout_seconds_, "s)...");
+
+    auto start = std::chrono::steady_clock::now();
+    int drained = 0;
+
+    while (draining_) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        if (elapsed >= drain_timeout_seconds_) {
+            Logger::warn("Drain timeout reached, stopping");
+            break;
+        }
+
+        bool any_records = false;
+
+        for (auto& [shard_id, iterator] : shard_iterators_) {
+            if (iterator.empty()) continue;
+
+            Aws::Kinesis::Model::GetRecordsRequest request;
+            request.SetShardIterator(iterator);
+            request.SetLimit(100);
+
+            auto outcome = client_->GetRecords(request);
+            if (!outcome.IsSuccess()) {
+                continue;
+            }
+
+            const auto& result = outcome.GetResult();
+            iterator = result.GetNextShardIterator();
+
+            for (const auto& record : result.GetRecords()) {
+                any_records = true;
+                ++drained;
+
+                const auto& data = record.GetData();
+                std::string value(reinterpret_cast<const char*>(data.GetUnderlyingData()),
+                                  data.GetLength());
+
+                if (callback_) {
+                    try {
+                        callback_(record.GetPartitionKey(), value);
+                    } catch (const std::exception& e) {
+                        Logger::error("Drain callback error:", e.what());
+                    }
+                }
+
+                // 체크포인트 저장
+                if (checkpoint_enabled_ && checkpoint_manager_) {
+                    checkpoint_manager_->checkpoint(shard_id, record.GetSequenceNumber());
+                }
+            }
+        }
+
+        if (!any_records) {
+            // 레코드 없으면 종료
+            break;
+        }
+    }
+
+    Logger::info("Drained", drained, "records");
 }
 
 int KinesisConsumer::countActiveIterators() const {
@@ -111,12 +243,13 @@ void KinesisConsumer::consumeLoop() {
     while (running_) {
         bool any_records = false;
         poll_count++;
-        
+
         if (poll_count % 100 == 0) {
             Logger::info("KinesisConsumer heartbeat: polling", shard_iterators_.size(),
-                         "shards, active iterators:", countActiveIterators());
+                         "shards, active iterators:", countActiveIterators(),
+                         "records:", records_processed_.load());
         }
-        
+
         for (auto& [shard_id, iterator] : shard_iterators_) {
             if (!running_) break; // 빠른 종료를 위한 체크
 
@@ -152,11 +285,11 @@ void KinesisConsumer::consumeLoop() {
                 }
                 continue;
             }
-            
+
             Aws::Kinesis::Model::GetRecordsRequest request;
             request.SetShardIterator(iterator);
             request.SetLimit(100);
-            
+
             auto outcome = client_->GetRecords(request);
             if (!outcome.IsSuccess()) {
                 const auto& error = outcome.GetError();
@@ -183,10 +316,10 @@ void KinesisConsumer::consumeLoop() {
                 }
                 continue;
             }
-            
+
             const auto& result = outcome.GetResult();
             std::string next_iterator = result.GetNextShardIterator();
-            
+
             if (next_iterator.empty()) {
                 // next_iterator가 빈 문자열이면 즉시 새 iterator 획득
                 Logger::warn("NextIterator empty for:", shard_id, "- refreshing immediately");
@@ -205,31 +338,46 @@ void KinesisConsumer::consumeLoop() {
                 }
                 iterator = next_iterator;
             }
-            
+
             for (const auto& record : result.GetRecords()) {
                 any_records = true;
                 const auto& data = record.GetData();
                 std::string value(reinterpret_cast<const char*>(data.GetUnderlyingData()),
                                   data.GetLength());
                 std::string partition_key = record.GetPartitionKey();
-                
-                Logger::info(">>> Received Kinesis record, shard:", shard_id, 
+                std::string sequence_number = record.GetSequenceNumber();
+
+                Logger::info(">>> Received Kinesis record, shard:", shard_id,
                              "key:", partition_key, "len:", data.GetLength());
-                
+
                 if (callback_) {
                     try {
                         callback_(partition_key, value);
+                        ++records_processed_;
+
+                        // 시퀀스 번호 저장 (체크포인팅용)
+                        last_sequence_numbers_[shard_id] = sequence_number;
+
+                        // 체크포인트 저장
+                        if (checkpoint_enabled_ && checkpoint_manager_) {
+                            checkpoint_manager_->checkpoint(shard_id, sequence_number);
+                        }
                     } catch (const std::exception& e) {
                         Logger::error("Callback error:", e.what());
                     }
                 }
             }
         }
-        
+
         // Kinesis는 최소 200ms 간격 권장
         if (!any_records && running_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
+    }
+
+    // Graceful shutdown 시 draining 처리
+    if (draining_) {
+        drainQueue();
     }
 }
 

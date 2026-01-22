@@ -64,6 +64,7 @@ set(SOURCES
     src/notification_client.cpp
     src/dynamodb_client.cpp
     src/ranking_manager.cpp
+    src/checkpoint_manager.cpp
 )
 
 # 메인 실행파일

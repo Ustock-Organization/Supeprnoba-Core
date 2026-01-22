@@ -10,6 +10,7 @@
 #include "kinesis_consumer.h"
 #include "kinesis_producer.h"
 #include "dynamodb_client.h"
+#include "checkpoint_manager.h"
 
 #include <iostream>
 #include <csignal>
@@ -61,12 +62,21 @@ int main(int argc, char* argv[]) {
     const auto depth_cache_host = Config::get("DEPTH_CACHE_HOST", redis_host);
     const auto depth_cache_port = Config::getInt("DEPTH_CACHE_PORT", redis_port);
     
+    // Checkpoint 설정
+    const bool checkpoint_enabled = Config::get("KINESIS_CHECKPOINT_ENABLED", "true") == "true";
+    const int checkpoint_interval_records = Config::getInt("KINESIS_CHECKPOINT_INTERVAL_RECORDS", 100);
+    const int checkpoint_interval_seconds = Config::getInt("KINESIS_CHECKPOINT_INTERVAL_SECONDS", 5);
+    const int drain_timeout_seconds = Config::getInt("SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 30);
+
     Logger::info("=== Configuration ===");
     Logger::info("Kinesis Stream:", stream_name);
     Logger::info("AWS Region:", aws_region);
     Logger::info("gRPC Port:", grpc_port);
     Logger::info("Redis (snapshot):", redis_host, ":", redis_port);
     Logger::info("Redis (depth):", depth_cache_host, ":", depth_cache_port);
+    Logger::info("Checkpoint enabled:", checkpoint_enabled ? "YES" : "NO");
+    Logger::info("Checkpoint interval:", checkpoint_interval_records, "records /", checkpoint_interval_seconds, "seconds");
+    Logger::info("Drain timeout:", drain_timeout_seconds, "seconds");
     Logger::info("=====================");
     
     try {
@@ -210,8 +220,33 @@ int main(int argc, char* argv[]) {
             Logger::info("LOAD_ORDERS_FROM_DYNAMODB=false - skipping DynamoDB order restore");
         }
         
+        // === CheckpointManager 생성 ===
+        std::unique_ptr<CheckpointManager> checkpoint_manager;
+        if (checkpoint_enabled && redis_connected) {
+            CheckpointManager::Config cp_config;
+            cp_config.stream_name = stream_name;
+            cp_config.flush_interval_records = checkpoint_interval_records;
+            cp_config.flush_interval_seconds = checkpoint_interval_seconds;
+            cp_config.enable_background_flush = false;  // 동기식 체크포인팅
+
+            checkpoint_manager = std::make_unique<CheckpointManager>(&redis, cp_config);
+            Logger::info("CheckpointManager initialized for stream:", stream_name);
+        } else {
+            Logger::warn("CheckpointManager disabled - checkpoint_enabled:", checkpoint_enabled, "redis_connected:", redis_connected);
+        }
+
         // Kinesis Consumer 시작
         KinesisConsumer consumer(stream_name, aws_region);
+
+        // Checkpoint 설정
+        if (checkpoint_manager) {
+            consumer.setCheckpointManager(checkpoint_manager.get());
+            consumer.setCheckpointEnabled(true);
+        } else {
+            consumer.setCheckpointEnabled(false);
+        }
+        consumer.setDrainTimeoutSeconds(drain_timeout_seconds);
+
         consumer.setCallback([&engine](const std::string& key,
                                         const std::string& value) {
             Metrics::instance().incrementOrdersReceived();
@@ -285,15 +320,47 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // 정리
-        Logger::info("Shutting down...");
+        // 정리 (Graceful Shutdown)
+        Logger::info("=== Initiating Graceful Shutdown ===");
+
+        // 1. RankingManager 스레드 종료
         if (ranking_enabled) {
+            Logger::info("Stopping RankingManager...");
             ranking_manager.stopSnapshotThread();
         }
+
+        // 2. Kinesis Consumer 종료 (Graceful: drain + checkpoint)
+        Logger::info("Stopping KinesisConsumer (drain timeout:", drain_timeout_seconds, "s)...");
         consumer.stop();
+        Logger::info("KinesisConsumer stopped, records processed:", consumer.getRecordsProcessed());
+
+        // 3. 최종 스냅샷 저장
+        if (redis_connected) {
+            Logger::info("Saving final orderbook snapshots...");
+            auto symbols = engine.getAllSymbols();
+            for (const auto& symbol : symbols) {
+                auto snapshot = engine.snapshotOrderBook(symbol);
+                if (!snapshot.empty()) {
+                    redis.saveSnapshot(symbol, snapshot);
+                }
+            }
+            Logger::info("Final snapshots saved for", symbols.size(), "symbols");
+        }
+
+        // 4. gRPC 서버 종료
+        Logger::info("Stopping gRPC server...");
         grpc_service.stop();
+
+        // 5. Kinesis Producer flush
+        Logger::info("Flushing Kinesis Producer...");
         producer.flush(5000);
-        
+
+        // 6. Checkpoint 메트릭 로깅
+        if (checkpoint_manager) {
+            Logger::info("Checkpoint stats - saved:", checkpoint_manager->getCheckpointCount(),
+                        "flushed:", checkpoint_manager->getFlushCount());
+        }
+
         Logger::info("=== Shutdown Complete ===");
         
     } catch (const std::exception& e) {
