@@ -4,18 +4,17 @@
 
 /var/log/supernoba/engine/*.log {
     daily
-    rotate 7
+    maxsize 500M
+    rotate 3
     compress
-    delaycompress
     missingok
     notifempty
     create 0644 ec2-user ec2-user
     dateext
-    dateformat -%Y%m%d
+    dateformat -%Y%m%d-%H%M
     sharedscripts
     postrotate
         # systemd가 관리하므로 재시작 불필요
-        # 로그 파일 핸들은 systemd가 관리
         true
     endscript
 }
