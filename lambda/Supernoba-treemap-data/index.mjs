@@ -8,26 +8,61 @@
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { ScanCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-
-// Common Layer - Valkey, CORS
-import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
+import Redis from 'ioredis';
 
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
+const DEPTH_CACHE_HOST = process.env.DEPTH_CACHE_HOST || 'master.supernoba-depth-cache.5vrxzz.apn2.cache.amazonaws.com';
+const BACKUP_CACHE_HOST = process.env.BACKUP_CACHE_HOST || 'master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com';
+const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
 
-// Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'depth' });
-const backupValkey = getValkeyClient({ type: 'backup' });
+// Redis 클라이언트 (Lambda 컨테이너 재사용)
+let depthClient = null;
+let backupClient = null;
+
+function getDepthClient() {
+  if (!depthClient) {
+    depthClient = new Redis({
+      host: DEPTH_CACHE_HOST,
+      port: VALKEY_PORT,
+      tls: {},
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1
+    });
+    depthClient.on('error', () => {}); // 에러 무시
+  }
+  return depthClient;
+}
+
+function getBackupClient() {
+  if (!backupClient) {
+    backupClient = new Redis({
+      host: BACKUP_CACHE_HOST,
+      port: VALKEY_PORT,
+      tls: {},
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1
+    });
+    backupClient.on('error', () => {}); // 에러 무시
+  }
+  return backupClient;
+}
+
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
 // Rankings snapshot 캐시 키
 const RANKINGS_SNAPSHOT_KEY = 'rankings:snapshot';
 
-// Layer의 CORS.FULL 사용
-const H = CORS.FULL;
+// CORS 헤더
+const H = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'DELETE, GET, OPTIONS, POST, PUT',
+  'Content-Type': 'application/json'
+};
 
-const ok = (d) => response.ok(d, H);
-const err = (c, m) => response.error(c, m, H);
+const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
+const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
 
 /**
  * 섹터 이름 정규화 (플랫폼 → 표시명)
@@ -74,6 +109,8 @@ export const handler = async (event) => {
     // ==========================================
     if (m === 'GET') {
       const startTime = Date.now();
+      const valkey = getDepthClient();
+      const backupValkey = getBackupClient();
 
       // 1. DynamoDB에서 ACTIVE 종목 목록 조회
       const { Items: symbols } = await dynamodb.send(
@@ -127,18 +164,26 @@ export const handler = async (event) => {
         console.warn('[treemap] Rankings cache miss or parse error:', cacheErr.message);
       }
 
-      // 3. Valkey에서 ticker 데이터 일괄 조회 (캐시 보완용)
+      // 3. Valkey에서 ticker 및 prevClose 데이터 일괄 조회
       const tickerKeys = symbols.map(s => `ticker:${s.symbol}`);
+      const prevCloseKeys = symbols.map(s => `prev:${s.symbol}`);
       let tickerDataRaw = [];
+      let prevCloseDataRaw = [];
 
       try {
-        tickerDataRaw = await valkey.mget(...tickerKeys);
+        // 병렬로 ticker와 prevClose 조회
+        [tickerDataRaw, prevCloseDataRaw] = await Promise.all([
+          valkey.mget(...tickerKeys),
+          valkey.mget(...prevCloseKeys)
+        ]);
+        console.log('[treemap] Valkey MGET success, tickers:', tickerDataRaw.filter(Boolean).length, 'prevClose:', prevCloseDataRaw.filter(Boolean).length);
       } catch (redisErr) {
         console.warn('[treemap] Valkey MGET failed:', redisErr.message);
         tickerDataRaw = new Array(symbols.length).fill(null);
+        prevCloseDataRaw = new Array(symbols.length).fill(null);
       }
 
-      // 4. 데이터 병합 - Rankings 캐시 우선, ticker fallback
+      // 4. 데이터 병합 - Rankings 캐시 우선, ticker fallback, prevClose 직접 계산
       const enrichedSymbols = symbols.map((sym, idx) => {
         // Ticker 데이터 파싱
         let ticker = {};
@@ -150,20 +195,39 @@ export const handler = async (event) => {
           console.warn(`[treemap] Ticker parse error for ${sym.symbol}:`, parseErr.message);
         }
 
+        // prevClose 데이터 파싱
+        let prevClose = 0;
+        try {
+          if (prevCloseDataRaw[idx]) {
+            const prevData = JSON.parse(prevCloseDataRaw[idx]);
+            prevClose = prevData.close || 0;
+          }
+        } catch (parseErr) {
+          console.warn(`[treemap] PrevClose parse error for ${sym.symbol}:`, parseErr.message);
+        }
+
         // Rankings 캐시에서 데이터 가져오기
         const rankingData = rankingsBySymbol.get(sym.symbol) || {};
 
-        // 가격: ticker 우선 (실시간), 캐시에서 marketCap 역산 가능
-        const price = ticker.price || ticker.c || sym.listingPrice || 0;
+        // 가격: ticker 우선 (실시간)
+        const price = ticker.p || ticker.price || ticker.c || sym.listingPrice || 0;
         const totalShares = sym.totalShares || 0;
 
         // MarketCap: 캐시 우선, 계산 fallback
         const marketCap = rankingData.marketCap || (price * totalShares);
 
-        // Change: 캐시 우선, ticker fallback
-        const change = rankingData.change !== undefined
-          ? rankingData.change
-          : (ticker.changePercent || ticker.yc || 0);
+        // Change: prevClose 기반 실시간 계산 우선, 캐시 fallback
+        let change = 0;
+        if (prevClose > 0 && price > 0) {
+          // 실시간 변동률 계산: (현재가 - 전일종가) / 전일종가 * 100
+          change = ((price - prevClose) / prevClose) * 100;
+        } else if (rankingData.change !== undefined && rankingData.change !== 0) {
+          // Rankings 캐시의 값 사용 (0이 아닌 경우만)
+          change = rankingData.change;
+        } else {
+          // ticker의 changePercent 사용
+          change = ticker.changePercent || ticker.yc || 0;
+        }
 
         // Volume: 캐시 우선, ticker fallback
         const volume = rankingData.volume !== undefined
