@@ -23,16 +23,31 @@ console.log('=== Streaming Server (Simplified) ===');
 console.log(`Valkey: ${VALKEY_HOST}:${VALKEY_PORT}`);
 console.log(`Backup Cache: ${BACKUP_CACHE_HOST}`);
 
+// Redis 재연결 전략 (exponential backoff)
+const retryStrategy = (times) => {
+  if (times > 100) {
+    console.error(`[Redis] Max retries (${times}) reached, giving up`);
+    return null; // 재연결 포기
+  }
+  const delay = Math.min(times * 100, 3000); // 최대 3초
+  console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times})`);
+  return delay;
+};
+
 // Valkey 연결 (메인 데이터 캐시)
 const valkey = new Redis({
   host: VALKEY_HOST,
   port: VALKEY_PORT,
   tls: VALKEY_TLS ? { rejectUnauthorized: false } : undefined,
   connectTimeout: 5000,
+  retryStrategy,
+  maxRetriesPerRequest: null, // 무제한 재시도 (재연결 후 자동 재시도)
+  enableOfflineQueue: true,   // 연결 끊김 시 명령 대기열에 저장
 });
 
-valkey.on('error', (err) => console.error('Redis error:', err.message));
-valkey.on('connect', () => console.log('Connected to Valkey'));
+valkey.on('error', (err) => console.error('[Valkey] Error:', err.message));
+valkey.on('connect', () => console.log('[Valkey] Connected'));
+valkey.on('reconnecting', (delay) => console.log(`[Valkey] Reconnecting in ${delay}ms`));
 
 // Backup Cache 연결 (어드민 연결 목록 조회용) - AWS ElastiCache는 항상 TLS 필요
 const backupCache = new Redis({
@@ -40,10 +55,14 @@ const backupCache = new Redis({
   port: VALKEY_PORT,
   tls: {},  // AWS ElastiCache는 TLS 필수
   connectTimeout: 5000,
+  retryStrategy,
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: true,
 });
 
-backupCache.on('error', (err) => console.error('BackupCache error:', err.message));
-backupCache.on('connect', () => console.log('Connected to Backup Cache'));
+backupCache.on('error', (err) => console.error('[BackupCache] Error:', err.message));
+backupCache.on('connect', () => console.log('[BackupCache] Connected'));
+backupCache.on('reconnecting', () => console.log('[BackupCache] Reconnecting...'));
 
 // Backup Cache Pub/Sub 연결 (MM 상태 구독용) - 별도 연결 필요
 const backupCacheSub = new Redis({
@@ -51,10 +70,14 @@ const backupCacheSub = new Redis({
   port: VALKEY_PORT,
   tls: {},  // AWS ElastiCache는 TLS 필수
   connectTimeout: 5000,
+  retryStrategy,
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: true,
 });
 
-backupCacheSub.on('error', (err) => console.error('BackupCache Sub error:', err.message));
-backupCacheSub.on('connect', () => console.log('Connected to Backup Cache (Pub/Sub)'));
+backupCacheSub.on('error', (err) => console.error('[BackupCache Sub] Error:', err.message));
+backupCacheSub.on('connect', () => console.log('[BackupCache Sub] Connected'));
+backupCacheSub.on('reconnecting', () => console.log('[BackupCache Sub] Reconnecting...'));
 
 // API Gateway 클라이언트 (일반 사용자)
 const apiClient = new ApiGatewayManagementApiClient({
@@ -88,23 +111,14 @@ async function sendToConnection(connectionId, data) {
 }
 
 async function cleanupConnection(connectionId) {
-  // Main 구독 정리 (conn:*:main 키 기반)
-  const mainSymbol = await valkey.get(`conn:${connectionId}:main`);
-  if (mainSymbol) {
-    await valkey.srem(`symbol:${mainSymbol}:main`, connectionId);
-    await valkey.srem(`symbol:${mainSymbol}:subscribers`, connectionId); // 레거시 호환
-    await valkey.del(`conn:${connectionId}:main`);
-  }
-
-  // Sub 구독 정리 (SCAN 기반)
-  const subscribedSymbols = await valkey.smembers('subscribed:symbols');
-  for (const symbol of subscribedSymbols) {
-    await valkey.srem(`symbol:${symbol}:sub`, connectionId);
-    await valkey.srem(`symbol:${symbol}:subscribers`, connectionId); // 레거시 호환
-  }
-
-  // realtime:connections 제거됨 - 더 이상 사용하지 않음
-  await valkey.del(`ws:${connectionId}`);
+  // NOTE: 전체 cleanup은 Disconnect Lambda에서 수행 (중복 방지)
+  // 스트리머는 410 에러 발견 시 로그만 출력하고, 실제 정리는 Lambda에 위임
+  // Lambda는 $disconnect 이벤트로 트리거되어 다음을 수행:
+  //   - Main/Sub 구독 정리
+  //   - user:*:connections에서 제거
+  //   - subscribed:symbols 업데이트
+  //   - ws:connectionId 삭제
+  console.log(`[Cleanup] Connection ${connectionId} stale (410), Lambda will handle cleanup`);
 }
 
 // 어드민에게 메시지 전송

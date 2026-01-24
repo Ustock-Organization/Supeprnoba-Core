@@ -307,35 +307,16 @@ void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* rea
 void MarketDataHandler::on_trade(const OrderBook* book,
                                   liquibook::book::Quantity qty,
                                   liquibook::book::Price price) {
-    std::string symbol = book->symbol();
-    Logger::info("TRADE:", symbol, "qty:", qty, "price:", price);
-    
-    Metrics::instance().incrementTradesExecuted();
-    
-    // 00:00 리셋 확인 및 OHLC 업데이트
-    checkDayReset(symbol);
-    DayData& day = getDayData(symbol);
-    
-    // 시가 설정 (당일 첫 체결)
-    if (day.open_price == 0) {
-        day.open_price = price;
-        day.high_price = price;
-        day.low_price = price;
-    }
-    
-    // 고가/저가 업데이트
-    if (price > day.high_price) day.high_price = price;
-    if (price < day.low_price) day.low_price = price;
-
-    // 현재가 업데이트
-    day.last_price = price;
-
-    // Ticker 캐시 업데이트 (Sub 데이터용)
-    updateTickerCache(symbol, price);
-
-    if (producer_) {
-        producer_->publishTrade(symbol, qty, price);
-    }
+    // NOTE: on_trade는 더 이상 사용하지 않음 (중복 제거)
+    // 모든 체결 처리는 on_fill에서 수행:
+    //   - DayData (OHLC) 업데이트
+    //   - 1분봉 캔들 업데이트
+    //   - 랭킹 업데이트
+    //   - Kinesis fills 발행
+    // supernoba-trades 스트림을 소비하는 프로세서가 없으므로 publishTrade()도 제거
+    (void)book;
+    (void)qty;
+    (void)price;
 }
 
 void MarketDataHandler::on_depth_change(const OrderBook* book,

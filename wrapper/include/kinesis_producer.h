@@ -51,7 +51,11 @@ private:
     void produce(const std::string& stream_name,
                  const std::string& partition_key,
                  const std::string& data);
-    
+
+    void saveToWAL(const std::string& stream_name,
+                   const std::string& partition_key,
+                   const std::string& data);
+
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::string fills_stream_;
     std::string trades_stream_;

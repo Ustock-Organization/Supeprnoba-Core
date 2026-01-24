@@ -4,6 +4,8 @@
 #include <aws/core/Aws.h>
 #include <aws/kinesis/model/PutRecordRequest.h>
 #include <chrono>
+#include <fstream>
+#include <thread>
 
 namespace aws_wrapper {
 
@@ -38,6 +40,9 @@ KinesisProducer::~KinesisProducer() {
 void KinesisProducer::produce(const std::string& stream_name,
                                const std::string& partition_key,
                                const std::string& data) {
+    constexpr int MAX_RETRIES = 3;
+    constexpr int RETRY_DELAY_MS = 100;  // 100, 200, 400ms
+
     auto start = std::chrono::steady_clock::now();
 
     Aws::Kinesis::Model::PutRecordRequest request;
@@ -46,21 +51,65 @@ void KinesisProducer::produce(const std::string& stream_name,
     request.SetData(Aws::Utils::ByteBuffer(
         reinterpret_cast<const unsigned char*>(data.c_str()), data.length()));
 
-    auto outcome = client_->PutRecord(request);
+    bool success = false;
+    std::string last_error;
 
-    auto end = std::chrono::steady_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+        auto outcome = client_->PutRecord(request);
 
-    if (!outcome.IsSuccess()) {
-        Logger::error("Failed to put record to", stream_name, "in", elapsed_ms, "ms:",
-                      outcome.GetError().GetMessage());
-    } else {
-        if (elapsed_ms > 1000) {
-            // Log warning if PutRecord took more than 1 second
-            Logger::warn("[SLOW] PutRecord to", stream_name, "took", elapsed_ms, "ms");
+        if (outcome.IsSuccess()) {
+            success = true;
+            auto end = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+            if (elapsed_ms > 1000) {
+                Logger::warn("[SLOW] PutRecord to", stream_name, "took", elapsed_ms, "ms");
+            }
+            Logger::debug("Published to", stream_name, "shard:",
+                          outcome.GetResult().GetShardId(), "in", elapsed_ms, "ms");
+            break;
         }
-        Logger::debug("Published to", stream_name, "shard:",
-                      outcome.GetResult().GetShardId(), "in", elapsed_ms, "ms");
+
+        last_error = outcome.GetError().GetMessage();
+        if (attempt < MAX_RETRIES - 1) {
+            int delay = RETRY_DELAY_MS * (1 << attempt);  // exponential backoff
+            Logger::warn("Kinesis retry", attempt + 1, "for", stream_name, "in", delay, "ms");
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }
+    }
+
+    if (!success) {
+        auto end = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        Logger::error("Failed to put record to", stream_name, "after", MAX_RETRIES,
+                      "retries in", elapsed_ms, "ms:", last_error);
+
+        // WAL: Save failed event to local file for manual recovery
+        saveToWAL(stream_name, partition_key, data);
+    }
+}
+
+void KinesisProducer::saveToWAL(const std::string& stream_name,
+                                  const std::string& partition_key,
+                                  const std::string& data) {
+    static const char* WAL_PATH = "/var/log/supernoba/kinesis-wal.log";
+
+    try {
+        std::ofstream wal_file(WAL_PATH, std::ios::app);
+        if (wal_file.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+
+            // WAL format: timestamp|stream|partition_key|data
+            wal_file << ts << "|" << stream_name << "|" << partition_key << "|" << data << "\n";
+            wal_file.flush();
+            Logger::warn("[WAL] Saved failed event to", WAL_PATH);
+        } else {
+            Logger::error("[WAL] Cannot open", WAL_PATH);
+        }
+    } catch (const std::exception& e) {
+        Logger::error("[WAL] Failed to save:", e.what());
     }
 }
 
@@ -103,9 +152,14 @@ void KinesisProducer::publishFill(const std::string& symbol,
     j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()).count();
 
-    // executed_at in ISO 8601 format for history storage
+    // executed_at in ISO 8601 format for history storage (thread-safe)
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_now = *std::gmtime(&time_t_now);
+    std::tm tm_now{};
+#ifdef _WIN32
+    gmtime_s(&tm_now, &time_t_now);
+#else
+    gmtime_r(&time_t_now, &tm_now);
+#endif
     char iso_buf[30];
     std::strftime(iso_buf, sizeof(iso_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
     j["executed_at"] = iso_buf;
