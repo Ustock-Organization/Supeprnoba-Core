@@ -1,0 +1,13 @@
+{
+  "name": "supernoba-candle-service",
+  "version": "1.0.0",
+  "description": "Supernoba Candle Aggregation Service for Local Development",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "ioredis": "^5.3.2"
+  }
+}
