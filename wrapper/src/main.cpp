@@ -200,7 +200,7 @@ int main(int argc, char* argv[]) {
             if (dynamodb.initialize()) {
                 // === totalShares 로드 (RankingManager용) ===
                 if (ranking_enabled) {
-                    const auto stocks_table = Config::get("DYNAMODB_STOCKS_TABLE", "supernoba-stocks");
+                    const auto stocks_table = Config::get("DYNAMODB_SYMBOLS_TABLE", "supernoba-symbols");
                     auto total_shares_map = dynamodb.loadSymbolsTotalShares(stocks_table);
                     for (const auto& [symbol, shares] : total_shares_map) {
                         ranking_manager.setTotalShares(symbol, shares);
