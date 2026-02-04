@@ -64,10 +64,10 @@ LOG_PATHS["aggregator"]="/var/log/supernoba/aggregator/aggregator.log"
 
 # 빌드 경로
 declare -A BUILD_PATHS
-BUILD_PATHS["engine"]="$HOME/Supeprnoba-Core/wrapper"
-BUILD_PATHS["streamer"]="$HOME/Supeprnoba-Core/streamer/node"
-BUILD_PATHS["mm"]="$HOME/Supeprnoba-Core/mm-service"
-BUILD_PATHS["aggregator"]="$HOME/Supeprnoba-Core/aggregator"
+BUILD_PATHS["engine"]="$HOME/Supernoba-Core_Old/wrapper"
+BUILD_PATHS["streamer"]="$HOME/Supernoba-Core_Old/streamer/node"
+BUILD_PATHS["mm"]="$HOME/Supernoba-Core_Old/mm-service"
+BUILD_PATHS["aggregator"]="$HOME/Supernoba-Core_Old/aggregator"
 
 # 서비스 설명
 declare -A SERVICE_DESC
@@ -370,7 +370,7 @@ case "$ACTION" in
 
         # Git pull
         log_info "Pulling latest code..."
-        cd "$HOME/Supeprnoba-Core" && git pull
+        cd "$HOME/Supernoba-Core_Old" && git pull
 
         # 빌드 및 재시작
         for svc in $local_services; do
