@@ -92,8 +92,13 @@ async function handleConnect(event) {
   }
 
   // WebSocket 연결 시 JWT 인증
-  // 쿼리 파라미터 token 또는 Authorization 헤더에서 JWT 추출
-  const token = event.queryStringParameters?.token;
+  // 쿼리 파라미터 token/auth 또는 Authorization 헤더에서 JWT 추출
+  let token = event.queryStringParameters?.token || event.queryStringParameters?.auth;
+  
+  // Bearer 접두사 제거 (프론트엔드가 "Bearer xxx" 형식으로 보낼 수 있음)
+  if (token?.startsWith('Bearer ')) {
+    token = token.substring(7);
+  }
   
   // verifyAdmin에 전달할 이벤트 객체 생성
   const authEvent = {
