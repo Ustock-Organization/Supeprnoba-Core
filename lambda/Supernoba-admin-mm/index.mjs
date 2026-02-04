@@ -12,20 +12,13 @@ try {
   verifyAdmin = authModule.verifyAdmin;
   authErrorResponse = authModule.authErrorResponse;
 } catch (e) {
-  console.warn('[admin-mm] Auth layer not available, using fallback');
-  // Fallback: 기존 API 키 방식만 사용
-  verifyAdmin = async (event) => {
-    const adminApiKey = process.env.ADMIN_API_KEY;
-    const authHeader = event.headers?.Authorization || event.headers?.authorization;
-    if (adminApiKey && authHeader === adminApiKey) {
-      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
-    }
-    return { success: false, error: 'UNAUTHORIZED', message: '인증이 필요합니다' };
-  };
+  console.error('[admin-mm] Failed to load auth layer:', e.message);
+  // Auth layer 없으면 모든 요청 거부
+  verifyAdmin = async () => ({ success: false, error: 'AUTH_LAYER_UNAVAILABLE' });
   authErrorResponse = (result) => ({
-    statusCode: 401,
+    statusCode: 503,
     headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: result.error, message: result.message })
+    body: JSON.stringify({ error: result.error || 'Service temporarily unavailable' })
   });
 }
 

@@ -2,13 +2,27 @@
  * Supernoba Admin WebSocket Handler
  * - 어드민 전용 WebSocket 연결 관리
  * - MM 실시간 데이터 구독 및 푸시
+ * - Cognito JWT 인증 (쿼리 파라미터 token 또는 헤더)
  */
 import { ApiGatewayManagementApiClient, PostToConnectionCommand, DeleteConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
 
 // Common Layer - Valkey
 import { getValkeyClient } from '/opt/nodejs/index.mjs';
 
-const ADMIN_KEY = process.env.ADMIN_KEY || '7194';
+// Auth Layer - Cognito 인증
+let verifyAdmin, authErrorResponse;
+try {
+  const authModule = await import('/opt/nodejs/verifyAuth.mjs');
+  verifyAdmin = authModule.verifyAdmin;
+  authErrorResponse = authModule.authErrorResponse;
+} catch (err) {
+  console.error('[admin-ws] Failed to load auth layer:', err.message);
+  verifyAdmin = async () => ({ success: false, error: 'AUTH_LAYER_UNAVAILABLE' });
+  authErrorResponse = (r) => ({
+    statusCode: 503,
+    body: JSON.stringify({ error: r.error || 'Service temporarily unavailable' })
+  });
+}
 
 // Layer를 통한 Redis 클라이언트 (두 개의 캐시 사용)
 const depthCache = getValkeyClient({ type: 'operating', preset: 'admin' });
@@ -77,14 +91,24 @@ async function handleConnect(event) {
     return { statusCode: 400, body: 'Missing connectionId' };
   }
 
-  // 어드민 키 확인 (쿼리 파라미터)
-  const authKey = event.queryStringParameters?.auth;
-  if (authKey !== ADMIN_KEY) {
-    console.log(`[admin-ws] REJECT Invalid admin key`);
-    return { statusCode: 401, body: 'Unauthorized' };
+  // WebSocket 연결 시 JWT 인증
+  // 쿼리 파라미터 token 또는 Authorization 헤더에서 JWT 추출
+  const token = event.queryStringParameters?.token;
+  
+  // verifyAdmin에 전달할 이벤트 객체 생성
+  const authEvent = {
+    headers: token 
+      ? { Authorization: `Bearer ${token}` }
+      : event.headers
+  };
+
+  const authResult = await verifyAdmin(authEvent);
+  if (!authResult.success) {
+    console.log(`[admin-ws] REJECT Auth failed: ${authResult.error}`);
+    return { statusCode: 401, body: authResult.message || 'Unauthorized' };
   }
 
-  console.log(`[admin-ws] Auth OK, connecting to cache...`);
+  console.log(`[admin-ws] Auth OK (${authResult.method}), userId: ${authResult.userId}, connecting to cache...`);
 
   try {
     await ensureConnected(backupCache);
@@ -96,13 +120,15 @@ async function handleConnect(event) {
   // 어드민 연결 저장
   const connectionInfo = {
     connectedAt: Date.now(),
+    userId: authResult.userId,
+    authMethod: authResult.method,
     subscriptions: [],
   };
 
   try {
     await backupCache.setex(`admin:ws:${connectionId}`, 86400, JSON.stringify(connectionInfo));
     await backupCache.sadd('admin:connections', connectionId);
-    console.log(`[admin-ws] OK Admin connected: ${connectionId}`);
+    console.log(`[admin-ws] OK Admin connected: ${connectionId} (user: ${authResult.userId})`);
   } catch (e) {
     console.error(`[admin-ws] Failed to save connection:`, e.message);
   }

@@ -5,7 +5,24 @@ import { ScanCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
+// Auth Layer - Cognito 인증
+const loadAuth = async () => {
+  try {
+    return await import('/opt/nodejs/verifyAuth.mjs');
+  } catch (err) {
+    console.error('[admin-monitoring] Failed to load auth layer:', err.message);
+    return {
+      verifyAdmin: async () => ({ success: false, error: 'AUTH_LAYER_UNAVAILABLE' }),
+      authErrorResponse: (r) => ({
+        statusCode: 503,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: r.error || 'Service temporarily unavailable' })
+      })
+    };
+  }
+};
+const { verifyAdmin, authErrorResponse } = await loadAuth();
+
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 
 // Layer를 통한 클라이언트 초기화
@@ -14,13 +31,18 @@ const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-no
 
 // Layer의 CORS.READONLY 사용 (GET, OPTIONS)
 const H = CORS.READONLY;
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => response.ok(d, H);
 const err = (c, m) => response.error(c, m, H);
 
 export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
-  if (!isAdmin(event)) return err(403, 'Unauthorized');
+  
+  // Cognito 관리자 인증
+  const authResult = await verifyAdmin(event);
+  if (!authResult.success) {
+    return authErrorResponse(authResult, H);
+  }
+  
   if (event.httpMethod !== 'GET') return err(405, 'Method not allowed');
 
   try {

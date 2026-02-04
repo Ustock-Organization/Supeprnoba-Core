@@ -44,9 +44,7 @@ const { verifyAdmin, authErrorResponse } = await loadAuth();
 
 // 환경변수
 const VALKEY_HOST = process.env.VALKEY_HOST;
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
@@ -71,7 +69,10 @@ const DEFAULT_TICKER_TAPE = {
 };
 
 // 클라이언트
-const valkey = new Redis({ host: VALKEY_HOST, port: 6379, tls: {}, connectTimeout: 5000, maxRetriesPerRequest: 3 });
+const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
+const valkeyOptions = { host: VALKEY_HOST, port: 6379, connectTimeout: 5000, maxRetriesPerRequest: 3 };
+if (VALKEY_TLS) valkeyOptions.tls = {};
+const valkey = new Redis(valkeyOptions);
 valkey.on('error', (e) => console.error('Redis:', e.message));
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
@@ -92,7 +93,6 @@ const checkAdmin = async (event) => {
   return { authorized: true, userId: result.userId, method: result.method };
 };
 
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
 const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
 
@@ -107,7 +107,7 @@ export const handler = async (event) => {
     // ==========================================
     // GET /auth - 관리자 권한 확인 (공개)
     // ==========================================
-    if (path.includes('/auth') && m === 'GET') {
+    if ((path.includes('/auth') || q.type === 'auth') && m === 'GET') {
       const { userId, twitterUsername, googleEmail } = q;
       let admin = false;
 
@@ -119,7 +119,7 @@ export const handler = async (event) => {
       }
       if (userId && !admin) {
         try {
-          const { Item } = await dynamodb.send(new GetCommand({ TableName: USER_CACHE_TABLE, Key: { user_id: userId } }));
+          const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
           if (Item) admin = Item.is_admin === true;
         } catch (e) {
           console.error('[auth] User cache lookup error:', e.message);
@@ -131,7 +131,7 @@ export const handler = async (event) => {
     // ==========================================
     // GET /alerts - 관리자 알림 (관리자 전용)
     // ==========================================
-    if (path.includes('/alerts') && m === 'GET') {
+    if ((path.includes('/alerts') || q.type === 'alerts') && m === 'GET') {
       const adminCheck = await checkAdmin(event);
       if (!adminCheck.authorized) return adminCheck.response;
 
@@ -373,7 +373,8 @@ export const handler = async (event) => {
 
     // GET /settings - 전체 시스템 설정 (관리자)
     if (path.includes('/settings') && m === 'GET' && !path.includes('/site') && !path.includes('/tickerTape')) {
-      if (!isAdmin(event)) return err(403, 'Unauthorized');
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
 
       try {
         const result = await dynamodb.send(new GetCommand({
@@ -436,18 +437,19 @@ export const handler = async (event) => {
     // ==========================================
     // Users 엔드포인트 (관리자 전용)
     // ==========================================
-    if (!isAdmin(event)) return err(403, 'Unauthorized');
+    const usersAdminCheck = await checkAdmin(event);
+    if (!usersAdminCheck.authorized) return usersAdminCheck.response;
 
     // GET /users/{userId} - 개별 사용자 상세
     if (m === 'GET') {
       const { userId, page = 1, limit = 50, search, status: userStatus } = q;
 
       if (userId) {
-        // 사용자 프로필
+        // 사용자 프로필 (balances 포함)
         let profile = null;
         try {
           const { Item } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           profile = Item || null;
@@ -455,18 +457,14 @@ export const handler = async (event) => {
           console.error('[GET USER] Profile fetch error:', profileErr.message);
         }
 
-        // 지갑 정보
-        let wallets = [];
-        try {
-          const { Items } = await dynamodb.send(new QueryCommand({
-            TableName: WALLETS_TABLE,
-            KeyConditionExpression: 'user_id = :uid',
-            ExpressionAttributeValues: { ':uid': userId }
-          }));
-          wallets = Items || [];
-        } catch (walletErr) {
-          console.error('[GET USER] Wallet fetch error:', walletErr.message);
-        }
+        // 지갑 정보 (users 테이블의 balances 필드에서 추출)
+        const userBalances = profile?.balances || {};
+        const wallets = Object.entries(userBalances).map(([currency, balance]) => ({
+          user_id: userId,
+          currency,
+          available: balance.available || 0,
+          locked: balance.locked || 0
+        }));
 
         const effectiveWallets = wallets.length > 0 ? wallets : [{
           user_id: userId,
@@ -528,7 +526,7 @@ export const handler = async (event) => {
       // 사용자 목록
       try {
         const { Items: allUsers } = await dynamodb.send(new ScanCommand({
-          TableName: USER_CACHE_TABLE
+          TableName: USERS_TABLE
         }));
 
         let users = allUsers || [];
@@ -553,26 +551,17 @@ export const handler = async (event) => {
         const offset = (parseInt(page) - 1) * parseInt(limit);
         const paginatedUsers = users.slice(offset, offset + parseInt(limit));
 
-        const enrichedUsers = await Promise.all(paginatedUsers.map(async (user) => {
-          let wallets = [];
-          try {
-            const { Items } = await dynamodb.send(new QueryCommand({
-              TableName: WALLETS_TABLE,
-              KeyConditionExpression: 'user_id = :uid',
-              ExpressionAttributeValues: { ':uid': user.user_id }
-            }));
-            wallets = Items || [];
-          } catch (e) { }
-
-          const boltWallet = wallets.find(w => w.currency === 'BOLT');
+        const enrichedUsers = paginatedUsers.map((user) => {
+          // users 테이블의 balances 필드에서 BOLT 잔고 추출
+          const boltBalance = user.balances?.BOLT || { available: 0, locked: 0 };
           return {
             ...user,
             id: user.user_id,
-            bolt_balance: boltWallet?.available ?? 0,
-            bolt_locked: boltWallet?.locked || 0,
-            wallet_exists: boltWallet !== undefined
+            bolt_balance: boltBalance.available ?? 0,
+            bolt_locked: boltBalance.locked || 0,
+            wallet_exists: !!user.balances?.BOLT
           };
-        }));
+        });
 
         return ok({
           users: enrichedUsers,
@@ -657,7 +646,7 @@ export const handler = async (event) => {
         const userPromises = userIds.slice(0, 100).map(async (uid) => {
           try {
             const { Item } = await dynamodb.send(new GetCommand({
-              TableName: USER_CACHE_TABLE,
+              TableName: USERS_TABLE,
               Key: { user_id: uid }
             }));
             if (Item) {
@@ -691,7 +680,7 @@ export const handler = async (event) => {
       if (action === 'suspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended, suspended_at = :suspended_at, suspended_reason = :reason',
             ExpressionAttributeValues: {
@@ -732,7 +721,7 @@ export const handler = async (event) => {
       if (action === 'unsuspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended REMOVE suspended_at, suspended_reason',
             ExpressionAttributeValues: {
@@ -757,27 +746,37 @@ export const handler = async (event) => {
         const { currency = 'BOLT', newBalance, adjustReason } = b;
         if (typeof newBalance !== 'number' || newBalance < 0) return err(400, 'newBalance must be a non-negative number');
 
-        let currentBalance = 0, currentLocked = 0;
+        // users 테이블에서 현재 잔고 조회
+        let currentBalance = 0, currentLocked = 0, currentBalances = {};
         try {
-          const { Item: wallet } = await dynamodb.send(new GetCommand({
-            TableName: WALLETS_TABLE,
-            Key: { user_id: userId, currency: currency }
+          const { Item: user } = await dynamodb.send(new GetCommand({
+            TableName: USERS_TABLE,
+            Key: { user_id: userId }
           }));
-          currentBalance = wallet?.available || 0;
-          currentLocked = wallet?.locked || 0;
+          currentBalances = user?.balances || {};
+          currentBalance = currentBalances[currency]?.available || 0;
+          currentLocked = currentBalances[currency]?.locked || 0;
         } catch (e) {
-          console.log('Wallet fetch error (ignored):', e.message);
+          console.log('User fetch error (ignored):', e.message);
         }
 
+        // users 테이블의 balances 필드 업데이트
         try {
-          await dynamodb.send(new PutCommand({
-            TableName: WALLETS_TABLE,
-            Item: {
-              user_id: userId,
-              currency,
+          const updatedBalances = {
+            ...currentBalances,
+            [currency]: {
               available: newBalance,
-              locked: currentLocked,
-              updated_at: new Date().toISOString()
+              locked: currentLocked
+            }
+          };
+          
+          await dynamodb.send(new UpdateCommand({
+            TableName: USERS_TABLE,
+            Key: { user_id: userId },
+            UpdateExpression: 'SET balances = :balances, updated_at = :updatedAt',
+            ExpressionAttributeValues: {
+              ':balances': updatedBalances,
+              ':updatedAt': new Date().toISOString()
             }
           }));
         } catch (updateErr) {
