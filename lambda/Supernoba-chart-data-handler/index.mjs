@@ -25,8 +25,10 @@ const RDS_PORT = parseInt(process.env.RDS_PORT || '5432');
 const DB_NAME = process.env.DB_NAME || 'postgres';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
-const VALKEY_HOST = process.env.VALKEY_HOST || 'master.supernoba-depth-cache.5vrxzz.apn2.cache.amazonaws.com';
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
+// Candle Cache (4개 Redis 아키텍처)
+const CANDLE_CACHE_HOST = process.env.CANDLE_CACHE_HOST || process.env.VALKEY_HOST || 'localhost';
+const CANDLE_CACHE_PORT = parseInt(process.env.CANDLE_CACHE_PORT || process.env.VALKEY_PORT || '6379');
+const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
 
 // Valkey 클라이언트 (Lambda 컨테이너 재사용을 위해 전역)
 let valkeyClient = null;
@@ -55,13 +57,13 @@ function elapsed(start) {
   return `${(Date.now() - start)}ms`;
 }
 
-// Valkey 연결 가져오기
+// Candle Cache 연결 가져오기
 function getValkeyClient() {
   if (!valkeyClient) {
     valkeyClient = new Redis({
-      host: VALKEY_HOST,
-      port: VALKEY_PORT,
-      tls: {},
+      host: CANDLE_CACHE_HOST,
+      port: CANDLE_CACHE_PORT,
+      tls: VALKEY_TLS ? {} : undefined,
       connectTimeout: 5000,
       maxRetriesPerRequest: 1
     });

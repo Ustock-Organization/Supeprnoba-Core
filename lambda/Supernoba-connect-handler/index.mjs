@@ -2,7 +2,7 @@ import { verifyAuth } from '/opt/nodejs/verifyAuth.mjs';
 import { getValkeyClient, createLegacyClient } from '/opt/nodejs/index.mjs';
 
 // Layer를 통한 Valkey 클라이언트 (websocket 프리셋: 빠른 실패, 재시도 없음)
-const valkey = getValkeyClient({ type: 'depth', preset: 'websocket' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'websocket' });
 
 // 시작 시 환경변수 상태 로깅 (Cold Start 시)
 console.log(`[connect-handler] STARTUP - Cognito config:`, {

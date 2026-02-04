@@ -37,7 +37,7 @@ const DB_NAME = process.env.DB_NAME || 'postgres';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 
 // Layer를 통한 Valkey 클라이언트 (backup 캐시 사용)
-const valkey = getValkeyClient({ type: 'backup', preset: 'admin' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 
 const secretsManager = new SecretsManagerClient({ region: 'ap-northeast-2' });
 let cachedCreds = null;

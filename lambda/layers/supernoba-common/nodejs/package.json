@@ -4,6 +4,7 @@
   "description": "Supernoba Lambda Common Layer - Redis, CORS, Utilities",
   "type": "module",
   "dependencies": {
-    "ioredis": "^5.9.0"
+    "ioredis": "^5.9.0",
+    "pg": "^8.18.0"
   }
 }

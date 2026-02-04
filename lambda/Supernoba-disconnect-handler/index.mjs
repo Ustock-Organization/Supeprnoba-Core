@@ -4,7 +4,7 @@
 import { getValkeyClient } from '/opt/nodejs/index.mjs';
 
 // Layer를 통한 Valkey 클라이언트 (websocket 프리셋)
-const valkey = getValkeyClient({ type: 'depth', preset: 'websocket' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'websocket' });
 
 export const handler = async (event) => {
   const connectionId = event.requestContext?.connectionId;

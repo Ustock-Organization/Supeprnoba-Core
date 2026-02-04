@@ -1,17 +1,10 @@
 {
   "name": "supernoba-symbol-admin",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Symbol domain management Lambda",
+  "description": "Symbol domain management Lambda (gRPC removed, uses Redis queue)",
   "main": "index.mjs",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.624.0",
-    "@aws-sdk/client-secrets-manager": "^3.624.0",
-    "@aws-sdk/client-sqs": "^3.624.0",
-    "@aws-sdk/lib-dynamodb": "^3.624.0",
-    "@grpc/grpc-js": "^1.14.3",
-    "@grpc/proto-loader": "^0.8.0",
-    "ioredis": "^5.4.1",
     "pg": "^8.12.0"
   }
 }

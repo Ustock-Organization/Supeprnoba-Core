@@ -21,13 +21,6 @@ import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, Dyna
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import pg from 'pg';
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Common Layer - Valkey, CORS, Social Links
 import { getValkeyClient, CORS, response, detectPlatformFromUrl } from '/opt/nodejs/index.mjs';
@@ -66,48 +59,17 @@ const IPO_SYSTEM_ACCOUNT = 'ipo-system';
 const CLEANUP_QUEUE_URL = process.env.CLEANUP_QUEUE_URL || 'https://sqs.ap-northeast-2.amazonaws.com/264520158196/supernoba-symbol-cleanup';
 const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
 
-// 매칭 엔진 gRPC 설정
-const ENGINE_GRPC_HOST = process.env.ENGINE_GRPC_HOST || '172.31.47.97:50051';
-
-// gRPC 클라이언트 (lazy 초기화)
-let grpcClient = null;
-async function getGrpcClient() {
-  if (grpcClient) return grpcClient;
-
-  const PROTO_PATH = path.join(__dirname, 'snapshot.proto');
-  const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
-    keepCase: true,
-    longs: String,
-    enums: String,
-    defaults: true,
-    oneofs: true
-  });
-  const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-  grpcClient = new protoDescriptor.aws_wrapper.SnapshotService(
-    ENGINE_GRPC_HOST,
-    grpc.credentials.createInsecure()
-  );
-  return grpcClient;
-}
-
-// gRPC RemoveOrderBook 호출
+// 매칭 엔진 명령 (Redis 큐 방식)
 async function removeEngineOrderBook(symbol) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const client = await getGrpcClient();
-      const deadline = new Date();
-      deadline.setSeconds(deadline.getSeconds() + 10); // 10초 타임아웃
-      client.RemoveOrderBook({ symbol }, { deadline }, (err, response) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(response);
-        }
-      });
-    } catch (e) {
-      reject(e);
-    }
-  });
+  try {
+    const command = JSON.stringify({ action: 'remove_symbol', symbol });
+    await valkey.lpush('engine:admin:queue', command);
+    console.log(`[Engine] Queued remove_symbol command for: ${symbol}`);
+    return { success: true };
+  } catch (e) {
+    console.error(`[Engine] Failed to queue command:`, e.message);
+    return { success: false, error: e.message };
+  }
 }
 
 // Layer를 통한 클라이언트 초기화

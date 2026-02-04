@@ -11,8 +11,8 @@ import { getValkeyClient } from '/opt/nodejs/index.mjs';
 const ADMIN_KEY = process.env.ADMIN_KEY || '7194';
 
 // Layer를 통한 Redis 클라이언트 (두 개의 캐시 사용)
-const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
-const backupCache = getValkeyClient({ type: 'backup', preset: 'admin' });
+const depthCache = getValkeyClient({ type: 'operating', preset: 'admin' });
+const backupCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 
 let cacheConnected = false;
 

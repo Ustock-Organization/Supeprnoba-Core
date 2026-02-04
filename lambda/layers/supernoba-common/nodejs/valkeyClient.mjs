@@ -13,18 +13,31 @@
 
 import Redis from 'ioredis';
 
-// 캐시 타입별 호스트 설정
+// 캐시 타입별 호스트 설정 (4개 Redis 아키텍처)
 const CACHE_CONFIGS = {
   depth: {
     getHost: () => process.env.DEPTH_CACHE_HOST || process.env.VALKEY_HOST,
+    getPort: () => parseInt(process.env.DEPTH_CACHE_PORT || process.env.VALKEY_PORT || '6379'),
     name: 'depth-cache',
   },
   backup: {
     getHost: () => process.env.BACKUP_CACHE_HOST || process.env.VALKEY_HOST,
+    getPort: () => parseInt(process.env.BACKUP_CACHE_PORT || process.env.VALKEY_PORT || '6379'),
     name: 'backup-cache',
   },
+  operating: {
+    getHost: () => process.env.OPERATING_CACHE_HOST || process.env.VALKEY_HOST,
+    getPort: () => parseInt(process.env.OPERATING_CACHE_PORT || process.env.VALKEY_PORT || '6379'),
+    name: 'operating-cache',
+  },
+  candle: {
+    getHost: () => process.env.CANDLE_CACHE_HOST || process.env.VALKEY_HOST,
+    getPort: () => parseInt(process.env.CANDLE_CACHE_PORT || process.env.VALKEY_PORT || '6379'),
+    name: 'candle-cache',
+  },
   default: {
-    getHost: () => process.env.VALKEY_HOST,
+    getHost: () => process.env.OPERATING_CACHE_HOST || process.env.VALKEY_HOST,
+    getPort: () => parseInt(process.env.OPERATING_CACHE_PORT || process.env.VALKEY_PORT || '6379'),
     name: 'default-cache',
   },
 };
@@ -84,12 +97,13 @@ export function getValkeyClient(options = {}) {
 
   const config = CACHE_CONFIGS[type] || CACHE_CONFIGS.default;
   const host = config.getHost();
+  const port = config.getPort ? config.getPort() : parseInt(process.env.VALKEY_PORT || '6379', 10);
 
   if (!host) {
     console.warn(`[valkeyClient] Warning: No host configured for type '${type}'`);
   }
 
-  const cacheKey = `${type}-${host}-${preset}`;
+  const cacheKey = `${type}-${host}-${port}-${preset}`;
 
   if (instances.has(cacheKey)) {
     return instances.get(cacheKey);
@@ -100,7 +114,7 @@ export function getValkeyClient(options = {}) {
 
   const client = new Redis({
     host,
-    port: parseInt(process.env.VALKEY_PORT || '6379', 10),
+    port,
     tls,
     ...presetOptions,
     ...overrides,
