@@ -25,9 +25,9 @@ import { v4 as uuidv4 } from "uuid";
 
 // === Configuration ===
 const CONFIG = {
-  // Redis (Backup Cache - 설정 및 상태 관리)
-  backupCacheHost: process.env.BACKUP_CACHE_HOST || "master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com",
-  backupCachePort: parseInt(process.env.BACKUP_CACHE_PORT || "6379"),
+  // Redis (Operating Cache - MM 설정 및 상태 관리, 4개 Redis 아키텍처)
+  operatingCacheHost: process.env.OPERATING_CACHE_HOST || process.env.BACKUP_CACHE_HOST || "localhost",
+  operatingCachePort: parseInt(process.env.OPERATING_CACHE_PORT || process.env.BACKUP_CACHE_PORT || "6379"),
 
   // Kinesis (주문 발행)
   kinesisStream: process.env.KINESIS_STREAM || "supernoba-orders",
@@ -39,34 +39,32 @@ const CONFIG = {
 };
 
 console.log("=== Supernoba Market Maker Service v9 ===");
-console.log("Backup Cache:", CONFIG.backupCacheHost + ":" + CONFIG.backupCachePort);
+console.log("Operating Cache:", CONFIG.operatingCacheHost + ":" + CONFIG.operatingCachePort);
 console.log("Kinesis Stream:", CONFIG.kinesisStream);
 
 // === Clients ===
 const kinesis = new KinesisClient({ region: CONFIG.awsRegion });
 
-// Backup Cache - 설정 읽기/쓰기용
-const backupCache = new Redis({
-  host: CONFIG.backupCacheHost,
-  port: CONFIG.backupCachePort,
-  tls: {},  // AWS ElastiCache는 TLS 필수
+// TLS 설정 (VALKEY_TLS=false이면 비활성화)
+const useTls = process.env.VALKEY_TLS !== "false";
+const redisOptions = {
+  host: CONFIG.operatingCacheHost,
+  port: CONFIG.operatingCachePort,
   connectTimeout: 5000,
   lazyConnect: true,
-});
+  ...(useTls ? { tls: {} } : {}),
+};
+
+// Operating Cache - MM 설정 읽기/쓰기용
+const operatingCache = new Redis(redisOptions);
 
 // Backup Cache - Pub/Sub 구독용 (별도 연결 필요)
-const backupCacheSub = new Redis({
-  host: CONFIG.backupCacheHost,
-  port: CONFIG.backupCachePort,
-  tls: {},
-  connectTimeout: 5000,
-  lazyConnect: true,
-});
+const operatingCacheSub = new Redis(redisOptions);
 
-backupCache.on("error", (e) => console.error("[BackupCache] Error:", e.message));
-backupCache.on("connect", () => console.log("[BackupCache] Connected"));
-backupCacheSub.on("error", (e) => console.error("[BackupCache Sub] Error:", e.message));
-backupCacheSub.on("connect", () => console.log("[BackupCache Sub] Connected"));
+operatingCache.on("error", (e) => console.error("[BackupCache] Error:", e.message));
+operatingCache.on("connect", () => console.log("[BackupCache] Connected"));
+operatingCacheSub.on("error", (e) => console.error("[BackupCache Sub] Error:", e.message));
+operatingCacheSub.on("connect", () => console.log("[BackupCache Sub] Connected"));
 
 // === State ===
 const activeSymbols = new Map();  // symbol -> { config, interval, orderCount, startedAt }
@@ -137,8 +135,8 @@ async function runSymbol(symbol) {
   }
 
   // Redis에 현재 가격 저장
-  await backupCache.set("mm:price:" + symbol, price.toString());
-  await backupCache.set("mm:orderCount:" + symbol, instance.orderCount.toString());
+  await operatingCache.set("mm:price:" + symbol, price.toString());
+  await operatingCache.set("mm:orderCount:" + symbol, instance.orderCount.toString());
 }
 
 // === Load Config (supports both STRING and HASH types) ===
@@ -146,7 +144,7 @@ async function loadConfig(symbol) {
   const key = "mm:config:" + symbol;
 
   // Check key type first for backward compatibility
-  const keyType = await backupCache.type(key);
+  const keyType = await operatingCache.type(key);
 
   if (keyType === "none") {
     console.log("[Config] No config found for " + symbol + ", using defaults");
@@ -157,7 +155,7 @@ async function loadConfig(symbol) {
 
   if (keyType === "string") {
     // Legacy format: JSON string (Admin Lambda v1)
-    const jsonStr = await backupCache.get(key);
+    const jsonStr = await operatingCache.get(key);
     try {
       const parsed = JSON.parse(jsonStr);
       config = {
@@ -175,7 +173,7 @@ async function loadConfig(symbol) {
     }
   } else if (keyType === "hash") {
     // New format: HASH type (Admin Lambda v2)
-    const hashData = await backupCache.hgetall(key);
+    const hashData = await operatingCache.hgetall(key);
     config = {
       basePrice: parseFloat(hashData.basePrice) || 100,
       period: parseFloat(hashData.period) || 600,
@@ -215,7 +213,7 @@ async function startSymbol(symbol) {
   activeSymbols.set(symbol, instance);
 
   // Redis에 시작 시간 기록
-  await backupCache.set("mm:started_at:" + symbol, Date.now().toString());
+  await operatingCache.set("mm:started_at:" + symbol, Date.now().toString());
 
   console.log("[MM] Started " + symbol + " - basePrice: " + config.basePrice + ", period: " + config.period + "s, amplitude: " + (config.amplitude * 100).toFixed(1) + "%");
 }
@@ -260,7 +258,7 @@ async function publishStatus() {
   };
 
   // mm:status 채널로 publish (Streamer가 Admin에게 전달)
-  await backupCache.publish("mm:status", JSON.stringify(status));
+  await operatingCache.publish("mm:status", JSON.stringify(status));
 }
 
 // === Control Message Handler ===
@@ -284,7 +282,7 @@ async function handleControlMessage(message) {
 
       case "startAll":
         // Redis에서 모든 running symbols 가져오기
-        const runningSymbols = await backupCache.smembers("mm:running:symbols");
+        const runningSymbols = await operatingCache.smembers("mm:running:symbols");
         for (const symbol of runningSymbols) {
           await startSymbol(symbol);
         }
@@ -323,7 +321,7 @@ async function handleControlMessage(message) {
 
 // === Redis Sync ===
 async function syncWithRedis() {
-  const runningSymbols = await backupCache.smembers("mm:running:symbols");
+  const runningSymbols = await operatingCache.smembers("mm:running:symbols");
   const currentSymbols = new Set(activeSymbols.keys());
 
   // 시작해야 할 심볼
@@ -347,14 +345,14 @@ async function syncWithRedis() {
 async function main() {
   console.log("[MM] Connecting to Redis...");
 
-  await backupCache.connect();
-  await backupCacheSub.connect();
+  await operatingCache.connect();
+  await operatingCacheSub.connect();
 
   // mm:control 채널 구독
-  await backupCacheSub.subscribe("mm:control");
+  await operatingCacheSub.subscribe("mm:control");
   console.log("[MM] Subscribed to mm:control channel");
 
-  backupCacheSub.on("message", (channel, message) => {
+  operatingCacheSub.on("message", (channel, message) => {
     if (channel === "mm:control") {
       handleControlMessage(message);
     }
@@ -378,8 +376,8 @@ process.on("SIGINT", async () => {
 
   if (statusInterval) clearInterval(statusInterval);
 
-  await backupCache.quit();
-  await backupCacheSub.quit();
+  await operatingCache.quit();
+  await operatingCacheSub.quit();
 
   console.log("[MM] Goodbye!");
   process.exit(0);
@@ -389,8 +387,8 @@ process.on("SIGTERM", async () => {
   console.log("\n[MM] Received SIGTERM, shutting down...");
   stopAllSymbols();
   if (statusInterval) clearInterval(statusInterval);
-  await backupCache.quit();
-  await backupCacheSub.quit();
+  await operatingCache.quit();
+  await operatingCacheSub.quit();
   process.exit(0);
 });
 

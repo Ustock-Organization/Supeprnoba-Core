@@ -6,9 +6,13 @@ namespace aggregator {
 Config Config::from_env() {
     Config cfg;
 
-    // Valkey 설정
-    cfg.valkey_host = std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost";
-    cfg.valkey_port = std::getenv("VALKEY_PORT") ? std::atoi(std::getenv("VALKEY_PORT")) : 6379;
+    // Candle Redis 설정 (4개 Redis 아키텍처 - 캔들 전용)
+    cfg.valkey_host = std::getenv("CANDLE_CACHE_HOST") 
+        ? std::getenv("CANDLE_CACHE_HOST") 
+        : (std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost");
+    cfg.valkey_port = std::getenv("CANDLE_CACHE_PORT") 
+        ? std::atoi(std::getenv("CANDLE_CACHE_PORT")) 
+        : (std::getenv("VALKEY_PORT") ? std::atoi(std::getenv("VALKEY_PORT")) : 6379);
 
     // AWS 설정
     cfg.aws_region = std::getenv("AWS_REGION") ? std::getenv("AWS_REGION") : "ap-northeast-2";

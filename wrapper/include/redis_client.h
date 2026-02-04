@@ -40,6 +40,7 @@ public:
     bool lpush(const std::string& key, const std::string& value);
     bool ltrim(const std::string& key, long start, long stop);
     std::vector<std::string> lrange(const std::string& key, long start, long stop);
+    std::optional<std::string> rpop(const std::string& key);
 
     // Set 연산 (연결 관리용)
     std::vector<std::string> smembers(const std::string& key);

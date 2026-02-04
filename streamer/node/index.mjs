@@ -5,79 +5,92 @@
 import Redis from 'ioredis';
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
 
-// 환경변수
-const VALKEY_HOST = process.env.VALKEY_HOST || 'localhost';
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
+// 환경변수 (4개 Redis 아키텍처)
+const DEPTH_CACHE_HOST = process.env.DEPTH_CACHE_HOST || process.env.VALKEY_HOST || 'localhost';
+const DEPTH_CACHE_PORT = parseInt(process.env.DEPTH_CACHE_PORT || process.env.VALKEY_PORT || '6379');
+const OPERATING_CACHE_HOST = process.env.OPERATING_CACHE_HOST || process.env.BACKUP_CACHE_HOST || 'localhost';
+const OPERATING_CACHE_PORT = parseInt(process.env.OPERATING_CACHE_PORT || process.env.VALKEY_PORT || '6379');
+const CANDLE_CACHE_HOST = process.env.CANDLE_CACHE_HOST || process.env.VALKEY_HOST || 'localhost';
+const CANDLE_CACHE_PORT = parseInt(process.env.CANDLE_CACHE_PORT || process.env.VALKEY_PORT || '6379');
 const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
 const WEBSOCKET_ENDPOINT = process.env.WEBSOCKET_ENDPOINT;
 const ADMIN_WEBSOCKET_ENDPOINT = process.env.ADMIN_WEBSOCKET_ENDPOINT || '2qlrv92731.execute-api.ap-northeast-2.amazonaws.com/admin';
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
-const BACKUP_CACHE_HOST = process.env.BACKUP_CACHE_HOST || 'master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com';
 
 const POLL_MS = 200;  // 브로드캐스트 주기
 let lastMMDataHash = '';  // MM 데이터 변경 감지용
 let isShuttingDown = false;  // 종료 플래그
 const intervalHandles = [];  // 인터벌 핸들 저장 (cleanup용)
 
-console.log('=== Streaming Server (Simplified) ===');
-console.log(`Valkey: ${VALKEY_HOST}:${VALKEY_PORT}`);
-console.log(`Backup Cache: ${BACKUP_CACHE_HOST}`);
+console.log('=== Streaming Server (4 Redis Architecture) ===');
+console.log(`Depth Cache: ${DEPTH_CACHE_HOST}:${DEPTH_CACHE_PORT}`);
+console.log(`Operating Cache: ${OPERATING_CACHE_HOST}:${OPERATING_CACHE_PORT}`);
+console.log(`Candle Cache: ${CANDLE_CACHE_HOST}:${CANDLE_CACHE_PORT}`);
 
 // Redis 재연결 전략 (exponential backoff)
 const retryStrategy = (times) => {
   if (times > 100) {
     console.error(`[Redis] Max retries (${times}) reached, giving up`);
-    return null; // 재연결 포기
+    return null;
   }
-  const delay = Math.min(times * 100, 3000); // 최대 3초
+  const delay = Math.min(times * 100, 3000);
   console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times})`);
   return delay;
 };
 
-// Valkey 연결 (메인 데이터 캐시)
-const valkey = new Redis({
-  host: VALKEY_HOST,
-  port: VALKEY_PORT,
-  tls: VALKEY_TLS ? { rejectUnauthorized: false } : undefined,
-  connectTimeout: 5000,
-  retryStrategy,
-  maxRetriesPerRequest: null, // 무제한 재시도 (재연결 후 자동 재시도)
-  enableOfflineQueue: true,   // 연결 끊김 시 명령 대기열에 저장
-});
+const tlsConfig = VALKEY_TLS ? { rejectUnauthorized: false } : undefined;
 
-valkey.on('error', (err) => console.error('[Valkey] Error:', err.message));
-valkey.on('connect', () => console.log('[Valkey] Connected'));
-valkey.on('reconnecting', (delay) => console.log(`[Valkey] Reconnecting in ${delay}ms`));
-
-// Backup Cache 연결 (어드민 연결 목록 조회용) - AWS ElastiCache는 항상 TLS 필요
-const backupCache = new Redis({
-  host: BACKUP_CACHE_HOST,
-  port: VALKEY_PORT,
-  tls: {},  // AWS ElastiCache는 TLS 필수
+// Depth Cache (호가/티커 폴링)
+const depthCache = new Redis({
+  host: DEPTH_CACHE_HOST,
+  port: DEPTH_CACHE_PORT,
+  tls: tlsConfig,
   connectTimeout: 5000,
   retryStrategy,
   maxRetriesPerRequest: null,
   enableOfflineQueue: true,
 });
+depthCache.on('error', (err) => console.error('[DepthCache] Error:', err.message));
+depthCache.on('connect', () => console.log('[DepthCache] Connected'));
 
-backupCache.on('error', (err) => console.error('[BackupCache] Error:', err.message));
-backupCache.on('connect', () => console.log('[BackupCache] Connected'));
-backupCache.on('reconnecting', () => console.log('[BackupCache] Reconnecting...'));
-
-// Backup Cache Pub/Sub 연결 (MM 상태 구독용) - 별도 연결 필요
-const backupCacheSub = new Redis({
-  host: BACKUP_CACHE_HOST,
-  port: VALKEY_PORT,
-  tls: {},  // AWS ElastiCache는 TLS 필수
+// Operating Cache (admin 연결, 랭킹 등)
+const operatingCache = new Redis({
+  host: OPERATING_CACHE_HOST,
+  port: OPERATING_CACHE_PORT,
+  tls: tlsConfig,
   connectTimeout: 5000,
   retryStrategy,
   maxRetriesPerRequest: null,
   enableOfflineQueue: true,
 });
+operatingCache.on('error', (err) => console.error('[OperatingCache] Error:', err.message));
+operatingCache.on('connect', () => console.log('[OperatingCache] Connected'));
 
-backupCacheSub.on('error', (err) => console.error('[BackupCache Sub] Error:', err.message));
-backupCacheSub.on('connect', () => console.log('[BackupCache Sub] Connected'));
-backupCacheSub.on('reconnecting', () => console.log('[BackupCache Sub] Reconnecting...'));
+// Operating Cache Pub/Sub (mm:status, rankings:broadcast 구독)
+const operatingCacheSub = new Redis({
+  host: OPERATING_CACHE_HOST,
+  port: OPERATING_CACHE_PORT,
+  tls: tlsConfig,
+  connectTimeout: 5000,
+  retryStrategy,
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: true,
+});
+operatingCacheSub.on('error', (err) => console.error('[OperatingCache Sub] Error:', err.message));
+operatingCacheSub.on('connect', () => console.log('[OperatingCache Sub] Connected'));
+
+// Candle Cache (캔들 데이터 폴링)
+const candleCache = new Redis({
+  host: CANDLE_CACHE_HOST,
+  port: CANDLE_CACHE_PORT,
+  tls: tlsConfig,
+  connectTimeout: 5000,
+  retryStrategy,
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: true,
+});
+candleCache.on('error', (err) => console.error('[CandleCache] Error:', err.message));
+candleCache.on('connect', () => console.log('[CandleCache] Connected'));
 
 // API Gateway 클라이언트 (일반 사용자)
 const apiClient = new ApiGatewayManagementApiClient({
@@ -133,7 +146,7 @@ async function sendToAdmin(connectionId, data) {
     if (error.$metadata?.httpStatusCode === 410) {
       // 연결 끊어짐
       adminConnections.delete(connectionId);
-      await backupCache.srem('admin:connections', connectionId);
+      await operatingCache.srem('admin:connections', connectionId);
     }
     return false;
   }
@@ -173,8 +186,8 @@ async function broadcastLoop() {
 
   while (!isShuttingDown) {
     try {
-      // 구독 중인 심볼 목록 가져오기
-      const subscribedSymbols = await valkey.smembers('subscribed:symbols');
+      // 구독 중인 심볼 목록 가져오기 (Operating Cache)
+      const subscribedSymbols = await operatingCache.smembers('subscribed:symbols');
 
       if (subscribedSymbols.length > 0) {
         // 각 심볼에 대해 데이터 브로드캐스트
@@ -194,19 +207,19 @@ async function broadcastLoop() {
 
 async function broadcastSymbolData(symbol) {
   try {
-    // Main 구독자 (depth + ticker + candle)
-    const mainConnections = await valkey.smembers(`symbol:${symbol}:main`);
+    // Main 구독자 (depth + ticker + candle) - Operating Cache
+    const mainConnections = await operatingCache.smembers(`symbol:${symbol}:main`);
 
-    // Sub 구독자 (ticker만) - :sub 키는 ticker-only 구독자용
-    const subConnections = await valkey.smembers(`symbol:${symbol}:sub`);
+    // Sub 구독자 (ticker만) - Operating Cache
+    const subConnections = await operatingCache.smembers(`symbol:${symbol}:sub`);
 
     if (mainConnections.length === 0 && subConnections.length === 0) return;
 
-    // Valkey에서 데이터 가져오기
+    // 각 Redis에서 데이터 가져오기
     const [depthJson, tickerJson, candleData] = await Promise.all([
-      valkey.get(`depth:${symbol}`),
-      valkey.get(`ticker:${symbol}`),
-      valkey.hgetall(`candle:1m:${symbol}`)
+      depthCache.get(`depth:${symbol}`),      // Depth Cache
+      depthCache.get(`ticker:${symbol}`),     // Depth Cache
+      candleCache.hgetall(`candle:1m:${symbol}`)  // Candle Cache
     ]);
 
     // ticker 파싱 (Main, Sub 모두에게 전송)
@@ -268,7 +281,7 @@ function ymdhmToEpoch(ymdhm) {
 async function subscribeMMStatus() {
   console.log('[MM Pub/Sub] Subscribing to mm:status channel...');
 
-  backupCacheSub.subscribe('mm:status', (err) => {
+  operatingCacheSub.subscribe('mm:status', (err) => {
     if (err) {
       console.error('[MM Pub/Sub] Subscribe error:', err.message);
     } else {
@@ -281,7 +294,7 @@ async function subscribeMMStatus() {
 async function subscribeRankings() {
   console.log('[Rankings Pub/Sub] Subscribing to rankings:broadcast channel...');
 
-  backupCacheSub.subscribe('rankings:broadcast', (err) => {
+  operatingCacheSub.subscribe('rankings:broadcast', (err) => {
     if (err) {
       console.error('[Rankings Pub/Sub] Subscribe error:', err.message);
     } else {
@@ -292,7 +305,7 @@ async function subscribeRankings() {
 
 // === Pub/Sub 메시지 핸들러 ===
 function setupPubSubHandlers() {
-  backupCacheSub.on('message', async (channel, message) => {
+  operatingCacheSub.on('message', async (channel, message) => {
     if (channel === 'mm:status') {
       try {
         const rawData = JSON.parse(message);
@@ -307,7 +320,7 @@ function setupPubSubHandlers() {
         // 각 심볼의 실제 체결가(ohlc.c) 조회
         const symbolsWithPrice = await Promise.all(
           (rawData.symbols || []).map(async (s) => {
-            const ohlcJson = await valkey.get(`ohlc:${s.symbol}`);
+            const ohlcJson = await candleCache.get(`ohlc:${s.symbol}`);
             const ohlc = ohlcJson ? JSON.parse(ohlcJson) : null;
 
             return {
@@ -373,7 +386,7 @@ function setupPubSubHandlers() {
 // === 어드민 연결 동기화 (Backup Cache에서 읽어오기) ===
 async function syncAdminConnections() {
   try {
-    const connections = await backupCache.smembers('admin:connections');
+    const connections = await operatingCache.smembers('admin:connections');
     // 메모리 세트 업데이트
     const oldSize = adminConnections.size;
     adminConnections.clear();
@@ -419,14 +432,15 @@ async function gracefulShutdown(signal) {
   intervalHandles.forEach(handle => clearInterval(handle));
   console.log(`[Shutdown] Cleared ${intervalHandles.length} intervals`);
 
-  // Redis 연결 종료
+  // Redis 연결 종료 (4개 Redis)
   try {
     await Promise.allSettled([
-      valkey.quit(),
-      backupCache.quit(),
-      backupCacheSub.quit()
+      depthCache.quit(),
+      operatingCache.quit(),
+      operatingCacheSub.quit(),
+      candleCache.quit()
     ]);
-    console.log('[Shutdown] Redis connections closed');
+    console.log('[Shutdown] All Redis connections closed');
   } catch (err) {
     console.error('[Shutdown] Error closing Redis:', err.message);
   }

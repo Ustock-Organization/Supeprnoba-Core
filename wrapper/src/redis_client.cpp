@@ -401,6 +401,23 @@ std::vector<std::string> RedisClient::lrange(const std::string& key, long start,
     return result;
 }
 
+std::optional<std::string> RedisClient::rpop(const std::string& key) {
+    if (!context_) return std::nullopt;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "RPOP %s", key.c_str()));
+    
+    if (!reply) return std::nullopt;
+    
+    std::optional<std::string> result;
+    if (reply->type == REDIS_REPLY_STRING) {
+        result = std::string(reply->str, reply->len);
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
 std::vector<std::string> RedisClient::smembers(const std::string& key) {
     std::vector<std::string> result;
     if (!context_) return result;
