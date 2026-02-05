@@ -106,23 +106,18 @@ export const handler = async (event) => {
 
     // ==========================================
     // GET /auth - 관리자 권한 확인 (공개)
+    // DynamoDB user 테이블의 is_admin 필드로만 확인
     // ==========================================
     if ((path.includes('/auth') || q.type === 'auth') && m === 'GET') {
-      const { userId, twitterUsername, googleEmail } = q;
+      const { userId } = q;
       let admin = false;
 
-      if (twitterUsername) {
-        admin = twitterUsername.replace('@', '').toLowerCase() === 'tchinnom';
-      }
-      if (googleEmail && !admin) {
-        admin = ['tchinnom@gmail.com', 'admin@supernoba.com'].includes(googleEmail.toLowerCase());
-      }
-      if (userId && !admin) {
+      if (userId) {
         try {
           const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
           if (Item) admin = Item.is_admin === true;
         } catch (e) {
-          console.error('[auth] User cache lookup error:', e.message);
+          console.error('[auth] User lookup error:', e.message);
         }
       }
       return ok({ isAdmin: admin });

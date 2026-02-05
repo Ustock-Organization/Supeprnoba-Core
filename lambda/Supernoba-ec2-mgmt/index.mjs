@@ -16,9 +16,29 @@ import { CloudWatchClient, GetMetricStatisticsCommand } from '@aws-sdk/client-cl
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 
+// Auth Layer
+const loadAuth = async () => {
+  try {
+    return await import('/opt/nodejs/verifyAuth.mjs');
+  } catch (err) {
+    console.error('[ec2-mgmt] Failed to load auth layer:', err.message);
+    return {
+      verifyAdmin: async () => {
+        console.error('[ec2-mgmt] Auth layer not available - rejecting request');
+        return { success: false, error: 'AUTH_LAYER_UNAVAILABLE' };
+      },
+      authErrorResponse: (r) => ({
+        statusCode: 503,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: r.error || 'Service temporarily unavailable' })
+      })
+    };
+  }
+};
+const { verifyAdmin, authErrorResponse } = await loadAuth();
+
 const REGION = 'ap-northeast-2';
 const AUDIT_TABLE = 'supernoba-ec2-audit';
-const ADMIN_KEY = process.env.ADMIN_KEY || '7194';
 
 // Allowed instance tag filter (only manage instances with this tag)
 const MANAGED_TAG_KEY = 'Project';
@@ -46,15 +66,6 @@ const jsonResponse = (statusCode, body) => ({
 });
 
 const errorResponse = (statusCode, message) => jsonResponse(statusCode, { error: message });
-
-// Auth verification
-const verifyAdmin = (event) => {
-  const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  if (!authHeader || authHeader !== ADMIN_KEY) {
-    return false;
-  }
-  return true;
-};
 
 // Audit logging
 const logAudit = async (userId, action, instanceId, result) => {
@@ -324,9 +335,10 @@ export const handler = async (event) => {
     return jsonResponse(200, { message: 'OK' });
   }
 
-  // Auth check
-  if (!verifyAdmin(event)) {
-    return errorResponse(403, 'Unauthorized');
+  // Auth check (Cognito JWT or API Key)
+  const authResult = await verifyAdmin(event);
+  if (!authResult.success) {
+    return authErrorResponse(authResult, CORS_HEADERS);
   }
 
   const method = event.httpMethod;
@@ -337,14 +349,8 @@ export const handler = async (event) => {
   const instanceIdMatch = path.match(/\/ec2\/instances\/(i-[a-z0-9]+)/);
   const instanceId = instanceIdMatch ? instanceIdMatch[1] : null;
 
-  // Parse userId from query or body
-  let userId = queryParams.userId || 'admin';
-  if (method === 'POST' && event.body) {
-    try {
-      const body = JSON.parse(event.body);
-      userId = body.userId || userId;
-    } catch (e) {}
-  }
+  // Get userId from auth result (JWT sub or 'admin' for API key)
+  const userId = authResult.userId || authResult.email || 'admin';
 
   // Route handling
   try {

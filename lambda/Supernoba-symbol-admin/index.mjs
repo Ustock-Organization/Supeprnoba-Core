@@ -7,6 +7,7 @@
  * - GET /symbols/{symbol} - 개별 종목 상세 (공개)
  * - POST /symbols (action=listing) - 신규 종목 등록 (관리자)
  * - POST /symbols (action=activate) - 종목 활성화 (관리자)
+ * - POST /symbols (action=deactivate) - 종목 비활성화 (관리자)
  * - POST /symbols (action=approve) - 크리에이터 승인 + IPO 생성 (관리자)
  * - POST /symbols (action=reject) - 크리에이터 거절 (관리자)
  * - POST /symbols (action=restore) - 삭제된 종목 복원 (관리자)
@@ -175,7 +176,14 @@ export const handler = async (event) => {
     const m = event.httpMethod;
     const q = event.queryStringParameters || {};
     const path = event.path || '';
-    const action = q.action;
+    // action을 쿼리 파라미터 또는 body에서 가져옴
+    let action = q.action;
+    if (!action && event.body) {
+      try {
+        const bodyParsed = JSON.parse(event.body);
+        action = bodyParsed.action;
+      } catch (e) { /* ignore */ }
+    }
 
     // ==========================================
     // GET: 종목 목록/상세 (공개)
@@ -521,25 +529,23 @@ export const handler = async (event) => {
           yesterday.setDate(yesterday.getDate() - 1);
           yesterday.setUTCHours(0, 0, 0, 0);
           const yesterdayEpoch = Math.floor(yesterday.getTime() / 1000);
-          const yesterdayYmdhm = yesterday.toISOString().slice(0, 10).replace(/-/g, '') + '0000';
 
           await pg.query(`
-            INSERT INTO candle_history (symbol, interval, time_epoch, time_ymdhm, open, high, low, close, volume)
-            VALUES ($1, '1d', $2, $3, $4, $4, $4, $4, 0)
+            INSERT INTO candle_history (symbol, interval, time_epoch, open, high, low, close, volume)
+            VALUES ($1, '1d', $2, $3, $3, $3, $3, 0)
             ON CONFLICT (symbol, interval, time_epoch) DO NOTHING
-          `, [symLower, yesterdayEpoch, yesterdayYmdhm, listingPrice]);
+          `, [symLower, yesterdayEpoch, listingPrice]);
 
           // 당일 캔들 생성 (dayOpen, dayHigh, dayLow 제공용)
           const today = new Date();
           today.setUTCHours(0, 0, 0, 0);
           const todayEpoch = Math.floor(today.getTime() / 1000);
-          const todayYmdhm = today.toISOString().slice(0, 10).replace(/-/g, '') + '0000';
 
           await pg.query(`
-            INSERT INTO candle_history (symbol, interval, time_epoch, time_ymdhm, open, high, low, close, volume)
-            VALUES ($1, '1d', $2, $3, $4, $4, $4, $4, 0)
+            INSERT INTO candle_history (symbol, interval, time_epoch, open, high, low, close, volume)
+            VALUES ($1, '1d', $2, $3, $3, $3, $3, 0)
             ON CONFLICT (symbol, interval, time_epoch) DO NOTHING
-          `, [symLower, todayEpoch, todayYmdhm, listingPrice]);
+          `, [symLower, todayEpoch, listingPrice]);
 
           console.log(`[LISTING] RDS 1d candles created for ${symLower} (prev: ${yesterdayEpoch}, today: ${todayEpoch})`);
         } catch (pgErr) {
@@ -567,9 +573,11 @@ export const handler = async (event) => {
           console.log(`[LISTING] IPO holdings created: ${sym} x ${totalShares} @ ${listingPrice}`);
 
           // 2. IPO 주문 생성 (DynamoDB Stream → ipo-processor)
+          const ipoOrderId = `ipo-${sym}-${Date.now()}`;
           await dynamodb.send(new PutCommand({
             TableName: IPO_ORDERS_TABLE,
             Item: {
+              order_id: ipoOrderId,  // Primary Key
               symbol: sym,
               status: 'PENDING',
               quantity: totalShares,
@@ -629,6 +637,48 @@ export const handler = async (event) => {
         await valkey.sadd('active:symbols', sym);
 
         return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
+      }
+
+      // deactivate - 종목 비활성화 (데이터 유지, 검색/거래에서 제외)
+      if (action === 'deactivate') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { symbol } = b;
+        if (!symbol || typeof symbol !== 'string') return err(400, 'symbol is required');
+        if (!validateSymbol(symbol)) return err(400, 'Invalid symbol format. Must be 2-20 alphanumeric characters (A-Z, 0-9)');
+
+        const sym = symbol.toUpperCase().trim();
+
+        const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (!Item) return err(404, `Symbol ${sym} not found`);
+        if (Item.status === 'INACTIVE') return err(400, `Symbol ${sym} is already inactive`);
+
+        const now = new Date().toISOString();
+
+        // 1. DynamoDB status를 INACTIVE로 변경
+        await dynamodb.send(new UpdateCommand({
+          TableName: SYMBOLS_TABLE,
+          Key: { symbol: sym },
+          UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':status': 'INACTIVE', ':updatedAt': now }
+        }));
+
+        // 2. active:symbols에서 제거
+        await valkey.srem('active:symbols', sym);
+
+        // 3. subscribed:symbols에서 제거
+        await valkey.srem('subscribed:symbols', sym);
+
+        console.log(`[DEACTIVATE] Symbol ${sym} deactivated - removed from active:symbols and subscribed:symbols`);
+
+        return ok({
+          success: true,
+          symbol: sym,
+          status: 'INACTIVE',
+          message: `Symbol ${sym} deactivated successfully. Data preserved but excluded from search/trading.`
+        });
       }
 
       // approve - 크리에이터 승인 + IPO 생성
