@@ -34,6 +34,11 @@ void CheckpointManager::checkpoint(const std::string& shard_id, const std::strin
 
     ++checkpoint_count_;
 
+    // Fix 3: 백그라운드 플러시 활성 시 inline flush 스킵 (consumer 스레드 블로킹 방지)
+    if (config_.enable_background_flush && running_.load()) {
+        return;
+    }
+
     // 즉시 플러시 조건 확인
     bool should_flush = false;
 
@@ -177,7 +182,7 @@ void CheckpointManager::flushLoop() {
             break;
         }
 
-        // 시간 기반 플러시
+        // 시간 기반 + 레코드 수 기반 플러시
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             auto now = std::chrono::steady_clock::now();
@@ -187,7 +192,9 @@ void CheckpointManager::flushLoop() {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - cp.last_updated).count();
 
-                    if (elapsed >= config_.flush_interval_seconds) {
+                    // 시간 초과 또는 레코드 수 초과 시 플러시
+                    if (elapsed >= config_.flush_interval_seconds ||
+                        cp.records_since_flush >= config_.flush_interval_records) {
                         flushShard(shard_id, cp);
                     }
                 }

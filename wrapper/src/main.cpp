@@ -255,10 +255,11 @@ int main(int argc, char* argv[]) {
             cp_config.stream_name = stream_name;
             cp_config.flush_interval_records = checkpoint_interval_records;
             cp_config.flush_interval_seconds = checkpoint_interval_seconds;
-            cp_config.enable_background_flush = false;  // 동기식 체크포인팅
+            cp_config.enable_background_flush = true;  // Fix 3: 비동기 체크포인팅 (consumer 스레드 블로킹 방지)
 
             checkpoint_manager = std::make_unique<CheckpointManager>(&redis, cp_config);
-            Logger::info("CheckpointManager initialized for stream:", stream_name);
+            checkpoint_manager->startBackgroundFlush();  // Fix 3: 백그라운드 플러시 시작
+            Logger::info("CheckpointManager initialized for stream:", stream_name, "(background flush enabled)");
         } else {
             Logger::warn("CheckpointManager disabled - checkpoint_enabled:", checkpoint_enabled, "redis_connected:", redis_connected);
         }
@@ -312,19 +313,35 @@ int main(int argc, char* argv[]) {
         Logger::info("Listening for orders on:", stream_name);
         Logger::info("gRPC server on port:", grpc_port);
         
-        // 메인 루프: 스냅샷 저장
+        // 메인 루프: 스냅샷 저장 + watchdog
         auto last_snapshot = std::chrono::steady_clock::now();
         auto last_metrics = std::chrono::steady_clock::now();
-        
+
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            
+
             auto now = std::chrono::steady_clock::now();
-            
+
+            // Fix 1: Watchdog — consumer 스레드가 60초 이상 진행하지 않으면 재시작
+            if (consumer.isRunning()) {
+                auto last_progress = consumer.getLastProgressEpochMs();
+                if (last_progress > 0) {
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    auto stale_seconds = (now_ms - last_progress) / 1000;
+                    if (stale_seconds >= KinesisConsumer::WATCHDOG_TIMEOUT_SECONDS) {
+                        Logger::error("WATCHDOG: KinesisConsumer stale for", stale_seconds,
+                                      "seconds (threshold:", KinesisConsumer::WATCHDOG_TIMEOUT_SECONDS,
+                                      "s) - restarting consumer");
+                        consumer.restart();
+                    }
+                }
+            }
+
             // 10초마다 스냅샷 저장
-            if (redis_connected && 
+            if (redis_connected &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_snapshot).count() >= 10) {
-                
+
                 auto symbols = engine.getAllSymbols();
                 for (const auto& symbol : symbols) {
                     auto snapshot = engine.snapshotOrderBook(symbol);
@@ -335,7 +352,7 @@ int main(int argc, char* argv[]) {
                 last_snapshot = now;
                 Logger::debug("Snapshots saved for", symbols.size(), "symbols");
             }
-            
+
             // 30초마다 메트릭 로깅
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_metrics).count() >= 30) {
                 auto& m = Metrics::instance();

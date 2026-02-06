@@ -8,6 +8,7 @@
 #include <aws/kinesis/model/DescribeStreamRequest.h>
 #include <chrono>
 #include <thread>
+#include <future>
 
 namespace aws_wrapper {
 
@@ -17,12 +18,15 @@ KinesisConsumer::KinesisConsumer(const std::string& stream_name,
 
     Aws::Client::ClientConfiguration config;
     config.region = region_;
-    config.connectTimeoutMs = 5000;
-    config.requestTimeoutMs = 10000;
+    config.connectTimeoutMs = 2000;       // Fix 2: 5000 → 2000
+    config.requestTimeoutMs = 3000;       // Fix 2: 10000 → 3000
+    config.enableTcpKeepAlive = true;     // Fix 2: TCP keepalive 활성화
 
     client_ = std::make_unique<Aws::Kinesis::KinesisClient>(config);
 
-    Logger::info("KinesisConsumer created, stream:", stream_name_, "region:", region_);
+    Logger::info("KinesisConsumer created, stream:", stream_name_, "region:", region_,
+                 "connectTimeout:", config.connectTimeoutMs, "requestTimeout:", config.requestTimeoutMs,
+                 "tcpKeepAlive:", config.enableTcpKeepAlive ? "ON" : "OFF");
 }
 
 KinesisConsumer::~KinesisConsumer() {
@@ -145,12 +149,20 @@ void KinesisConsumer::stop() {
     draining_ = true;
     running_ = false;
 
-    // 2. 워커 스레드 종료 대기
+    // 2. AWS SDK 클라이언트 파괴 → 진행 중인 GetRecords 등 요청 강제 취소
+    //    이렇게 하면 블로킹된 API 호출이 즉시 에러로 반환되어 worker 스레드 탈출 가능
+    client_.reset();
+
+    // 3. 워커 스레드 종료 대기 (5초 타임아웃 — client_ 파괴로 빠르게 종료됨)
     if (worker_.joinable()) {
-        worker_.join();
+        auto future = std::async(std::launch::async, [this]() { worker_.join(); });
+        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+            Logger::warn("KinesisConsumer worker thread did not exit within 5s - detaching");
+            worker_.detach();
+        }
     }
 
-    // 3. 마지막 체크포인트 저장
+    // 4. 마지막 체크포인트 저장
     if (checkpoint_enabled_ && checkpoint_manager_) {
         Logger::info("Flushing final checkpoints...");
         for (const auto& [shard_id, seq] : last_sequence_numbers_) {
@@ -163,6 +175,27 @@ void KinesisConsumer::stop() {
     }
 
     Logger::info("KinesisConsumer stopped gracefully, records processed:", records_processed_.load());
+}
+
+void KinesisConsumer::restart() {
+    Logger::warn("KinesisConsumer restarting...");
+    stop();
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // KinesisClient 재생성 (새 TCP 연결 풀)
+    Aws::Client::ClientConfiguration config;
+    config.region = region_;
+    config.connectTimeoutMs = 2000;
+    config.requestTimeoutMs = 3000;
+    config.enableTcpKeepAlive = true;
+    client_ = std::make_unique<Aws::Kinesis::KinesisClient>(config);
+
+    shard_iterators_.clear();
+    shard_iterator_created_.clear();
+    last_sequence_numbers_.clear();
+
+    start();
+    Logger::info("KinesisConsumer restarted successfully");
 }
 
 void KinesisConsumer::drainQueue() {
@@ -240,18 +273,26 @@ int KinesisConsumer::countActiveIterators() const {
 
 void KinesisConsumer::consumeLoop() {
     long long poll_count = 0;
+    auto last_heartbeat = std::chrono::steady_clock::now();
+    constexpr int HEARTBEAT_INTERVAL_SECONDS = 30;  // Fix 4: 시간 기반 하트비트
+
     while (running_) {
         bool any_records = false;
         poll_count++;
 
-        if (poll_count % 100 == 0) {
+        // Fix 4: 시간 기반 하트비트 (30초마다)
+        auto now_steady = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now_steady - last_heartbeat).count()
+            >= HEARTBEAT_INTERVAL_SECONDS) {
             Logger::info("KinesisConsumer heartbeat: polling", shard_iterators_.size(),
                          "shards, active iterators:", countActiveIterators(),
-                         "records:", records_processed_.load());
+                         "records:", records_processed_.load(),
+                         "poll_count:", poll_count);
+            last_heartbeat = now_steady;
         }
 
         for (auto& [shard_id, iterator] : shard_iterators_) {
-            if (!running_) break; // 빠른 종료를 위한 체크
+            if (!running_ || !client_) break; // 빠른 종료를 위한 체크 (client_ null = stop() 호출됨)
 
             // 선제적 Iterator 갱신 (만료 전 4분마다)
             auto now = std::chrono::steady_clock::now();
@@ -266,7 +307,9 @@ void KinesisConsumer::consumeLoop() {
                         shard_iterator_created_[shard_id] = now;
                         Logger::info("Iterator proactively refreshed for", shard_id);
                     } else {
-                        Logger::warn("Failed to proactively refresh iterator for", shard_id);
+                        // Fix 5: 실패 시 30초 후 재시도 (즉시 재시도 방지)
+                        Logger::warn("Failed to proactively refresh iterator for", shard_id, "- will retry in 30s");
+                        shard_iterator_created_[shard_id] = now - std::chrono::seconds(ITERATOR_REFRESH_SECONDS - 30);
                     }
                 }
             }
@@ -289,6 +332,13 @@ void KinesisConsumer::consumeLoop() {
             Aws::Kinesis::Model::GetRecordsRequest request;
             request.SetShardIterator(iterator);
             request.SetLimit(100);
+
+            // Watchdog 타임스탬프 갱신: GetRecords 직전에만 갱신
+            // GetRecords에서 hang → 다음 갱신 없음 → 60초 후 watchdog 트리거
+            // callback에서 hang → 다음 루프의 GetRecords 전 갱신 없음 → 60초 후 watchdog 트리거
+            last_progress_epoch_ms_.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
 
             auto outcome = client_->GetRecords(request);
             if (!outcome.IsSuccess()) {
@@ -375,8 +425,8 @@ void KinesisConsumer::consumeLoop() {
         }
     }
 
-    // Graceful shutdown 시 draining 처리
-    if (draining_) {
+    // Graceful shutdown 시 draining 처리 (client_가 유효한 경우에만)
+    if (draining_ && client_) {
         drainQueue();
     }
 }

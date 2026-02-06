@@ -25,6 +25,7 @@ public:
     void setCallback(MessageCallback callback) { callback_ = std::move(callback); }
     void start();
     void stop();
+    void restart();
     bool isRunning() const { return running_; }
 
     // Checkpoint 설정
@@ -36,6 +37,10 @@ public:
 
     // 메트릭
     uint64_t getRecordsProcessed() const { return records_processed_.load(); }
+
+    // Watchdog: 마지막 진행 시각 (main thread에서 모니터링)
+    int64_t getLastProgressEpochMs() const { return last_progress_epoch_ms_.load(); }
+    static constexpr int WATCHDOG_TIMEOUT_SECONDS = 60;
 
 private:
     void consumeLoop();
@@ -64,6 +69,9 @@ private:
 
     // 메트릭
     std::atomic<uint64_t> records_processed_{0};
+
+    // Watchdog: 매 루프 반복마다 갱신되는 타임스탬프
+    std::atomic<int64_t> last_progress_epoch_ms_{0};
 
     // Iterator 선제적 갱신 주기 (4분 = 240초, 만료는 5분)
     static constexpr int ITERATOR_REFRESH_SECONDS = 240;
