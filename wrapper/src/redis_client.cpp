@@ -36,7 +36,12 @@ bool RedisClient::connect() {
         return false;
     }
 
-    Logger::info("Redis connected to:", host_, ":", port_);
+    // Set command-level socket timeout (SO_RCVTIMEO/SO_SNDTIMEO)
+    // Without this, redisCommand() blocks indefinitely if connection drops mid-operation
+    struct timeval cmd_timeout = {3, 0};  // 3 seconds for read/write operations
+    redisSetTimeout(context_, cmd_timeout);
+
+    Logger::info("Redis connected to:", host_, ":", port_, "(cmd_timeout: 3s)");
     state_ = ConnectionState::CONNECTED;
     current_reconnect_attempts_ = 0;  // Reset on successful connection
     last_health_check_ = std::chrono::steady_clock::now();
