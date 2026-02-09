@@ -76,18 +76,15 @@ void RankingManager::updateOnFill(const std::string& symbol,
     // 거래량 증가 (누적)
     backup_redis_->zincrby(KEY_VOLUME, static_cast<double>(fill_qty), symbol);
 
-    // 급등/급락 점수 = 등락률 × 1,000,000 (정밀도 유지)
-    // gainers: 등락률 내림차순 (높은 순)
-    // losers: 등락률 오름차순 (낮은 순, 음수 점수로 저장)
-    int64_t change_score = static_cast<int64_t>(change_pct * 1000000.0);
-
-    backup_redis_->zadd(KEY_GAINERS, static_cast<double>(change_score), symbol);
-    backup_redis_->zadd(KEY_LOSERS, static_cast<double>(-change_score), symbol);
-
-    // 급등/급락은 상위 100개만 유지 (하위 제거)
-    // ZREMRANGEBYRANK key 0 -101: rank 0 ~ (마지막-100) 삭제 = 상위 100개 유지
-    backup_redis_->zremrangebyrank(KEY_GAINERS, 0, -MAX_GAINERS_LOSERS - 1);
-    backup_redis_->zremrangebyrank(KEY_LOSERS, 0, -MAX_GAINERS_LOSERS - 1);
+    // 급등/급락: Aggregator가 prev_close 기반으로 관리
+    // change_pct가 0.0이면 (= 엔진에서 prev_close 없이 호출) Aggregator 데이터 보존을 위해 스킵
+    if (change_pct != 0.0) {
+        int64_t change_score = static_cast<int64_t>(change_pct * 1000000.0);
+        backup_redis_->zadd(KEY_GAINERS, static_cast<double>(change_score), symbol);
+        backup_redis_->zadd(KEY_LOSERS, static_cast<double>(-change_score), symbol);
+        backup_redis_->zremrangebyrank(KEY_GAINERS, 0, -MAX_GAINERS_LOSERS - 1);
+        backup_redis_->zremrangebyrank(KEY_LOSERS, 0, -MAX_GAINERS_LOSERS - 1);
+    }
 
     Logger::debug("RankingManager: updated ranking for", symbol,
                   "price:", price, "qty:", fill_qty, "change:", change_pct, "%");

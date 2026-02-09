@@ -6,7 +6,10 @@
  * - GET ?type=auth - 관리자 권한 확인 (공개)
  * - GET ?type=alerts - 관리자 알림
  * - GET/PUT ?type=siteConfig - 사이트 기본 설정
- * - GET/PUT ?type=tickerTape - 티커테이프 설정
+ * - GET/PUT ?type=tickerTape - 티커테이프 설정 (레거시, tickerTape_pc 폴백)
+ * - GET/PUT ?type=tickerTape_pc - PC 티커테이프 설정
+ * - GET/PUT ?type=tickerTape_mobile - 모바일 티커테이프 설정
+ * - GET/PUT ?type=gameSettings - 게임 밸런스 설정
  *
  * Symbol 관련 기능은 Supernoba-symbol-admin으로 이동됨
  * User 관련 기능은 Supernoba-admin-users로 이동됨
@@ -18,26 +21,13 @@ import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DynamoDBDocumentCli
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
-// Auth Layer
-const loadAuth = async () => {
-  try {
-    return await import('/opt/nodejs/verifyAuth.mjs');
-  } catch {
-    return {
-      verifyAdmin: async (e) => {
-        const key = process.env.ADMIN_API_KEY, h = e.headers?.Authorization || e.headers?.authorization;
-        return key && h === key ? { success: true, userId: 'admin', method: 'api_key' } : { success: false, error: 'UNAUTHORIZED' };
-      },
-      authErrorResponse: (r) => ({ statusCode: 401, headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify(r) })
-    };
-  }
-};
-const { verifyAdmin, authErrorResponse } = await loadAuth();
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
+const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
 
 // Layer를 통한 클라이언트 초기화
 const valkey = getValkeyClient({ preset: 'admin' });
@@ -220,10 +210,13 @@ export const handler = async (event) => {
     }
 
     // ==========================================
-    // tickerTape - 티커테이프 설정
+    // tickerTape - 티커테이프 설정 (PC/모바일 분리)
     // ==========================================
-    if (q.type === 'tickerTape') {
-      const TICKER_CACHE_KEY = 'tickerTape:activeSymbols';
+    const TICKER_TYPES = ['tickerTape', 'tickerTape_pc', 'tickerTape_mobile'];
+    if (TICKER_TYPES.includes(q.type)) {
+      // tickerTape (레거시) → tickerTape_pc 폴백
+      const settingsKey = q.type === 'tickerTape' ? 'tickerTape_pc' : q.type;
+      const TICKER_CACHE_KEY = `${settingsKey}:activeSymbols`;
       const TICKER_CACHE_TTL = 300;
 
       // GET: 공개
@@ -234,9 +227,33 @@ export const handler = async (event) => {
             TableName: SETTINGS_TABLE,
             Key: { setting_id: 'SYSTEM_SETTINGS' }
           }));
-          tickerTapeSettings = settingsItem?.settings?.tickerTape || DEFAULT_TICKER_TAPE;
+
+          const allSettings = settingsItem?.settings || {};
+
+          // 마이그레이션: tickerTape_pc가 없으면 기존 tickerTape에서 복사
+          if (!allSettings[settingsKey] && allSettings.tickerTape && settingsKey === 'tickerTape_pc') {
+            tickerTapeSettings = allSettings.tickerTape;
+            // 자동 마이그레이션 저장
+            try {
+              const newSettings = { ...allSettings, tickerTape_pc: allSettings.tickerTape };
+              if (!allSettings.tickerTape_mobile) {
+                newSettings.tickerTape_mobile = { ...DEFAULT_TICKER_TAPE };
+              }
+              await dynamodb.send(new UpdateCommand({
+                TableName: SETTINGS_TABLE,
+                Key: { setting_id: 'SYSTEM_SETTINGS' },
+                UpdateExpression: 'SET settings = :settings',
+                ExpressionAttributeValues: { ':settings': newSettings }
+              }));
+              console.log('[tickerTape] Auto-migrated tickerTape → tickerTape_pc + tickerTape_mobile');
+            } catch (migErr) {
+              console.error('[tickerTape] Migration error:', migErr.message);
+            }
+          } else {
+            tickerTapeSettings = allSettings[settingsKey] || DEFAULT_TICKER_TAPE;
+          }
         } catch (dbErr) {
-          console.error('[tickerTape GET] Settings fetch error:', dbErr.message);
+          console.error(`[${settingsKey} GET] Settings fetch error:`, dbErr.message);
         }
 
         let activeSymbols = [];
@@ -245,15 +262,41 @@ export const handler = async (event) => {
           if (cached) {
             activeSymbols = JSON.parse(cached);
           } else {
+            // Rankings API에서 volume 기준 정렬된 목록 가져오기
+            const rankApiUrl = process.env.RANKINGS_API_URL || 'https://4xs6g4w8l6.execute-api.ap-northeast-2.amazonaws.com/restV2/rankings';
+            let rankedSymbols = [];
+            try {
+              const rankRes = await fetch(`${rankApiUrl}?type=volume&limit=100`);
+              if (rankRes.ok) {
+                const rankData = await rankRes.json();
+                rankedSymbols = (rankData.rankings || []).map(r => r.symbol);
+              }
+            } catch (rankErr) {
+              console.error(`[${settingsKey} GET] Rankings API error:`, rankErr.message);
+            }
+
+            // DynamoDB에서 종목 메타데이터(이름, 로고) 가져오기
             const { Items: allSymbols } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
-            activeSymbols = (allSymbols || [])
-              .filter(s => s.status === 'ACTIVE')
-              .sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
-              .map(s => ({ symbol: s.symbol, name: s.name, volume24h: s.volume24h || 0, logoUrl: s.logoUrl }));
+            const symbolMap = {};
+            (allSymbols || []).filter(s => s.status === 'ACTIVE').forEach(s => {
+              symbolMap[s.symbol] = { symbol: s.symbol, name: s.name, logoUrl: s.logoUrl };
+            });
+
+            // Rankings 순서대로 메타데이터 합치기
+            activeSymbols = rankedSymbols
+              .filter(sym => symbolMap[sym])
+              .map(sym => symbolMap[sym]);
+
+            // Rankings에 없는 ACTIVE 종목도 뒤에 붙이기
+            const rankedSet = new Set(rankedSymbols);
+            Object.values(symbolMap).forEach(s => {
+              if (!rankedSet.has(s.symbol)) activeSymbols.push(s);
+            });
+
             await valkey.setex(TICKER_CACHE_KEY, TICKER_CACHE_TTL, JSON.stringify(activeSymbols));
           }
         } catch (cacheErr) {
-          console.error('[tickerTape GET] Cache/DB error:', cacheErr.message);
+          console.error(`[${settingsKey} GET] Cache/DB error:`, cacheErr.message);
         }
 
         let displaySymbols;
@@ -276,11 +319,24 @@ export const handler = async (event) => {
         if (!adminCheck.authorized) return adminCheck.response;
 
         const b = JSON.parse(event.body || '{}');
-        const { mode, manualSymbols, autoCount, scrollSpeed } = b;
+        const { mode, manualSymbols, autoCount, scrollSpeed, rankingMode } = b;
 
-        // 유효성 검사
-        if (mode !== undefined && !['auto', 'manual'].includes(mode)) {
-          return err(400, 'mode must be "auto" or "manual"');
+        // 유효성 검사 (기존과 동일)
+        if (mode !== undefined && !['auto', 'manual', 'ranking'].includes(mode)) {
+          return err(400, 'mode must be "auto", "manual", or "ranking"');
+        }
+        if (mode === 'ranking' || rankingMode !== undefined) {
+          if (rankingMode) {
+            if (rankingMode.criteria !== undefined && !['marketcap', 'volume', 'gainers', 'losers'].includes(rankingMode.criteria)) {
+              return err(400, 'rankingMode.criteria must be "marketcap", "volume", "gainers", or "losers"');
+            }
+            if (rankingMode.count !== undefined && (typeof rankingMode.count !== 'number' || rankingMode.count < 5 || rankingMode.count > 50)) {
+              return err(400, 'rankingMode.count must be a number between 5 and 50');
+            }
+            if (rankingMode.realtime !== undefined && typeof rankingMode.realtime !== 'boolean') {
+              return err(400, 'rankingMode.realtime must be a boolean');
+            }
+          }
         }
         if (manualSymbols !== undefined) {
           if (!Array.isArray(manualSymbols)) return err(400, 'manualSymbols must be an array');
@@ -291,7 +347,6 @@ export const handler = async (event) => {
           if (manualSymbols.length > 0) {
             try {
               const { Items: existingSymbols } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
-              // ACTIVE 상태인 심볼만 허용
               const activeSymbolSet = new Set(
                 (existingSymbols || [])
                   .filter(s => s.status === 'ACTIVE')
@@ -302,7 +357,7 @@ export const handler = async (event) => {
                 return err(400, `Invalid or inactive symbols: ${invalidSymbols.join(', ')}. Only ACTIVE symbols are allowed.`);
               }
             } catch (dbErr) {
-              console.error('[tickerTape PUT] Symbol validation error:', dbErr.message);
+              console.error(`[${settingsKey} PUT] Symbol validation error:`, dbErr.message);
             }
           }
         }
@@ -319,19 +374,20 @@ export const handler = async (event) => {
             Key: { setting_id: 'SYSTEM_SETTINGS' }
           }));
 
-          const currentTickerTape = currentSettings?.settings?.tickerTape || DEFAULT_TICKER_TAPE;
+          const currentTickerTape = currentSettings?.settings?.[settingsKey] || DEFAULT_TICKER_TAPE;
 
           const newTickerTape = {
             mode: mode !== undefined ? mode : currentTickerTape.mode,
             manualSymbols: manualSymbols !== undefined ? manualSymbols : currentTickerTape.manualSymbols,
             autoCount: autoCount !== undefined ? autoCount : currentTickerTape.autoCount,
             scrollSpeed: scrollSpeed !== undefined ? scrollSpeed : currentTickerTape.scrollSpeed,
+            rankingMode: rankingMode !== undefined ? { ...currentTickerTape.rankingMode, ...rankingMode } : currentTickerTape.rankingMode,
             updatedAt: Date.now()
           };
 
           const newSettings = {
             ...currentSettings?.settings,
-            tickerTape: newTickerTape
+            [settingsKey]: newTickerTape
           };
 
           await dynamodb.send(new UpdateCommand({
@@ -346,10 +402,74 @@ export const handler = async (event) => {
 
           await valkey.del(TICKER_CACHE_KEY);
 
-          return ok({ success: true, tickerTape: newTickerTape });
+          return ok({ success: true, [settingsKey]: newTickerTape });
         } catch (dbErr) {
-          console.error('[tickerTape PUT] Update error:', dbErr.message);
+          console.error(`[${settingsKey} PUT] Update error:`, dbErr.message);
           return err(500, 'Failed to save settings: ' + dbErr.message);
+        }
+      }
+    }
+
+    // ==========================================
+    // gameSettings - 게임 밸런스 설정
+    // ==========================================
+    if (q.type === 'gameSettings') {
+      // GET: 공개 (게임 클라이언트도 읽어야 함)
+      if (m === 'GET') {
+        try {
+          const { Item } = await dynamodb.send(new GetCommand({
+            TableName: SETTINGS_TABLE,
+            Key: { setting_id: 'GAME_SETTINGS' }
+          }));
+          return ok({ settings: Item?.settings || null });
+        } catch (e) {
+          console.error('[gameSettings GET] Error:', e.message);
+          return ok({ settings: null });
+        }
+      }
+
+      // PUT: 관리자 전용
+      if (m === 'PUT') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const body = JSON.parse(event.body || '{}');
+        const { weapons, combatAllocation, respawn, scoring, system } = body;
+
+        if (!weapons && !combatAllocation && !respawn && !scoring && !system) {
+          return err(400, 'At least one settings section required (weapons, combatAllocation, respawn, scoring, system)');
+        }
+
+        try {
+          // 기존 설정 가져와서 병합
+          const { Item: current } = await dynamodb.send(new GetCommand({
+            TableName: SETTINGS_TABLE,
+            Key: { setting_id: 'GAME_SETTINGS' }
+          }));
+          const currentSettings = current?.settings || {};
+
+          const newSettings = {
+            weapons: weapons ? { ...currentSettings.weapons, ...weapons } : currentSettings.weapons,
+            combatAllocation: combatAllocation ? { ...currentSettings.combatAllocation, ...combatAllocation } : currentSettings.combatAllocation,
+            respawn: respawn ? { ...currentSettings.respawn, ...respawn } : currentSettings.respawn,
+            scoring: scoring ? { ...currentSettings.scoring, ...scoring } : currentSettings.scoring,
+            system: system ? { ...currentSettings.system, ...system } : currentSettings.system,
+          };
+
+          await dynamodb.send(new PutCommand({
+            TableName: SETTINGS_TABLE,
+            Item: {
+              setting_id: 'GAME_SETTINGS',
+              settings: newSettings,
+              updated_at: new Date().toISOString()
+            }
+          }));
+
+          console.log('[gameSettings] Updated by admin');
+          return ok({ success: true, settings: newSettings });
+        } catch (e) {
+          console.error('[gameSettings PUT] Error:', e.message);
+          return err(500, 'Failed to save game settings: ' + e.message);
         }
       }
     }
@@ -388,7 +508,7 @@ export const handler = async (event) => {
       return err(410, 'Symbol DELETE moved to /Supernoba-symbol-admin endpoint');
     }
 
-    return err(404, 'Not found. Available endpoints: ?type=auth, ?type=alerts, ?type=siteConfig, ?type=tickerTape');
+    return err(404, 'Not found. Available endpoints: ?type=auth, ?type=alerts, ?type=siteConfig, ?type=tickerTape, ?type=tickerTape_pc, ?type=tickerTape_mobile, ?type=gameSettings');
   } catch (e) {
     console.error('Error:', e);
     return err(500, e.message);
