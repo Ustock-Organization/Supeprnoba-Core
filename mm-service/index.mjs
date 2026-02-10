@@ -1,10 +1,17 @@
 /**
- * Supernoba Market Maker Service v9
+ * Supernoba Market Maker Service v10
  *
  * Admin Panel에서 제어하는 경량 마켓메이커
  * - Redis pub/sub으로 시작/정지 신호 수신
  * - Kinesis에 주문 발행하여 실제 오더북/캔들 데이터 생성
  * - 실시간 상태를 mm:status 채널로 브로드캐스트
+ *
+ * v10 변경사항:
+ * - Strategy Pattern 도입 (legacy_sine, spread, depth)
+ * - OrderManager 기반 주문 추적/취소
+ * - InventoryTracker 5단계 방어선 (포지션 추적, 비대칭 스프레드, 수량 감소, 서킷 브레이커, 모니터링)
+ * - PriceFeed (외부 Binance 시세) / InternalFeed (내부 Valkey 캐시) 연동
+ * - 100% 하위 호환: strategy 필드 미설정 시 legacy_sine 동작 (v9 동일)
  *
  * v9 변경사항:
  * - SELL을 먼저 발행하여 잔존 매수호가에 체결되는 문제 해결
@@ -20,14 +27,22 @@
  */
 
 import Redis from "ioredis";
-import { KinesisClient, PutRecordCommand } from "@aws-sdk/client-kinesis";
-import { v4 as uuidv4 } from "uuid";
+import { KinesisClient } from "@aws-sdk/client-kinesis";
+
+// v10 modules
+import OrderManager from "./utils/order-manager.mjs";
+import InventoryTracker from "./utils/inventory.mjs";
+import SineStrategy from "./strategies/sine-strategy.mjs";
+import SpreadStrategy from "./strategies/spread-mm.mjs";
+import DepthStrategy from "./strategies/depth-mm.mjs";
+import PriceFeed from "./feeds/price-feed.mjs";
+import InternalFeed from "./feeds/internal-feed.mjs";
 
 // === Configuration ===
 const CONFIG = {
-  // Redis (Backup Cache - 설정 및 상태 관리)
-  backupCacheHost: process.env.BACKUP_CACHE_HOST || "master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com",
-  backupCachePort: parseInt(process.env.BACKUP_CACHE_PORT || "6379"),
+  // Redis (Operating Cache - MM 설정 및 상태 관리)
+  operatingCacheHost: process.env.OPERATING_CACHE_HOST || process.env.BACKUP_CACHE_HOST || "master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com",
+  operatingCachePort: parseInt(process.env.OPERATING_CACHE_PORT || process.env.BACKUP_CACHE_PORT || "6382"),
 
   // Kinesis (주문 발행)
   kinesisStream: process.env.KINESIS_STREAM || "supernoba-orders",
@@ -38,107 +53,128 @@ const CONFIG = {
   statusPublishInterval: 2000,  // 2초마다 상태 발행
 };
 
-console.log("=== Supernoba Market Maker Service v9 ===");
-console.log("Backup Cache:", CONFIG.backupCacheHost + ":" + CONFIG.backupCachePort);
+console.log("=== Supernoba Market Maker Service v10 ===");
+console.log("Operating Cache:", CONFIG.operatingCacheHost + ":" + CONFIG.operatingCachePort);
 console.log("Kinesis Stream:", CONFIG.kinesisStream);
 
 // === Clients ===
 const kinesis = new KinesisClient({ region: CONFIG.awsRegion });
 
-// Backup Cache - 설정 읽기/쓰기용
-const backupCache = new Redis({
-  host: CONFIG.backupCacheHost,
-  port: CONFIG.backupCachePort,
-  tls: {},  // AWS ElastiCache는 TLS 필수
+// TLS: ElastiCache는 TLS 필수, localhost(EC2)는 비활성
+const useTls = process.env.VALKEY_TLS === 'true' && CONFIG.operatingCacheHost !== '127.0.0.1' && CONFIG.operatingCacheHost !== 'localhost';
+
+// Operating Cache - 설정 읽기/쓰기용 (MM 관련 데이터)
+const operatingCache = new Redis({
+  host: CONFIG.operatingCacheHost,
+  port: CONFIG.operatingCachePort,
+  ...(useTls ? { tls: {} } : {}),
   connectTimeout: 5000,
   lazyConnect: true,
 });
 
-// Backup Cache - Pub/Sub 구독용 (별도 연결 필요)
-const backupCacheSub = new Redis({
-  host: CONFIG.backupCacheHost,
-  port: CONFIG.backupCachePort,
-  tls: {},
+// Operating Cache - Pub/Sub 구독용 (별도 연결 필요)
+const operatingCacheSub = new Redis({
+  host: CONFIG.operatingCacheHost,
+  port: CONFIG.operatingCachePort,
+  ...(useTls ? { tls: {} } : {}),
   connectTimeout: 5000,
   lazyConnect: true,
 });
 
-backupCache.on("error", (e) => console.error("[BackupCache] Error:", e.message));
-backupCache.on("connect", () => console.log("[BackupCache] Connected"));
-backupCacheSub.on("error", (e) => console.error("[BackupCache Sub] Error:", e.message));
-backupCacheSub.on("connect", () => console.log("[BackupCache Sub] Connected"));
+operatingCache.on("error", (e) => console.error("[OperatingCache] Error:", e.message));
+operatingCache.on("connect", () => console.log("[OperatingCache] Connected"));
+operatingCacheSub.on("error", (e) => console.error("[OperatingCache Sub] Error:", e.message));
+operatingCacheSub.on("connect", () => console.log("[OperatingCache Sub] Connected"));
 
 // === State ===
-const activeSymbols = new Map();  // symbol -> { config, interval, orderCount, startedAt }
+const activeSymbols = new Map();  // symbol -> { config, strategy, interval, orderCount, startedAt, tickCount }
 let isRunning = false;
 let statusInterval = null;
 
-// === Price Calculation ===
-function calculatePrice(basePrice, config, t) {
-  const period = config.period || 600;  // 기본 10분 주기
-  const amplitude = config.amplitude || 0.1;  // 기본 10% 진폭
+// === v10 Shared Instances (initialized in main()) ===
+let orderManager = null;
+let inventory = null;
+let priceFeed = null;
+let internalFeed = null;
 
-  // 사인파 가격 계산
-  const swing = amplitude * Math.sin((2 * Math.PI * t) / period);
-  const price = Math.round(basePrice * (1 + swing));
+// === v10 Default Config (v9 fields + v10 extensions) ===
+const DEFAULT_CONFIG = {
+  // v9 legacy
+  basePrice: 100,
+  period: 600,
+  amplitude: 0.1,
+  tickInterval: 1000,
+  tradeInterval: 1,
+  tradeQuantity: 10,
+  // v10 extensions
+  strategy: "legacy_sine",
+  spread: 0.02,
+  depthLevels: 3,
+  depthDecay: 0.5,
+  externalFeed: "none",
+  externalSymbol: "btcusdt",
+  correlation: 0.3,
+  cancelInterval: 5,
+  maxOpenOrders: 10,
+  trendBias: 0,
+  positionLimit: 500,
+  riskAversion: 0.5,
+  volatility: 0.0001,
+};
 
-  return Math.max(1, price);  // 최소 가격 1
-}
-
-// === Order Publishing ===
-async function sendOrder(symbol, side, price, quantity) {
-  const userId = side === "BUY" ? "mm-buyer" : "mm-seller";
-  const order = {
-    user_id: userId,
-    order_id: uuidv4(),
-    symbol,
-    side,
-    order_type: "LIMIT",
-    quantity,
-    price,
-    timestamp: Date.now(),
+// === Strategy Factory ===
+function createStrategy(symbol, config) {
+  const strategyName = config.strategy || "legacy_sine";
+  const deps = {
+    kinesis,
+    operatingCache,
+    orderManager,
+    inventory,
+    priceFeed: null,
+    internalFeed,
+    config: { kinesisStream: CONFIG.kinesisStream },
   };
 
-  try {
-    const result = await kinesis.send(new PutRecordCommand({
-      StreamName: CONFIG.kinesisStream,
-      Data: Buffer.from(JSON.stringify(order)),
-      PartitionKey: symbol,
-    }));
-    console.log("[Order] Sent " + side + " order for " + symbol + " @ " + price + " x " + quantity + " -> shard: " + result.ShardId);
-    return true;
-  } catch (e) {
-    console.error("[Order] Failed to send " + side + " order for " + symbol + ":", e.message);
-    return false;
+  // External feed setup (lazy — only connect if needed)
+  if (config.externalFeed === "binance" && !priceFeed) {
+    priceFeed = new PriceFeed(config.externalSymbol || "btcusdt");
+    priceFeed.connect().catch(e => console.error("[PriceFeed] connect error:", e.message));
+  }
+  if (priceFeed) deps.priceFeed = priceFeed;
+
+  switch (strategyName) {
+    case "spread": return new SpreadStrategy(symbol, config, deps);
+    case "depth": return new DepthStrategy(symbol, config, deps);
+    case "legacy_sine":
+    default: return new SineStrategy(symbol, config, deps);
   }
 }
 
-// === Symbol Runner ===
-async function runSymbol(symbol) {
-  const instance = activeSymbols.get(symbol);
-  if (!instance) return;
-
-  const config = instance.config;
-  const basePrice = config.basePrice || 100;
-  const quantity = config.tradeQuantity || 10;
-
-  // 경과 시간 (초)
-  const t = (Date.now() - instance.startedAt) / 1000;
-  const price = calculatePrice(basePrice, config, t);
-
-  // SELL을 먼저 발행 → BUY가 방금 발행한 SELL과 체결 (잔존 매수호가에 체결 방지)
-  // Kinesis 파티션 키가 같으므로 순서 보장됨
-  const sellSuccess = await sendOrder(symbol, "SELL", price, quantity);
-  const buySuccess = await sendOrder(symbol, "BUY", price, quantity);
-
-  if (buySuccess && sellSuccess) {
-    instance.orderCount += 2;
-    instance.currentPrice = price;
-  }
-
-  // Redis에 현재 가격 저장
-  await backupCache.set("mm:price:" + symbol, price.toString());
-  await backupCache.set("mm:orderCount:" + symbol, instance.orderCount.toString());
+// === Config Parsing Helper ===
+function parseConfigFields(raw) {
+  return {
+    // v9 legacy fields
+    basePrice: parseFloat(raw.basePrice) || DEFAULT_CONFIG.basePrice,
+    period: parseFloat(raw.period) || DEFAULT_CONFIG.period,
+    amplitude: parseFloat(raw.amplitude) || DEFAULT_CONFIG.amplitude,
+    tickInterval: parseInt(raw.tickInterval) || DEFAULT_CONFIG.tickInterval,
+    tradeInterval: parseFloat(raw.tradeInterval) || DEFAULT_CONFIG.tradeInterval,
+    tradeQuantity: parseInt(raw.tradeQuantity) || DEFAULT_CONFIG.tradeQuantity,
+    // v10 extensions
+    strategy: raw.strategy || DEFAULT_CONFIG.strategy,
+    spread: parseFloat(raw.spread) || DEFAULT_CONFIG.spread,
+    depthLevels: parseInt(raw.depthLevels) || DEFAULT_CONFIG.depthLevels,
+    depthDecay: parseFloat(raw.depthDecay) || DEFAULT_CONFIG.depthDecay,
+    externalFeed: raw.externalFeed || DEFAULT_CONFIG.externalFeed,
+    externalSymbol: raw.externalSymbol || DEFAULT_CONFIG.externalSymbol,
+    correlation: parseFloat(raw.correlation) || DEFAULT_CONFIG.correlation,
+    cancelInterval: parseInt(raw.cancelInterval) || DEFAULT_CONFIG.cancelInterval,
+    maxOpenOrders: parseInt(raw.maxOpenOrders) || DEFAULT_CONFIG.maxOpenOrders,
+    trendBias: parseFloat(raw.trendBias) || DEFAULT_CONFIG.trendBias,
+    positionLimit: parseInt(raw.positionLimit) || DEFAULT_CONFIG.positionLimit,
+    riskAversion: parseFloat(raw.riskAversion) || DEFAULT_CONFIG.riskAversion,
+    volatility: parseFloat(raw.volatility) || DEFAULT_CONFIG.volatility,
+  };
 }
 
 // === Load Config (supports both STRING and HASH types) ===
@@ -146,48 +182,34 @@ async function loadConfig(symbol) {
   const key = "mm:config:" + symbol;
 
   // Check key type first for backward compatibility
-  const keyType = await backupCache.type(key);
+  const keyType = await operatingCache.type(key);
 
   if (keyType === "none") {
     console.log("[Config] No config found for " + symbol + ", using defaults");
-    return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
+    return { ...DEFAULT_CONFIG };
   }
 
   let config;
 
   if (keyType === "string") {
     // Legacy format: JSON string (Admin Lambda v1)
-    const jsonStr = await backupCache.get(key);
+    const jsonStr = await operatingCache.get(key);
     try {
       const parsed = JSON.parse(jsonStr);
-      config = {
-        basePrice: parseFloat(parsed.basePrice) || 100,
-        period: parseFloat(parsed.period) || 600,
-        amplitude: parseFloat(parsed.amplitude) || 0.1,
-        tickInterval: parseInt(parsed.tickInterval) || 1000,
-        tradeInterval: parseFloat(parsed.tradeInterval) || 1,
-        tradeQuantity: parseInt(parsed.tradeQuantity) || 10,
-      };
+      config = parseConfigFields(parsed);
       console.log("[Config] Loaded STRING config for " + symbol + ":", JSON.stringify(config));
     } catch (e) {
       console.error("[Config] Failed to parse JSON for " + symbol + ":", e.message);
-      return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
+      return { ...DEFAULT_CONFIG };
     }
   } else if (keyType === "hash") {
     // New format: HASH type (Admin Lambda v2)
-    const hashData = await backupCache.hgetall(key);
-    config = {
-      basePrice: parseFloat(hashData.basePrice) || 100,
-      period: parseFloat(hashData.period) || 600,
-      amplitude: parseFloat(hashData.amplitude) || 0.1,
-      tickInterval: parseInt(hashData.tickInterval) || 1000,
-      tradeInterval: parseFloat(hashData.tradeInterval) || 1,
-      tradeQuantity: parseInt(hashData.tradeQuantity) || 10,
-    };
+    const hashData = await operatingCache.hgetall(key);
+    config = parseConfigFields(hashData);
     console.log("[Config] Loaded HASH config for " + symbol + ":", JSON.stringify(config));
   } else {
     console.error("[Config] Unexpected key type for " + symbol + ":", keyType);
-    return { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeQuantity: 10 };
+    return { ...DEFAULT_CONFIG };
   }
 
   return config;
@@ -200,38 +222,54 @@ async function startSymbol(symbol) {
     return;
   }
 
-  // v7: Load config from HASH
   const config = await loadConfig(symbol);
   const tickInterval = config.tickInterval || CONFIG.defaultTickInterval;
+  const strategy = createStrategy(symbol, config);
 
   const instance = {
     config,
+    strategy,
     orderCount: 0,
     currentPrice: config.basePrice || 100,
     startedAt: Date.now(),
-    interval: setInterval(() => runSymbol(symbol), tickInterval),
+    tickCount: 0,
+    interval: null,
   };
+
+  instance.interval = setInterval(async () => {
+    instance.tickCount++;
+    const elapsed = (Date.now() - instance.startedAt) / 1000;
+    try {
+      await strategy.execute({ elapsed, tickCount: instance.tickCount });
+      instance.currentPrice = strategy.currentPrice;
+      instance.orderCount = strategy._orderCount;
+    } catch (e) {
+      console.error(`[MM] ${symbol} tick error:`, e.message);
+    }
+  }, tickInterval);
 
   activeSymbols.set(symbol, instance);
 
   // Redis에 시작 시간 기록
-  await backupCache.set("mm:started_at:" + symbol, Date.now().toString());
+  await operatingCache.set("mm:started_at:" + symbol, Date.now().toString());
 
-  console.log("[MM] Started " + symbol + " - basePrice: " + config.basePrice + ", period: " + config.period + "s, amplitude: " + (config.amplitude * 100).toFixed(1) + "%");
+  console.log(`[MM] Started ${symbol} (strategy: ${strategy.strategyName}) - basePrice: ${config.basePrice}, period: ${config.period}s`);
 }
 
-function stopSymbol(symbol) {
+async function stopSymbol(symbol) {
   const instance = activeSymbols.get(symbol);
   if (instance) {
     clearInterval(instance.interval);
+    if (instance.strategy) await instance.strategy.cleanup();
     activeSymbols.delete(symbol);
     console.log("[MM] Stopped " + symbol + " - orders: " + instance.orderCount);
   }
 }
 
-function stopAllSymbols() {
+async function stopAllSymbols() {
   for (const [symbol, instance] of activeSymbols) {
     clearInterval(instance.interval);
+    if (instance.strategy) await instance.strategy.cleanup();
     console.log("[MM] Stopped " + symbol + " - orders: " + instance.orderCount);
   }
   activeSymbols.clear();
@@ -242,13 +280,22 @@ async function publishStatus() {
   const symbols = [];
 
   for (const [symbol, instance] of activeSymbols) {
+    let inventoryStatus = null;
+    if (instance.strategy && instance.strategy.strategyName !== "legacy_sine") {
+      try {
+        inventoryStatus = await inventory.getStatus(symbol);
+      } catch (_) {}
+    }
+
     symbols.push({
       symbol,
       basePrice: instance.config.basePrice || 100,
       price: instance.currentPrice,
       orders: instance.orderCount,
       isRunning: true,
+      strategy: instance.strategy?.strategyName || "legacy_sine",
       config: instance.config,
+      inventory: inventoryStatus,
     });
   }
 
@@ -260,7 +307,7 @@ async function publishStatus() {
   };
 
   // mm:status 채널로 publish (Streamer가 Admin에게 전달)
-  await backupCache.publish("mm:status", JSON.stringify(status));
+  await operatingCache.publish("mm:status", JSON.stringify(status));
 }
 
 // === Control Message Handler ===
@@ -278,29 +325,42 @@ async function handleControlMessage(message) {
 
       case "stop":
         if (cmd.symbol) {
-          stopSymbol(cmd.symbol);
+          await stopSymbol(cmd.symbol);
         }
         break;
 
-      case "startAll":
+      case "startAll": {
         // Redis에서 모든 running symbols 가져오기
-        const runningSymbols = await backupCache.smembers("mm:running:symbols");
+        const runningSymbols = await operatingCache.smembers("mm:running:symbols");
         for (const symbol of runningSymbols) {
           await startSymbol(symbol);
         }
         break;
+      }
 
       case "stopAll":
-        stopAllSymbols();
+        await stopAllSymbols();
         break;
 
       case "reload":
-        // 설정 리로드
+        // 설정 리로드 — 전략 변경 시 stop + restart
         if (cmd.symbol && activeSymbols.has(cmd.symbol)) {
-          const config = await loadConfig(cmd.symbol);
+          const newConfig = await loadConfig(cmd.symbol);
           const instance = activeSymbols.get(cmd.symbol);
-          instance.config = config;
-          console.log("[MM] Reloaded config for " + cmd.symbol);
+          const oldStrategy = instance.config.strategy || "legacy_sine";
+          const newStrategy = newConfig.strategy || "legacy_sine";
+
+          if (oldStrategy !== newStrategy) {
+            // Strategy type changed — full restart
+            console.log(`[MM] Strategy changed for ${cmd.symbol}: ${oldStrategy} → ${newStrategy}`);
+            await stopSymbol(cmd.symbol);
+            await startSymbol(cmd.symbol);
+          } else {
+            // Same strategy — update config in place
+            instance.config = newConfig;
+            if (instance.strategy) instance.strategy.config = { ...instance.strategy.config, ...newConfig };
+            console.log("[MM] Reloaded config for " + cmd.symbol);
+          }
         }
         break;
 
@@ -323,7 +383,7 @@ async function handleControlMessage(message) {
 
 // === Redis Sync ===
 async function syncWithRedis() {
-  const runningSymbols = await backupCache.smembers("mm:running:symbols");
+  const runningSymbols = await operatingCache.smembers("mm:running:symbols");
   const currentSymbols = new Set(activeSymbols.keys());
 
   // 시작해야 할 심볼
@@ -336,7 +396,7 @@ async function syncWithRedis() {
   // 중지해야 할 심볼
   for (const symbol of currentSymbols) {
     if (!runningSymbols.includes(symbol)) {
-      stopSymbol(symbol);
+      await stopSymbol(symbol);
     }
   }
 
@@ -347,14 +407,20 @@ async function syncWithRedis() {
 async function main() {
   console.log("[MM] Connecting to Redis...");
 
-  await backupCache.connect();
-  await backupCacheSub.connect();
+  await operatingCache.connect();
+  await operatingCacheSub.connect();
+
+  // v10: Initialize shared instances
+  orderManager = new OrderManager(kinesis, CONFIG.kinesisStream);
+  inventory = new InventoryTracker(operatingCache);
+  internalFeed = new InternalFeed();
+  await internalFeed.connect();
 
   // mm:control 채널 구독
-  await backupCacheSub.subscribe("mm:control");
+  await operatingCacheSub.subscribe("mm:control");
   console.log("[MM] Subscribed to mm:control channel");
 
-  backupCacheSub.on("message", (channel, message) => {
+  operatingCacheSub.on("message", (channel, message) => {
     if (channel === "mm:control") {
       handleControlMessage(message);
     }
@@ -366,33 +432,32 @@ async function main() {
   // 시작 시 Redis 상태와 동기화
   await syncWithRedis();
 
-  console.log("[MM] Market Maker Service ready");
+  console.log("[MM] Market Maker Service v10 ready");
+  console.log("[MM] Strategies: legacy_sine, spread, depth");
   console.log("[MM] Waiting for control messages on mm:control channel...");
 }
 
 // === Graceful Shutdown ===
-process.on("SIGINT", async () => {
-  console.log("\n[MM] Shutting down...");
+async function shutdown(signal) {
+  console.log(`\n[MM] ${signal} received, shutting down...`);
 
-  stopAllSymbols();
+  await stopAllSymbols();
 
   if (statusInterval) clearInterval(statusInterval);
 
-  await backupCache.quit();
-  await backupCacheSub.quit();
+  if (orderManager) orderManager.clearAll();
+  if (priceFeed) priceFeed.disconnect();
+  if (internalFeed) await internalFeed.disconnect();
+
+  await operatingCache.quit();
+  await operatingCacheSub.quit();
 
   console.log("[MM] Goodbye!");
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  console.log("\n[MM] Received SIGTERM, shutting down...");
-  stopAllSymbols();
-  if (statusInterval) clearInterval(statusInterval);
-  await backupCache.quit();
-  await backupCacheSub.quit();
-  process.exit(0);
-});
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // Start
 main().catch((e) => {
