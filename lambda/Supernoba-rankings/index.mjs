@@ -8,13 +8,42 @@
 
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { ScanCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+
+const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
+const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+
+// Lambda 인스턴스 단위 캐시 (5분 TTL) — 화이트리스트 방식
+let activeSymbolsCache = { set: new Set(), expiry: 0 };
+
+async function getActiveSymbols() {
+  if (activeSymbolsCache.expiry > Date.now()) return activeSymbolsCache.set;
+  try {
+    const { Items } = await dynamodb.send(new ScanCommand({
+      TableName: SYMBOLS_TABLE,
+      ProjectionExpression: 'symbol, is_test, #s',
+      ExpressionAttributeNames: { '#s': 'status' }
+    }));
+    const activeSet = new Set();
+    (Items || []).forEach(item => {
+      if (item.status === 'ACTIVE' && item.is_test !== true) activeSet.add(item.symbol);
+    });
+    activeSymbolsCache = { set: activeSet, expiry: Date.now() + 300000 };
+    return activeSet;
+  } catch (e) {
+    console.error('[rankings] Active symbols load error:', e.message);
+    return activeSymbolsCache.set;
+  }
+}
 
 // 환경변수
 const SNAPSHOT_KEY = 'rankings:snapshot';
 const SNAPSHOT_TTL = 15;  // 초
 
-// Layer를 통한 클라이언트 초기화 (backup cache, admin preset for reliable connection)
-const valkey = getValkeyClient({ type: 'backup', preset: 'admin' });
+// Layer를 통한 클라이언트 초기화 (backup + depth cache)
+const backupCache = getValkeyClient({ type: 'backup', preset: 'admin' });
+const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
@@ -34,28 +63,41 @@ const isValidType = (type) => VALID_TYPES.includes(type);
  */
 async function getRankingsFromSnapshot(type, limit, offset) {
   try {
-    const snapshotJson = await valkey.get(SNAPSHOT_KEY);
+    const snapshotJson = await backupCache.get(SNAPSHOT_KEY);
+    if (!snapshotJson) return null;
 
-    if (snapshotJson) {
-      const snapshot = JSON.parse(snapshotJson);
-      const rankings = snapshot[type] || [];
+    const snapshot = JSON.parse(snapshotJson);
+    let rankings = snapshot[type] || [];
+    const activeSymbols = await getActiveSymbols();
 
-      // 스냅샷에 데이터가 있을 때만 사용 (빈 배열이면 fallback)
-      if (rankings.length > 0) {
-        return {
-          timestamp: snapshot.timestamp,
-          type,
-          total: rankings.length,
-          rankings: rankings.slice(offset, offset + limit)
-        };
-      }
-      console.log(`[rankings] Snapshot exists but ${type} is empty, falling back to sorted set`);
+    // 활성 종목이 없으면 fallback
+    if (activeSymbols.size === 0) return null;
+
+    // 스냅샷 데이터를 score map으로 변환
+    const scoreField = type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change';
+    const scoreMap = {};
+    rankings.forEach(r => { scoreMap[r.symbol] = r[scoreField] || 0; });
+
+    // 모든 활성 종목 merge (스냅샷에 없는 종목은 score=0)
+    let merged = [];
+    for (const symbol of activeSymbols) {
+      merged.push({ symbol, [scoreField]: scoreMap[symbol] || 0 });
     }
-  } catch (e) {
-    console.warn('[rankings] Snapshot cache miss or parse error:', e.message);
-  }
 
-  return null;
+    // 정렬 + 순위
+    merged.sort((a, b) => (b[scoreField] || 0) - (a[scoreField] || 0));
+    merged = merged.map((r, i) => ({ ...r, rank: i + 1 }));
+
+    return {
+      timestamp: snapshot.timestamp,
+      type,
+      total: merged.length,
+      rankings: merged.slice(offset, offset + limit)
+    };
+  } catch (e) {
+    console.warn('[rankings] Snapshot cache error:', e.message);
+    return null;
+  }
 }
 
 /**
@@ -63,47 +105,41 @@ async function getRankingsFromSnapshot(type, limit, offset) {
  */
 async function getRankingsFromSortedSet(type, limit, offset) {
   const key = `ranking:${type}`;
+  const activeSymbols = await getActiveSymbols();
 
+  // Valkey sorted set에서 전체 스코어 맵 구축
+  const scoreMap = {};
   try {
-    let results;
-
-    if (type === 'losers') {
-      // losers는 음수 점수로 저장되어 있으므로 zrange 사용
-      results = await valkey.zrange(key, offset, offset + limit - 1, 'WITHSCORES');
-    } else {
-      // 나머지는 내림차순 (zrevrange)
-      results = await valkey.zrevrange(key, offset, offset + limit - 1, 'WITHSCORES');
+    const all = await backupCache.zrevrange(key, 0, -1, 'WITHSCORES');
+    for (let i = 0; i < all.length; i += 2) {
+      scoreMap[all[i]] = parseFloat(all[i + 1]);
     }
-
-    // WITHSCORES 결과: [member1, score1, member2, score2, ...]
-    const rankings = [];
-    for (let i = 0; i < results.length; i += 2) {
-      const symbol = results[i];
-      let score = parseFloat(results[i + 1]);
-
-      // 등락률 복원 (gainers, losers는 1e6 스케일)
-      if (type === 'gainers' || type === 'losers') {
-        if (type === 'losers') score = -score;  // 음수 복원
-        score = score / 1000000;
-      }
-
-      rankings.push({
-        rank: offset + (i / 2) + 1,
-        symbol,
-        [type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change']: score
-      });
-    }
-
-    return {
-      timestamp: new Date().toISOString(),
-      type,
-      total: rankings.length,
-      rankings
-    };
   } catch (e) {
-    console.error('[rankings] Sorted set query error:', e.message);
-    throw e;
+    console.warn('[rankings] Sorted set read error:', e.message);
   }
+
+  // 모든 활성 종목에 대해 랭킹 항목 생성 (Valkey에 없으면 score=0)
+  const scoreField = type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change';
+  let rankings = [];
+  for (const symbol of activeSymbols) {
+    let score = scoreMap[symbol] || 0;
+    if (type === 'gainers' || type === 'losers') {
+      if (type === 'losers') score = -score;
+      score = score / 1000000;
+    }
+    rankings.push({ symbol, [scoreField]: score });
+  }
+
+  // 정렬 (내림차순)
+  rankings.sort((a, b) => (b[scoreField] || 0) - (a[scoreField] || 0));
+  rankings = rankings.map((r, i) => ({ ...r, rank: i + 1 }));
+
+  return {
+    timestamp: new Date().toISOString(),
+    type,
+    total: rankings.length,
+    rankings: rankings.slice(offset, offset + limit)
+  };
 }
 
 export const handler = async (event) => {
@@ -140,7 +176,32 @@ export const handler = async (event) => {
         result = await getRankingsFromSortedSet(type, limit, offset);
       }
 
-      // 3. 응답 구성
+      // 3. 가격 데이터 enrichment (prev:* 키에서 prevClose 직접 계산)
+      if (result.rankings && result.rankings.length > 0) {
+        try {
+          const tickerKeys = result.rankings.map(r => `ticker:${r.symbol}`);
+          const prevKeys = result.rankings.map(r => `prev:${r.symbol}`);
+          const [tickerRaw, prevRaw] = await Promise.all([
+            depthCache.mget(...tickerKeys),
+            depthCache.mget(...prevKeys)
+          ]);
+          result.rankings = result.rankings.map((r, i) => {
+            let price = 0, changePct = 0;
+            try {
+              if (tickerRaw[i]) { price = JSON.parse(tickerRaw[i]).p || 0; }
+              if (prevRaw[i] && price > 0) {
+                const prevClose = JSON.parse(prevRaw[i]).close || 0;
+                if (prevClose > 0) changePct = ((price - prevClose) / prevClose) * 100;
+              }
+            } catch (e) {}
+            return { ...r, price, changePct };
+          });
+        } catch (e) {
+          console.warn('[rankings] Price enrichment error:', e.message);
+        }
+      }
+
+      // 4. 응답 구성
       return ok({
         ...result,
         processingTime: Date.now() - startTime

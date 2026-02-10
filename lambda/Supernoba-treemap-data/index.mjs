@@ -8,61 +8,24 @@
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { ScanCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import Redis from 'ioredis';
+import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
-const DEPTH_CACHE_HOST = process.env.DEPTH_CACHE_HOST || 'master.supernoba-depth-cache.5vrxzz.apn2.cache.amazonaws.com';
-const BACKUP_CACHE_HOST = process.env.BACKUP_CACHE_HOST || 'master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com';
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
 
-// Redis 클라이언트 (Lambda 컨테이너 재사용)
-let depthClient = null;
-let backupClient = null;
-
-function getDepthClient() {
-  if (!depthClient) {
-    depthClient = new Redis({
-      host: DEPTH_CACHE_HOST,
-      port: VALKEY_PORT,
-      tls: {},
-      connectTimeout: 5000,
-      maxRetriesPerRequest: 1
-    });
-    depthClient.on('error', () => {}); // 에러 무시
-  }
-  return depthClient;
-}
-
-function getBackupClient() {
-  if (!backupClient) {
-    backupClient = new Redis({
-      host: BACKUP_CACHE_HOST,
-      port: VALKEY_PORT,
-      tls: {},
-      connectTimeout: 5000,
-      maxRetriesPerRequest: 1
-    });
-    backupClient.on('error', () => {}); // 에러 무시
-  }
-  return backupClient;
-}
+// Valkey 클라이언트 (Common Layer 4-Cache)
+const depthCache = getValkeyClient({ type: 'depth', preset: 'default' });
+const backupCache = getValkeyClient({ type: 'backup', preset: 'default' });
 
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
 // Rankings snapshot 캐시 키
 const RANKINGS_SNAPSHOT_KEY = 'rankings:snapshot';
 
-// CORS 헤더
-const H = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Methods': 'DELETE, GET, OPTIONS, POST, PUT',
-  'Content-Type': 'application/json'
-};
-
-const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
-const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
+// CORS 헤더 (Common Layer)
+const H = CORS.FULL;
+const ok = (d) => response.ok(d, H);
+const err = (c, m) => response.error(c, m, H);
 
 /**
  * 섹터 이름 정규화 (플랫폼 → 표시명)
@@ -109,8 +72,8 @@ export const handler = async (event) => {
     // ==========================================
     if (m === 'GET') {
       const startTime = Date.now();
-      const valkey = getDepthClient();
-      const backupValkey = getBackupClient();
+      const valkey = depthCache;
+      const backupValkey = backupCache;
 
       // 1. DynamoDB에서 ACTIVE 종목 목록 조회
       const { Items: symbols } = await dynamodb.send(

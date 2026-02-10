@@ -17,42 +17,16 @@
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
-import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import pg from 'pg';
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 // Common Layer - Valkey, CORS, Social Links
 import { getValkeyClient, CORS, response, detectPlatformFromUrl } from '/opt/nodejs/index.mjs';
 
 // Auth Layer
-const loadAuth = async () => {
-  try {
-    return await import('/opt/nodejs/verifyAuth.mjs');
-  } catch (err) {
-    console.error('[symbol-admin] Failed to load auth layer:', err.message);
-    // 프로덕션에서는 auth layer 로드 실패 시 요청 거부
-    return {
-      verifyAdmin: async () => {
-        console.error('[symbol-admin] Auth layer not available - rejecting request');
-        return { success: false, error: 'AUTH_LAYER_UNAVAILABLE' };
-      },
-      authErrorResponse: (r) => ({
-        statusCode: 503,
-        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: r.error || 'Service temporarily unavailable' })
-      })
-    };
-  }
-};
-const { verifyAdmin, authErrorResponse } = await loadAuth();
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 const { Client: PgClient } = pg;
 
@@ -63,59 +37,36 @@ const CREATOR_REQUESTS_TABLE = process.env.CREATOR_REQUESTS_TABLE || 'supernoba-
 const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 const IPO_SYSTEM_ACCOUNT = 'ipo-system';
-const CLEANUP_QUEUE_URL = process.env.CLEANUP_QUEUE_URL || 'https://sqs.ap-northeast-2.amazonaws.com/264520158196/supernoba-symbol-cleanup';
+const DELIST_JOBS_TABLE = process.env.DELIST_JOBS_TABLE || 'supernoba-delist-jobs';
+const STATE_MACHINE_ARN = process.env.DELISTING_STATE_MACHINE_ARN || 'arn:aws:states:ap-northeast-2:264520158196:stateMachine:supernoba-delisting';
 const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
 
-// 매칭 엔진 gRPC 설정
-const ENGINE_GRPC_HOST = process.env.ENGINE_GRPC_HOST || '172.31.47.97:50051';
-
-// gRPC 클라이언트 (lazy 초기화)
-let grpcClient = null;
-async function getGrpcClient() {
-  if (grpcClient) return grpcClient;
-
-  const PROTO_PATH = path.join(__dirname, 'snapshot.proto');
-  const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
-    keepCase: true,
-    longs: String,
-    enums: String,
-    defaults: true,
-    oneofs: true
-  });
-  const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-  grpcClient = new protoDescriptor.aws_wrapper.SnapshotService(
-    ENGINE_GRPC_HOST,
-    grpc.credentials.createInsecure()
-  );
-  return grpcClient;
-}
-
-// gRPC RemoveOrderBook 호출
-async function removeEngineOrderBook(symbol) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const client = await getGrpcClient();
-      const deadline = new Date();
-      deadline.setSeconds(deadline.getSeconds() + 10); // 10초 타임아웃
-      client.RemoveOrderBook({ symbol }, { deadline }, (err, response) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(response);
-        }
-      });
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-// Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'admin' });
-const sqs = new SQSClient({ region: 'ap-northeast-2' });
+// Layer를 통한 클라이언트 초기화 (4-Cache: operating + depth + candle)
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
+const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
+const candleCache = getValkeyClient({ type: 'candle', preset: 'admin' });
+const sfn = new SFNClient({ region: 'ap-northeast-2' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 const secrets = new SecretsManagerClient({ region: 'ap-northeast-2' });
 let dbCreds = null, pgClient = null;
+
+/**
+ * Publish an admin event to Valkey Pub/Sub for real-time admin UI updates.
+ * Non-blocking: failures are logged but never prevent the main flow.
+ * Uses the module-level `valkey` client (already initialized above).
+ */
+async function publishAdminEvent(type, payload) {
+  try {
+    await operatingCache.publish('admin:events', JSON.stringify({
+      type,
+      ...payload,
+      timestamp: Date.now()
+    }));
+    console.log(`[Admin Event] Published ${type} for ${payload.symbol}`);
+  } catch (e) {
+    console.warn(`[Admin Event] Publish failed (non-fatal): ${e.message}`);
+  }
+}
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
@@ -267,13 +218,48 @@ export const handler = async (event) => {
         });
       }
 
+      // 상장폐지 진행 상황 조회 - 관리자 전용
+      if (action === 'delist-status') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const jobId = q.job_id;
+        if (!jobId) return err(400, 'job_id is required');
+
+        try {
+          const { Item: job } = await dynamodb.send(new GetCommand({
+            TableName: DELIST_JOBS_TABLE,
+            Key: { job_id: jobId }
+          }));
+
+          if (!job) return err(404, 'Delist job not found');
+
+          return ok({
+            job_id: job.job_id,
+            symbol: job.symbol,
+            status: job.status,
+            phase: job.phase,
+            phases_completed: job.phases_completed || [],
+            error: job.error || null,
+            failed_checks: job.failed_checks || null,
+            cancelled_orders: job.cancelled_orders || 0,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            completed_at: job.completed_at || null
+          });
+        } catch (jobErr) {
+          console.error(`[delist-status] Failed to fetch job ${jobId}: ${jobErr.message}`);
+          return err(500, `Failed to fetch delist status: ${jobErr.message}`);
+        }
+      }
+
       // 삭제된 종목 목록 (deleted:symbols) - 관리자 전용
       if (q.type === 'deleted') {
         const adminCheck = await checkAdmin(event);
         if (!adminCheck.authorized) return adminCheck.response;
 
         try {
-          const deletedSymbols = await valkey.smembers('deleted:symbols');
+          const deletedSymbols = await operatingCache.smembers('deleted:symbols');
           console.log(`[GET] deleted:symbols count: ${deletedSymbols.length}`);
           return ok({ deletedSymbols: deletedSymbols || [] });
         } catch (valkeyErr) {
@@ -312,19 +298,20 @@ export const handler = async (event) => {
         if (!adminCheck.authorized) return adminCheck.response;
 
         const { Items } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
-        const deletedSymbols = await valkey.smembers('deleted:symbols');
+        const deletedSymbols = await operatingCache.smembers('deleted:symbols');
         const deletedSet = new Set(deletedSymbols);
 
         if (Items?.length > 0) {
-          const p = valkey.pipeline();
-          p.del('active:symbols');
+          const opPipe = operatingCache.pipeline();
+          const depthPipe = depthCache.pipeline();
+          opPipe.del('active:symbols');
           let syncedCount = 0;
 
           for (const i of Items) {
             if (deletedSet.has(i.symbol)) continue;
             if (i.status === 'ACTIVE') {
-              p.sadd('active:symbols', i.symbol);
-              p.set(`ticker:${i.symbol}`, JSON.stringify({
+              opPipe.sadd('active:symbols', i.symbol);
+              depthPipe.set(`ticker:${i.symbol}`, JSON.stringify({
                 symbol: i.symbol,
                 price: i.listingPrice || 0,
                 changePercent: 0,
@@ -333,7 +320,7 @@ export const handler = async (event) => {
               syncedCount++;
             }
           }
-          await p.exec();
+          await Promise.all([opPipe.exec(), depthPipe.exec()]);
           return ok({ synced: syncedCount, skippedDeleted: deletedSymbols.length });
         }
         return ok({ synced: 0 });
@@ -371,14 +358,16 @@ export const handler = async (event) => {
             console.log(`[cleanChart] Deleted corrupted candles for ${sym}: ${result.rowCount} rows`);
           }
 
-          // Redis 캔들 캐시 정리
-          const pipe = valkey.pipeline();
+          // Redis 캔들 캐시 정리 (candle→6380, ohlc→depth 6379)
+          const candlePipe = candleCache.pipeline();
           ['1m', '5m', '15m', '30m', '1h', '4h', '1d'].forEach(tf => {
-            pipe.del(`candle:${tf}:${sym.toUpperCase()}`);
+            candlePipe.del(`candle:${tf}:${sym.toUpperCase()}`);
           });
-          pipe.del(`candle:closed:1m:${sym.toUpperCase()}`);
-          pipe.del(`ohlc:${sym.toUpperCase()}`);
-          await pipe.exec();
+          candlePipe.del(`candle:closed:1m:${sym.toUpperCase()}`);
+          await Promise.all([
+            candlePipe.exec(),
+            depthCache.del(`ohlc:${sym.toUpperCase()}`)
+          ]);
 
           return ok({
             success: true,
@@ -404,13 +393,13 @@ export const handler = async (event) => {
         const sym = (b.symbol || '').toUpperCase().trim();
         if (!sym) return err(400, 'symbol is required');
 
-        const wasDeleted = await valkey.sismember('deleted:symbols', sym);
+        const wasDeleted = await operatingCache.sismember('deleted:symbols', sym);
         if (!wasDeleted) return err(400, `Symbol ${sym} is not in deleted list`);
 
         const restoreResults = {};
 
         // 1. deleted:symbols에서 제거
-        await valkey.srem('deleted:symbols', sym);
+        await operatingCache.srem('deleted:symbols', sym);
         restoreResults.deleted_symbols = { success: true };
         console.log(`[RESTORE] Symbol ${sym} removed from deleted list`);
 
@@ -439,7 +428,7 @@ export const handler = async (event) => {
 
         // 3. Valkey subscribed:symbols에 추가 (구독 가능하도록)
         try {
-          await valkey.sadd('subscribed:symbols', sym);
+          await operatingCache.sadd('subscribed:symbols', sym);
           restoreResults.subscribed_symbols = { success: true };
           console.log(`[RESTORE] Added ${sym} to subscribed:symbols`);
         } catch (valkeyErr) {
@@ -482,9 +471,9 @@ export const handler = async (event) => {
         const now = new Date().toISOString();
 
         // 삭제된 종목이면 자동으로 복원 (재상장 허용)
-        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
         if (isDeleted) {
-          await valkey.srem('deleted:symbols', sym);
+          await operatingCache.srem('deleted:symbols', sym);
           console.log(`[LISTING] Auto-restored deleted symbol: ${sym}`);
         }
 
@@ -518,11 +507,11 @@ export const handler = async (event) => {
         };
 
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: item }));
-        await valkey.set(`symbol:${sym}:listingPrice`, listingPrice.toString());
+        await operatingCache.set(`symbol:${sym}:listingPrice`, listingPrice.toString());
 
         // 전일종가 초기화 (등락율 계산용)
         const prevData = JSON.stringify({ close: listingPrice });
-        await valkey.set(`prev:${sym}`, prevData);
+        await depthCache.set(`prev:${sym}`, prevData);
         console.log(`[LISTING] prev:${sym} initialized with listingPrice: ${listingPrice}`);
 
         const tickerData = {
@@ -540,7 +529,7 @@ export const handler = async (event) => {
           trades: 0,
           updatedAt: now
         };
-        await valkey.set(`ticker:${sym}`, JSON.stringify(tickerData));
+        await depthCache.set(`ticker:${sym}`, JSON.stringify(tickerData));
 
         // PostgreSQL: 초기 1d 캔들 생성 (프론트엔드 getDayOHLC 지원)
         try {
@@ -605,9 +594,11 @@ export const handler = async (event) => {
           console.log(`[LISTING] IPO holdings created: ${sym} x ${totalShares} @ ${listingPrice}`);
 
           // 2. IPO 주문 생성 (DynamoDB Stream → ipo-processor)
+          const listingOrderId = `ipo-${sym}-${Date.now()}`;
           await dynamodb.send(new PutCommand({
             TableName: IPO_ORDERS_TABLE,
             Item: {
+              order_id: listingOrderId,
               symbol: sym,
               status: 'PENDING',
               quantity: totalShares,
@@ -617,7 +608,7 @@ export const handler = async (event) => {
               ttl: Math.floor(Date.now() / 1000) + 86400 * 7  // 7일 TTL
             }
           }));
-          console.log(`[LISTING] IPO order created: PENDING, ${sym} x ${totalShares} @ ${listingPrice}`);
+          console.log(`[LISTING] IPO order created: ${listingOrderId}, ${sym} x ${totalShares} @ ${listingPrice}`);
         } catch (ipoErr) {
           console.error(`[LISTING] IPO creation failed: ${ipoErr.message}`);
           // IPO 실패해도 종목 등록은 성공 처리
@@ -643,9 +634,9 @@ export const handler = async (event) => {
         const sym = symbol.toUpperCase().trim();
 
         // 삭제된 종목이면 자동으로 복원 (재활성화 허용)
-        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
         if (isDeleted) {
-          await valkey.srem('deleted:symbols', sym);
+          await operatingCache.srem('deleted:symbols', sym);
           console.log(`[ACTIVATE] Auto-restored deleted symbol: ${sym}`);
         }
 
@@ -663,8 +654,8 @@ export const handler = async (event) => {
           ExpressionAttributeValues: { ':status': 'ACTIVE', ':updatedAt': now }
         }));
 
-        await valkey.sadd('subscribed:symbols', sym);
-        await valkey.sadd('active:symbols', sym);
+        await operatingCache.sadd('subscribed:symbols', sym);
+        await operatingCache.sadd('active:symbols', sym);
 
         return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
       }
@@ -684,9 +675,9 @@ export const handler = async (event) => {
         const sym = symbol.toUpperCase().trim();
 
         // 삭제된 종목이면 자동으로 복원 (재승인 허용)
-        const isDeleted = await valkey.sismember('deleted:symbols', sym);
+        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
         if (isDeleted) {
-          await valkey.srem('deleted:symbols', sym);
+          await operatingCache.srem('deleted:symbols', sym);
           console.log(`[APPROVE] Auto-restored deleted symbol: ${sym}`);
         }
 
@@ -761,7 +752,7 @@ export const handler = async (event) => {
         };
 
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
-        await valkey.sadd('active:symbols', symbol.toUpperCase());
+        await operatingCache.sadd('active:symbols', symbol.toUpperCase());
 
         // IPO 주문 처리
         let ipoError = null;
@@ -788,9 +779,11 @@ export const handler = async (event) => {
             console.log(`[APPROVE] IPO holdings created for ${IPO_SYSTEM_ACCOUNT}`);
 
             // IPO 주문 생성
+            const approveOrderId = `ipo-${symbol.toUpperCase()}-${Date.now()}`;
             await dynamodb.send(new PutCommand({
               TableName: IPO_ORDERS_TABLE,
               Item: {
+                order_id: approveOrderId,
                 symbol: symbol.toUpperCase(),
                 status: 'PENDING',
                 quantity: ipoQuantity,
@@ -800,7 +793,7 @@ export const handler = async (event) => {
                 ttl: Math.floor(Date.now() / 1000) + 86400 * 7
               }
             }));
-            console.log(`[APPROVE] IPO order request created (PENDING)`);
+            console.log(`[APPROVE] IPO order created: ${approveOrderId} (PENDING)`);
             ipoOrderStatus = 'PENDING';
           } catch (ipoErr) {
             console.error('[APPROVE] IPO order creation failed:', ipoErr);
@@ -870,6 +863,46 @@ export const handler = async (event) => {
       if (!adminCheck.authorized) return adminCheck.response;
 
       const b = JSON.parse(event.body || '{}');
+
+      // --- 강제 완료: 상장폐지 job을 스킵된 Phase 기록과 함께 강제 종료 ---
+      if (b.action === 'force-complete-delist') {
+        const jobId = b.job_id;
+        if (!jobId) return err(400, 'job_id is required');
+
+        const { Item: job } = await dynamodb.send(new GetCommand({
+          TableName: DELIST_JOBS_TABLE, Key: { job_id: jobId }
+        }));
+        if (!job) return err(404, 'Delist job not found');
+
+        const allPhases = ['ORDER_BLOCKED', 'ENGINE_CLEANED', 'VALKEY_CLEANED', 'RDS_CLEANED', 'SYMBOL_DELETED', 'USER_DATA_CLEANED', 'VERIFIED'];
+        const completed = job.phases_completed || [];
+        const skipped = allPhases.filter(p => !completed.includes(p));
+
+        // Valkey: deleted:symbols SADD + blocked:symbols SREM
+        try {
+          await operatingCache.sadd('deleted:symbols', job.symbol);
+          await operatingCache.srem('blocked:symbols', job.symbol);
+        } catch (e) { console.warn('Valkey force-complete warning:', e.message); }
+
+        // delist-jobs 업데이트
+        const fcNow = new Date().toISOString();
+        await dynamodb.send(new UpdateCommand({
+          TableName: DELIST_JOBS_TABLE,
+          Key: { job_id: jobId },
+          UpdateExpression: 'SET #s = :s, phases_skipped = :skipped, force_completed_by = :by, force_completed_at = :now, updated_at = :now',
+          ExpressionAttributeNames: { '#s': 'status' },
+          ExpressionAttributeValues: {
+            ':s': 'FORCE_COMPLETED',
+            ':skipped': skipped,
+            ':by': adminCheck.userId,
+            ':now': fcNow
+          }
+        }));
+
+        console.log(`[PUT] Force-completed delist job ${jobId} by ${adminCheck.userId}. Skipped: ${skipped.join(', ')}`);
+        return ok({ success: true, job_id: jobId, status: 'FORCE_COMPLETED', phases_skipped: skipped });
+      }
+
       const symbolMatch = path.match(/\/symbols\/([^\/]+)/);
       const sym = (symbolMatch?.[1] || b.symbol || '').toUpperCase().trim();
       if (!sym) return err(400, 'symbol is required');
@@ -913,11 +946,11 @@ export const handler = async (event) => {
         exprAttrValues[':status'] = b.status;
 
         if (b.status === 'ACTIVE') {
-          await valkey.sadd('subscribed:symbols', sym);
-          await valkey.sadd('active:symbols', sym);
+          await operatingCache.sadd('subscribed:symbols', sym);
+          await operatingCache.sadd('active:symbols', sym);
         } else if (b.status !== 'ACTIVE' && Item.status === 'ACTIVE') {
-          await valkey.srem('subscribed:symbols', sym);
-          await valkey.srem('active:symbols', sym);
+          await operatingCache.srem('subscribed:symbols', sym);
+          await operatingCache.srem('active:symbols', sym);
         }
       }
 
@@ -930,15 +963,14 @@ export const handler = async (event) => {
       }));
 
       if (b.listingPrice !== undefined) {
-        await valkey.set(`symbol:${sym}:listingPrice`, b.listingPrice.toString());
+        await operatingCache.set(`symbol:${sym}:listingPrice`, b.listingPrice.toString());
       }
 
       return ok({ success: true, symbol: sym, message: `Symbol ${sym} updated successfully` });
     }
 
     // ==========================================
-    // DELETE: 종목 상장폐지 (관리자)
-    // 모든 관련 데이터 삭제: DynamoDB, PostgreSQL, Valkey
+    // DELETE: 종목 상장폐지 (관리자) - Step Functions 비동기 오케스트레이션
     // ==========================================
     if (m === 'DELETE') {
       const adminCheck = await checkAdmin(event);
@@ -948,167 +980,112 @@ export const handler = async (event) => {
       const sym = (b.symbol || '').toUpperCase().trim();
       if (!sym) return err(400, 'symbol is required');
 
-      console.log(`[DELETE] Processing delisting for symbol: ${sym}`);
+      console.log(`[DELETE] Starting async delisting for symbol: ${sym}`);
 
+      // 1. 종목 존재 확인
       const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
       if (!Item) return err(404, `Symbol ${sym} not found`);
 
-      // 삭제 결과 추적
-      const deletionResults = {};
-
-      // === 매칭 엔진 오더북 삭제 (gRPC 직접 호출) ===
-      // 중요: gRPC 성공 시에만 삭제 프로세스 진행 (원자성 보장)
-      let grpcSuccess = false;
-      try {
-        const grpcResponse = await removeEngineOrderBook(sym);
-        if (grpcResponse.success) {
-          console.log(`[DELETE] gRPC RemoveOrderBook success for ${sym}`);
-          deletionResults.engine_orderbook = { success: true };
-          grpcSuccess = true;
-        } else {
-          console.error(`[DELETE] gRPC RemoveOrderBook failed: ${grpcResponse.error}`);
-          deletionResults.engine_orderbook = { success: false, error: grpcResponse.error };
-        }
-      } catch (grpcErr) {
-        console.error(`[DELETE] gRPC call failed: ${grpcErr.message}`);
-        deletionResults.engine_orderbook = { success: false, error: grpcErr.message };
+      // 2. DELISTING 중복 방지: 이미 진행 중인 job이 있는지 확인
+      if (Item.status === 'DELISTING') {
+        return err(409, `Symbol ${sym} is already being delisted`);
       }
 
-      // gRPC 실패 시 삭제 중단 - 비일관 상태 방지
-      if (!grpcSuccess) {
-        console.error(`[DELETE] Aborting deletion for ${sym} - engine orderbook removal failed`);
-        return err(500, `Failed to remove orderbook from matching engine. Deletion aborted to prevent inconsistent state. Error: ${deletionResults.engine_orderbook?.error || 'Unknown'}`);
-      }
+      // 3. delist-jobs 레코드 생성
+      const job_id = `delist-${sym}-${Date.now()}`;
+      const now = new Date().toISOString();
 
-      // gRPC 성공 후에만 deleted:symbols에 추가
-      await valkey.sadd('deleted:symbols', sym);
-
-      // === Valkey 캐시 삭제 ===
       try {
-        const pipe = valkey.pipeline();
-        // 스냅샷 삭제 (엔진 재시작 시 복원 방지)
-        pipe.del(`snapshot:${sym}`);
-        pipe.del(`snapshot:${sym}:timestamp`);
-        ['ticker', 'depth', 'ohlc'].forEach(k => pipe.del(`${k}:${sym}`));
-        pipe.del(`symbol:${sym}:listingPrice`);
-        pipe.del(`symbol:${sym}:main`);
-        pipe.del(`symbol:${sym}:subscribers`);
-        pipe.del(`symbol:${sym}:sub`);
-        ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'].forEach(tf => pipe.del(`candle:${tf}:${sym}`));
-        pipe.del(`candle:closed:1m:${sym}`);
-        ['config', 'price', 'orderCount', 'started_at'].forEach(k => pipe.del(`mm:${k}:${sym}`));
-        // Ranking sorted sets에서 제거 (ranking:{sym}은 존재하지 않는 키)
-        ['gainers', 'losers', 'marketcap', 'volume'].forEach(r => pipe.zrem(`ranking:${r}`, sym));
-        ['active:symbols', 'subscribed:symbols', 'mm:running:symbols'].forEach(s => pipe.srem(s, sym));
-        await pipe.exec();
-        deletionResults.valkey_cache = { success: true, keys: 28 };
-        console.log(`[DELETE] Valkey cache deleted for ${sym}`);
-      } catch (valkeyErr) {
-        deletionResults.valkey_cache = { success: false, error: valkeyErr.message };
-        console.warn(`[DELETE] Valkey cache cleanup warning: ${valkeyErr.message}`);
-      }
-
-      // === Valkey prev:{symbol} 삭제 ===
-      try {
-        await valkey.del(`prev:${sym}`);
-        deletionResults.valkey_prev = { success: true, keys: 1 };
-        console.log(`[DELETE] Valkey prev:${sym} deleted`);
-      } catch (prevErr) {
-        deletionResults.valkey_prev = { success: false, error: prevErr.message };
-        console.warn(`[DELETE] Valkey prev cleanup warning: ${prevErr.message}`);
-      }
-
-      // === PostgreSQL 삭제 ===
-      try {
-        const db = await getPg();
-
-        // MM 설정 삭제
-        const mmResult = await db.query('DELETE FROM market_maker_configs WHERE symbol = $1', [sym]);
-        deletionResults.mm_config = { success: true, count: mmResult.rowCount };
-        console.log(`[DELETE] MarketMaker config deleted for ${sym}: ${mmResult.rowCount} rows`);
-
-        // 거래 내역 삭제
-        const tradeResult = await db.query('DELETE FROM trade_history WHERE symbol = $1', [sym]);
-        deletionResults.postgres_trades = { success: true, count: tradeResult.rowCount };
-        console.log(`[DELETE] trade_history deleted for ${sym}: ${tradeResult.rowCount} rows`);
-
-        // 캔들 내역 삭제
-        const candleResult = await db.query('DELETE FROM candle_history WHERE symbol = $1', [sym]);
-        deletionResults.postgres_candles = { success: true, count: candleResult.rowCount };
-        console.log(`[DELETE] candle_history deleted for ${sym}: ${candleResult.rowCount} rows`);
-
-        // OHLC 요약 삭제
-        const ohlcResult = await db.query('DELETE FROM daily_ohlc_summary WHERE symbol = $1', [sym]);
-        deletionResults.postgres_ohlc = { success: true, count: ohlcResult.rowCount };
-        console.log(`[DELETE] daily_ohlc_summary deleted for ${sym}: ${ohlcResult.rowCount} rows`);
-
-        // 전일종가 삭제
-        const prevCloseResult = await db.query('DELETE FROM symbol_prev_close WHERE symbol = $1', [sym]);
-        deletionResults.postgres_prevclose = { success: true, count: prevCloseResult.rowCount };
-        console.log(`[DELETE] symbol_prev_close deleted for ${sym}: ${prevCloseResult.rowCount} rows`);
-
-        // 활성 심볼 삭제
-        try {
-          const activeResult = await db.query('DELETE FROM active_symbols WHERE symbol = $1', [sym]);
-          console.log(`[DELETE] active_symbols deleted for ${sym}: ${activeResult.rowCount} rows`);
-        } catch (activeErr) {
-          console.warn(`[DELETE] active_symbols cleanup warning (table may not exist): ${activeErr.message}`);
-        }
-      } catch (pgErr) {
-        console.warn(`[DELETE] PostgreSQL cleanup warning: ${pgErr.message}`);
-        // 개별 실패 시에도 계속 진행
-        if (!deletionResults.postgres_trades) deletionResults.postgres_trades = { success: false, error: pgErr.message };
-        if (!deletionResults.postgres_candles) deletionResults.postgres_candles = { success: false, error: pgErr.message };
-        if (!deletionResults.postgres_ohlc) deletionResults.postgres_ohlc = { success: false, error: pgErr.message };
-        if (!deletionResults.postgres_prevclose) deletionResults.postgres_prevclose = { success: false, error: pgErr.message };
-        if (!deletionResults.mm_config) deletionResults.mm_config = { success: false, error: pgErr.message };
-      }
-
-      // === DynamoDB 종목 삭제 ===
-      try {
-        await dynamodb.send(new DeleteCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
-        deletionResults.dynamodb_symbols = { success: true, count: 1 };
-        console.log(`[DELETE] DynamoDB symbol deleted: ${sym}`);
-      } catch (symErr) {
-        deletionResults.dynamodb_symbols = { success: false, error: symErr.message };
-      }
-
-      // === DynamoDB IPO 주문 삭제 ===
-      try {
-        await dynamodb.send(new DeleteCommand({ TableName: IPO_ORDERS_TABLE, Key: { symbol: sym } }));
-        console.log(`[DELETE] IPO order deleted for ${sym}`);
-      } catch (ipoErr) {
-        console.warn(`[DELETE] IPO order cleanup warning: ${ipoErr.message}`);
-      }
-
-      // === 비동기 정리 (SQS) - holdings, orders, favorites ===
-      try {
-        await sqs.send(new SendMessageCommand({
-          QueueUrl: CLEANUP_QUEUE_URL,
-          MessageBody: JSON.stringify({
-            action: 'DELETE_SYMBOL',
+        await dynamodb.send(new PutCommand({
+          TableName: DELIST_JOBS_TABLE,
+          Item: {
+            job_id,
             symbol: sym,
-            timestamp: new Date().toISOString()
-          }),
-          MessageGroupId: undefined
+            status: 'PENDING',
+            phase: 'INITIATED',
+            phases_completed: [],
+            error_log: [],
+            requested_by: adminCheck.userId,
+            created_at: now,
+            updated_at: now
+          }
         }));
-        console.log(`[DELETE] Cleanup message sent to SQS for ${sym}`);
-        deletionResults.dynamodb_holdings = { success: true, count: 0, async: true };
-        deletionResults.dynamodb_orders = { success: true, count: 0, async: true };
-        deletionResults.dynamodb_favorites = { success: true, count: 0, async: true };
-      } catch (sqsErr) {
-        console.error(`[DELETE] SQS message failed: ${sqsErr.message}`);
-        deletionResults.dynamodb_holdings = { success: false, error: sqsErr.message };
-        deletionResults.dynamodb_orders = { success: false, error: sqsErr.message };
-        deletionResults.dynamodb_favorites = { success: false, error: sqsErr.message };
+        console.log(`[DELETE] delist-jobs record created: job_id=${job_id}`);
+      } catch (jobErr) {
+        console.error(`[DELETE] Failed to create delist-jobs record: ${jobErr.message}`);
+        return err(500, `Failed to initiate delisting: ${jobErr.message}`);
       }
 
-      console.log(`[DELETE] Symbol ${sym} delisted successfully`);
+      // 3.5. symbols 테이블 status를 DELISTING으로 변경
+      try {
+        await dynamodb.send(new UpdateCommand({
+          TableName: SYMBOLS_TABLE,
+          Key: { symbol: sym },
+          UpdateExpression: 'SET #status = :status, delist_job_id = :jobId, updated_at = :now',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':status': 'DELISTING',
+            ':jobId': job_id,
+            ':now': now
+          }
+        }));
+        console.log(`[DELETE] symbols table status -> DELISTING for ${sym}`);
+      } catch (symErr) {
+        console.error(`[DELETE] symbols status update failed (non-fatal): ${symErr.message}`);
+      }
+
+      // 3.7. MM-service 사전 중지 (Step Functions 시작 전 — 레이스 컨디션 방지)
+      // MM이 상장폐지 중에도 Kinesis로 주문을 계속 보내면 ticker/depth 키가 재생성됨.
+      // mm:all:symbols에서 제거하면 MM이 이 종목을 무시함.
+      try {
+        await operatingCache.publish('mm:control', JSON.stringify({
+          action: 'stop', symbol: sym, timestamp: Date.now()
+        }));
+        await operatingCache.srem('mm:all:symbols', sym);
+        await operatingCache.srem('mm:running:symbols', sym);
+        console.log(`[DELETE] MM pre-stop sent + removed from mm sets for ${sym}`);
+      } catch (mmErr) {
+        console.warn(`[DELETE] MM pre-stop failed (continuing): ${mmErr.message}`);
+      }
+
+      // 4. Step Functions 실행 시작
+      try {
+        const executionResult = await sfn.send(new StartExecutionCommand({
+          stateMachineArn: STATE_MACHINE_ARN,
+          name: job_id,
+          input: JSON.stringify({ job_id, symbol: sym })
+        }));
+        console.log(`[DELETE] Step Functions execution started: ${executionResult.executionArn}`);
+
+        // Publish initial delisting event to admin WebSocket clients
+        await publishAdminEvent('delist_progress', {
+          job_id, symbol: sym, phase: 'INITIATED', status: 'PENDING',
+          phases_completed: []
+        });
+      } catch (sfnErr) {
+        console.error(`[DELETE] Step Functions start failed: ${sfnErr.message}`);
+        // Job 상태를 FAILED로 업데이트
+        await dynamodb.send(new UpdateCommand({
+          TableName: DELIST_JOBS_TABLE,
+          Key: { job_id },
+          UpdateExpression: 'SET #s = :s, #e = :e, updated_at = :now',
+          ExpressionAttributeNames: { '#s': 'status', '#e': 'error' },
+          ExpressionAttributeValues: {
+            ':s': 'FAILED',
+            ':e': `Step Functions start failed: ${sfnErr.message}`,
+            ':now': new Date().toISOString()
+          }
+        })).catch(() => {});
+        return err(500, `Failed to start delisting process: ${sfnErr.message}`);
+      }
+
+      // 5. 즉시 반환 (비동기 - 프론트엔드에서 폴링)
       return ok({
         success: true,
+        job_id,
         symbol: sym,
-        message: `Symbol ${sym} delisted. All related data has been removed.`,
-        deletionResults
+        status: 'PENDING',
+        message: `Delisting started for ${sym}. Poll GET /symbols?action=delist-status&job_id=${job_id} for progress.`
       });
     }
 

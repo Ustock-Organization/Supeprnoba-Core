@@ -2,7 +2,7 @@ import { verifyAuth } from '/opt/nodejs/verifyAuth.mjs';
 import { getValkeyClient, createLegacyClient } from '/opt/nodejs/index.mjs';
 
 // Layer를 통한 Valkey 클라이언트 (websocket 프리셋: 빠른 실패, 재시도 없음)
-const valkey = getValkeyClient({ type: 'depth', preset: 'websocket' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'websocket' });
 
 // 시작 시 환경변수 상태 로깅 (Cold Start 시)
 console.log(`[connect-handler] STARTUP - Cognito config:`, {
@@ -63,6 +63,20 @@ const connectHandler = async (event) => {
     console.log(`[connect] No token → anonymous user: ${userId}`);
   }
 
+  // 정지 사용자 WebSocket 연결 거부 (로그인 사용자만 체크)
+  if (isLoggedIn && userId) {
+    try {
+      if (valkey.status === 'ready') {
+        const isSuspended = await valkey.get(`user:${userId}:suspended`);
+        if (isSuspended === 'true') {
+          console.log(`[connect] Blocked suspended user: ${userId}`);
+          return { statusCode: 403, body: 'Account suspended' };
+        }
+      }
+    } catch (e) {
+      console.warn(`[connect] Suspend check failed (fail-open): ${e.message}`);
+    }
+  }
 
   // Valkey 연결 시도 (최대 3회 재시도)
   let valkeyConnected = false;

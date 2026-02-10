@@ -5,22 +5,27 @@ import { ScanCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 
 // Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'admin' });
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
+const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
 // Layer의 CORS.READONLY 사용 (GET, OPTIONS)
 const H = CORS.READONLY;
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => response.ok(d, H);
 const err = (c, m) => response.error(c, m, H);
 
 export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
-  if (!isAdmin(event)) return err(403, 'Unauthorized');
+  
+  // Cognito JWT 인증
+  const authResult = await verifyAdmin(event);
+  if (!authResult.success) return authErrorResponse(authResult, H);
   if (event.httpMethod !== 'GET') return err(405, 'Method not allowed');
 
   try {
@@ -31,9 +36,9 @@ export const handler = async (event) => {
 
     // WebSocket 연결 목록
     if (!section || section === 'connections' || section === 'all') {
-      const connectionKeys = await valkey.keys('ws:*');
+      const connectionKeys = await operatingCache.keys('ws:*');
       const connections = await Promise.all(connectionKeys.slice(0, 100).map(async (key) => {
-        const data = await valkey.get(key);
+        const data = await operatingCache.get(key);
         try {
           const parsed = JSON.parse(data);
           return {
@@ -69,10 +74,10 @@ export const handler = async (event) => {
 
     // 심볼 구독 현황
     if (!section || section === 'subscriptions' || section === 'all') {
-      const subscribedSymbols = await valkey.smembers('subscribed:symbols');
+      const subscribedSymbols = await operatingCache.smembers('subscribed:symbols');
       const symbolSubscribers = await Promise.all(subscribedSymbols.map(async (symbol) => {
-        const mainCount = await valkey.scard(`symbol:${symbol}:main`);
-        const subCount = await valkey.scard(`symbol:${symbol}:sub`);
+        const mainCount = await operatingCache.scard(`symbol:${symbol}:main`);
+        const subCount = await operatingCache.scard(`symbol:${symbol}:sub`);
         return { symbol, main: mainCount, sub: subCount, total: mainCount + subCount };
       }));
 
@@ -93,9 +98,9 @@ export const handler = async (event) => {
 
       const orderbookStatus = await Promise.all((symbols || []).slice(0, 20).map(async (sym) => {
         const [depth, ticker, ohlc] = await Promise.all([
-          valkey.get(`depth:${sym.symbol}`),
-          valkey.get(`ticker:${sym.symbol}`),
-          valkey.get(`ohlc:${sym.symbol}`)
+          depthCache.get(`depth:${sym.symbol}`),
+          depthCache.get(`ticker:${sym.symbol}`),
+          depthCache.get(`ohlc:${sym.symbol}`)
         ]);
 
         let status = 'no_data';
@@ -144,12 +149,12 @@ export const handler = async (event) => {
 
     // 마켓메이커 상태
     if (!section || section === 'marketmakers' || section === 'all') {
-      const runningMMs = await valkey.smembers('mm:running:symbols');
+      const runningMMs = await operatingCache.smembers('mm:running:symbols');
       const mmStatus = await Promise.all(runningMMs.map(async (symbol) => {
         const [price, orderCount, config] = await Promise.all([
-          valkey.get(`mm:price:${symbol}`),
-          valkey.get(`mm:orderCount:${symbol}`),
-          valkey.get(`mm:config:${symbol}`)
+          operatingCache.get(`mm:price:${symbol}`),
+          operatingCache.get(`mm:orderCount:${symbol}`),
+          operatingCache.get(`mm:config:${symbol}`)
         ]);
 
         let configParsed = {};
@@ -175,7 +180,7 @@ export const handler = async (event) => {
 
     // 최근 에러 로그
     if (!section || section === 'errors' || section === 'all') {
-      const recentErrors = await valkey.lrange('engine:errors', 0, 49);
+      const recentErrors = await operatingCache.lrange('engine:errors', 0, 49);
       result.errors = {
         count: recentErrors.length,
         recent: recentErrors.map(e => {
@@ -189,7 +194,7 @@ export const handler = async (event) => {
       // Redis 연결 상태
       let redisStatus = 'connected';
       try {
-        await valkey.ping();
+        await operatingCache.ping();
       } catch {
         redisStatus = 'disconnected';
       }

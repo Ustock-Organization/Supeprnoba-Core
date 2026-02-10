@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { getValkeyClient } from '/opt/nodejs/index.mjs';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { PutCommand, DeleteCommand, GetCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
@@ -7,8 +7,6 @@ import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 
 // === Configuration ===
-const VALKEY_HOST = process.env.VALKEY_HOST;
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const CREATOR_REQUESTS_TABLE = process.env.CREATOR_REQUESTS_TABLE || 'supernoba-creator-requests';
 
@@ -21,15 +19,7 @@ const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
 const secretsManager = new SecretsManagerClient({ region: AWS_REGION });
 
 // Clients
-const valkey = new Redis({
-  host: VALKEY_HOST,
-  port: VALKEY_PORT,
-  tls: {},
-  connectTimeout: 5000,
-  maxRetriesPerRequest: 3,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
-});
-valkey.on('error', (err) => console.error('Redis error:', err.message));
+const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 
 const dynamodb = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: AWS_REGION })

@@ -33,13 +33,11 @@ export const handler = async (event) => {
 
         const platform = detectPlatform(url);
         console.log(`[PREVIEW] Detected Platform: ${platform}`);
-        console.log(`[PREVIEW] Detected Platform: ${platform}`);
-        console.log(`[DEBUG] Token Present: ${!!process.env.TWITTER_BEARER_TOKEN}`);
-        console.log('[DEBUG] VERSION: CHECK_FINAL_TAR');
 
         let image = null;
         let title = null;
-        let errorDetails = null;
+        let followerCount = null;
+        let subscriberCount = null;
 
         // 1. YouTube
         if (platform === 'YOUTUBE' && process.env.YOUTUBE_API_KEY) {
@@ -50,15 +48,15 @@ export const handler = async (event) => {
                 let handle = null;
 
                 if (url.includes('@')) {
-                    const match = url.match(/@([\w\-\.]+)/);
-                    if (match) handle = match[1];
+                    // Support Korean and other unicode characters in handle
+                    const match = url.match(/@([^\/\?\s]+)/);
+                    if (match) handle = decodeURIComponent(match[1]);
                 } else if (url.includes('/channel/')) {
                     const match = url.match(/\/channel\/([a-zA-Z0-9_-]+)/);
                     if (match) channelId = match[1];
                 } else if (url.includes('/c/')) {
                     const match = url.match(/\/c\/([a-zA-Z0-9_-]+)/);
                     if (match) {
-                        // Search for channel ID
                         const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(match[1])}&key=${ytKey}&maxResults=1`;
                         const searchRes = await fetch(searchUrl);
                         const searchData = await searchRes.json();
@@ -74,43 +72,58 @@ export const handler = async (event) => {
                     }
                 }
 
-                if (channelId) {
-                    const ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${channelId}&key=${ytKey}`;
+                // Fetch channel with statistics
+                const fetchChannelData = async (chId) => {
+                    const ytUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${chId}&key=${ytKey}`;
                     const ytRes = await fetch(ytUrl);
                     const ytData = await ytRes.json();
                     if (ytData.items?.[0]) {
-                        const snip = ytData.items[0].snippet;
+                        const item = ytData.items[0];
+                        const snip = item.snippet;
                         image = snip.thumbnails.high?.url || snip.thumbnails.medium?.url || snip.thumbnails.default?.url;
                         title = snip.title;
+                        // Get subscriber count
+                        if (item.statistics?.subscriberCount) {
+                            subscriberCount = parseInt(item.statistics.subscriberCount, 10);
+                        }
                     }
+                };
+
+                if (channelId) {
+                    await fetchChannelData(channelId);
                 } else if (handle) {
-                     // Try forHandle
-                     const forHandleUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet&forHandle=${handle}&key=${ytKey}`;
-                     const forHandleRes = await fetch(forHandleUrl);
-                     const forHandleData = await forHandleRes.json();
-                     if (forHandleData.items?.[0]) {
-                         const snip = forHandleData.items[0].snippet;
-                         image = snip.thumbnails.high?.url || snip.thumbnails.medium?.url || snip.thumbnails.default?.url;
-                         title = snip.title;
-                     } else {
-                         // Fallback search
-                         const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(handle)}&key=${ytKey}&maxResults=1`;
-                         const searchRes = await fetch(searchUrl);
-                         const searchData = await searchRes.json();
-                         const foundId = searchData.items?.[0]?.id?.channelId;
-                         if (foundId) {
-                             const chRes = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=snippet&id=${foundId}&key=${ytKey}`);
-                             const chData = await chRes.json();
-                             if (chData.items?.[0]) {
-                                 title = chData.items[0].snippet.title;
-                                 image = chData.items[0].snippet.thumbnails.high?.url;
-                             }
-                         }
-                     }
+                    // Check if handle contains non-ASCII (Korean, etc.)
+                    const isNonAscii = /[^\x00-\x7F]/.test(handle);
+                    
+                    if (!isNonAscii) {
+                        // Try forHandle with statistics (only for ASCII handles)
+                        const forHandleUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&forHandle=${encodeURIComponent(handle)}&key=${ytKey}`;
+                        const forHandleRes = await fetch(forHandleUrl);
+                        const forHandleData = await forHandleRes.json();
+                        if (forHandleData.items?.[0]) {
+                            const item = forHandleData.items[0];
+                            const snip = item.snippet;
+                            image = snip.thumbnails.high?.url || snip.thumbnails.medium?.url || snip.thumbnails.default?.url;
+                            title = snip.title;
+                            if (item.statistics?.subscriberCount) {
+                                subscriberCount = parseInt(item.statistics.subscriberCount, 10);
+                            }
+                        }
+                    }
+                    
+                    // Fallback to search API (works for Korean handles)
+                    if (!title) {
+                        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(handle)}&key=${ytKey}&maxResults=1`;
+                        const searchRes = await fetch(searchUrl);
+                        const searchData = await searchRes.json();
+                        const foundId = searchData.items?.[0]?.id?.channelId;
+                        if (foundId) {
+                            await fetchChannelData(foundId);
+                        }
+                    }
                 }
             } catch (e) {
                 console.error('[PREVIEW] YouTube Error:', e);
-                errorDetails = e.message;
             }
         }
 
@@ -127,33 +140,30 @@ export const handler = async (event) => {
                 }
 
                 if (username && !['i', 'home', 'search'].includes(username)) {
+                    // Request public_metrics for follower count
                     const xRes = await fetch(
-                        `https://api.twitter.com/2/users/by/username/${username}?user.fields=profile_image_url,name`,
+                        `https://api.twitter.com/2/users/by/username/${username}?user.fields=profile_image_url,name,public_metrics`,
                         { headers: { 'Authorization': `Bearer ${process.env.TWITTER_BEARER_TOKEN}` } }
                     );
                     const xData = await xRes.json();
                     
-                    if (!xRes.ok) {
-                        console.error('[PREVIEW] X API Error:', JSON.stringify(xData));
-                        errorDetails = `API Error: ${xRes.status} ${JSON.stringify(xData)}`;
-                    } else {
-                        // Success case debugging
-                        errorDetails = `Success Raw Data: ${JSON.stringify(xData)}`;
+                    if (xRes.ok && xData.data) {
+                        const rawImg = xData.data.profile_image_url;
+                        image = rawImg ? rawImg.replace(/_(normal|mini|bigger)\./, '.') : null; 
+                        if (image === rawImg && image) image = rawImg.replace('_normal', '_400x400');
                         
-                        if (xData.data) {
-                            const rawImg = xData.data.profile_image_url;
-                            image = rawImg ? rawImg.replace(/_(normal|mini|bigger)\./, '.') : null; 
-                            if (image === rawImg && image) image = rawImg.replace('_normal', '_400x400');
-                            
-                            title = xData.data.name;
-                        } else {
-                             errorDetails += ' | No Data found for user';
+                        title = xData.data.name;
+                        
+                        // Get follower count from public_metrics
+                        if (xData.data.public_metrics?.followers_count) {
+                            followerCount = xData.data.public_metrics.followers_count;
                         }
+                    } else {
+                        console.error('[PREVIEW] X API Error:', JSON.stringify(xData));
                     }
                 }
             } catch (e) {
                 console.error('[PREVIEW] X Error:', e);
-                errorDetails = e.message;
             }
         }
 
@@ -165,7 +175,9 @@ export const handler = async (event) => {
                 title: title || '',
                 image: image || '',
                 platform,
-                debug_error: errorDetails
+                // Return both fields for frontend compatibility
+                followerCount: followerCount,
+                subscriberCount: subscriberCount,
             })
         };
 

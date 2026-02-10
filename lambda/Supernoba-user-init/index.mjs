@@ -1,9 +1,8 @@
 /**
- * Supernoba-user-init: 신규 사용자 초기화 Lambda - DynamoDB Version (Supabase Removed)
+ * Supernoba-user-init: 신규 사용자 초기화 Lambda - DynamoDB Version
  *
  * OAuth 로그인 성공 후 프론트엔드에서 호출
- * - user_cache 생성 (DynamoDB)
- * - wallets 생성 (DynamoDB, welcomeBonus 적용)
+ * - supernoba-users 테이블에 프로필 + balances.BOLT 통합 생성
  * - 시스템 설정 반환 (maintenanceMode, tradingEnabled 등)
  */
 
@@ -11,8 +10,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { GetCommand, PutCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+const USER_TABLE = process.env.USER_TABLE || process.env.USER_CACHE_TABLE || 'supernoba-users';
 const SETTINGS_KEY = 'SYSTEM_SETTINGS';
 
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
@@ -70,9 +68,8 @@ export const handler = async (event) => {
 
     // GET 요청: 설정만 반환 (초기화 없이)
     if (event.httpMethod === 'GET') {
-      // user_cache 존재 여부 확인
       const userResult = await dynamodb.send(new GetCommand({
-        TableName: USER_CACHE_TABLE,
+        TableName: USER_TABLE,
         Key: { user_id: userId }
       }));
 
@@ -89,25 +86,21 @@ export const handler = async (event) => {
     // POST 요청: 초기화 수행
     // 1. 이미 초기화된 사용자인지 확인
     const existingUserResult = await dynamodb.send(new GetCommand({
-      TableName: USER_CACHE_TABLE,
+      TableName: USER_TABLE,
       Key: { user_id: userId }
     }));
 
     if (existingUserResult.Item) {
-      // 이미 존재하는 사용자 - wallet 조회
-      const walletResult = await dynamodb.send(new GetCommand({
-        TableName: WALLETS_TABLE,
-        Key: { user_id: userId, currency: 'BOLT' }
-      }));
-
-      const userCache = existingUserResult.Item;
+      // 이미 존재하는 사용자 — balances.BOLT에서 직접 읽기
+      const existingUser = existingUserResult.Item;
+      const boltBalance = existingUser.balances?.BOLT || { available: 0, locked: 0 };
 
       return ok({
         is_new_user: false,
         initialized: true,
-        balance: walletResult.Item?.available || 0,
-        is_admin: userCache.is_admin === true,
-        is_tester: userCache.is_tester === true,
+        balance: boltBalance.available,
+        is_admin: existingUser.is_admin === true,
+        is_tester: existingUser.is_tester === true,
         settings: {
           maintenanceMode: settings.system?.maintenanceMode || false,
           tradingEnabled: settings.system?.tradingEnabled !== false,
@@ -121,11 +114,13 @@ export const handler = async (event) => {
       return err(403, 'NEW_REGISTRATION_DISABLED');
     }
 
-    // 3. user_cache 생성 (DynamoDB)
+    // 3. 프로필 + 잔고를 하나의 레코드로 생성 (통합)
     const now = new Date().toISOString();
+    const welcomeBonus = settings.user?.welcomeBonus || 0;
+
     try {
       await dynamodb.send(new PutCommand({
-        TableName: USER_CACHE_TABLE,
+        TableName: USER_TABLE,
         Item: {
           user_id: userId,
           email: email || null,
@@ -135,6 +130,13 @@ export const handler = async (event) => {
           provider: provider || 'unknown',
           is_admin: false,
           is_tester: false,
+          balances: {
+            BOLT: {
+              available: welcomeBonus,
+              locked: 0
+            }
+          },
+          version: 1,
           created_at: now,
           updated_at: now
         },
@@ -149,31 +151,8 @@ export const handler = async (event) => {
           message: 'User already exists'
         });
       }
-      console.error('Failed to create user_cache:', insertError);
+      console.error('Failed to create user:', insertError);
       return err(500, 'Failed to create user profile');
-    }
-
-    // 4. wallets 생성 (welcomeBonus 적용)
-    const welcomeBonus = settings.user?.welcomeBonus || 0;
-    try {
-      await dynamodb.send(new PutCommand({
-        TableName: WALLETS_TABLE,
-        Item: {
-          user_id: userId,
-          currency: 'BOLT',
-          available: welcomeBonus,
-          locked: 0,
-          version: 1,
-          created_at: now,
-          updated_at: now
-        },
-        ConditionExpression: 'attribute_not_exists(user_id)'
-      }));
-    } catch (walletError) {
-      if (walletError.name !== 'ConditionalCheckFailedException') {
-        console.error('Failed to create wallet:', walletError);
-      }
-      // 프로필은 생성됐으니 계속 진행
     }
 
     console.log(`[user-init] New user initialized: ${userId}, bonus: ${welcomeBonus}`);

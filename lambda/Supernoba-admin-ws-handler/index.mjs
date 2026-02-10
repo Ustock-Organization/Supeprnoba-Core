@@ -2,24 +2,26 @@
  * Supernoba Admin WebSocket Handler
  * - 어드민 전용 WebSocket 연결 관리
  * - MM 실시간 데이터 구독 및 푸시
+ * - Cognito JWT 인증 (DynamoDB is_admin 확인)
  */
 import { ApiGatewayManagementApiClient, PostToConnectionCommand, DeleteConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
 
 // Common Layer - Valkey
 import { getValkeyClient } from '/opt/nodejs/index.mjs';
 
-const ADMIN_KEY = process.env.ADMIN_KEY || '7194';
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin } from '/opt/nodejs/verifyAuth.mjs';
 
-// Layer를 통한 Redis 클라이언트 (두 개의 캐시 사용)
+// Layer를 통한 Redis 클라이언트 (4개 캐시 아키텍처)
 const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
-const backupCache = getValkeyClient({ type: 'backup', preset: 'admin' });
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });  // MM 관련 데이터는 Operating Cache
 
 let cacheConnected = false;
 
 // EC2 MM Service에 제어 신호 발송 (mm:control Pub/Sub)
 async function sendMMControl(action, symbol = null) {
   const message = { action, symbol, timestamp: Date.now() };
-  await backupCache.publish('mm:control', JSON.stringify(message));
+  await operatingCache.publish('mm:control', JSON.stringify(message));
   console.log(`[admin-ws] MM Control sent: ${action}`, symbol || '');
 }
 
@@ -62,7 +64,7 @@ async function sendToConnection(apiClient, connectionId, data) {
     console.error(`[admin-ws] PostToConnection ERROR: ${err.name} - ${err.message}`);
     if (err.statusCode === 410) {
       // Connection gone, cleanup
-      await backupCache.srem('admin:connections', connectionId).catch(() => {});
+      await operatingCache.srem('admin:connections', connectionId).catch(() => {});
     }
     return false;
   }
@@ -77,17 +79,34 @@ async function handleConnect(event) {
     return { statusCode: 400, body: 'Missing connectionId' };
   }
 
-  // 어드민 키 확인 (쿼리 파라미터)
-  const authKey = event.queryStringParameters?.auth;
-  if (authKey !== ADMIN_KEY) {
-    console.log(`[admin-ws] REJECT Invalid admin key`);
-    return { statusCode: 401, body: 'Unauthorized' };
+  // Cognito JWT 인증 (쿼리 파라미터에서 토큰 추출)
+  const token = event.queryStringParameters?.auth;
+  if (!token) {
+    console.log(`[admin-ws] REJECT No auth token provided`);
+    return { statusCode: 401, body: 'Unauthorized - No token' };
   }
 
-  console.log(`[admin-ws] Auth OK, connecting to cache...`);
+  // verifyAdmin은 event.headers를 사용하므로 가짜 event 생성
+  const authEvent = {
+    headers: { Authorization: `Bearer ${token}` }
+  };
 
   try {
-    await ensureConnected(backupCache);
+    const authResult = await verifyAdmin(authEvent);
+    if (!authResult.success) {
+      console.log(`[admin-ws] REJECT Auth failed:`, authResult.error, authResult.message);
+      return { statusCode: 401, body: `Unauthorized - ${authResult.message}` };
+    }
+    console.log(`[admin-ws] Auth OK - userId: ${authResult.userId}, method: ${authResult.method}`);
+  } catch (authError) {
+    console.error(`[admin-ws] Auth exception:`, authError.message);
+    return { statusCode: 401, body: 'Unauthorized - Auth error' };
+  }
+
+  console.log(`[admin-ws] Connecting to cache...`);
+
+  try {
+    await ensureConnected(operatingCache);
   } catch (cacheErr) {
     console.error(`[admin-ws] Cache connect error:`, cacheErr.message);
     // 캐시 연결 실패해도 연결은 허용
@@ -100,8 +119,8 @@ async function handleConnect(event) {
   };
 
   try {
-    await backupCache.setex(`admin:ws:${connectionId}`, 86400, JSON.stringify(connectionInfo));
-    await backupCache.sadd('admin:connections', connectionId);
+    await operatingCache.setex(`admin:ws:${connectionId}`, 86400, JSON.stringify(connectionInfo));
+    await operatingCache.sadd('admin:connections', connectionId);
     console.log(`[admin-ws] OK Admin connected: ${connectionId}`);
   } catch (e) {
     console.error(`[admin-ws] Failed to save connection:`, e.message);
@@ -117,12 +136,12 @@ async function handleDisconnect(event) {
 
   if (!connectionId) return { statusCode: 200, body: 'OK' };
 
-  await ensureConnected(backupCache);
+  await ensureConnected(operatingCache);
 
   try {
-    await backupCache.del(`admin:ws:${connectionId}`);
-    await backupCache.srem('admin:connections', connectionId);
-    await backupCache.srem('admin:mm:subscribers', connectionId);  // 구독자 목록에서도 제거
+    await operatingCache.del(`admin:ws:${connectionId}`);
+    await operatingCache.srem('admin:connections', connectionId);
+    await operatingCache.srem('admin:mm:subscribers', connectionId);  // 구독자 목록에서도 제거
     console.log(`[admin-ws] OK Admin disconnected: ${connectionId}`);
   } catch (e) {
     console.error(`[admin-ws] Disconnect cleanup failed:`, e.message);
@@ -133,18 +152,18 @@ async function handleDisconnect(event) {
 
 // === MM 데이터 조회 ===
 async function getMMData() {
-  await ensureConnected(backupCache);
+  await ensureConnected(operatingCache);
   await ensureConnected(depthCache);
 
   // 모든 등록된 심볼 조회 (대기 상태 포함)
-  let allSymbols = await backupCache.smembers('mm:all:symbols').catch(() => []);
-  const runningSymbols = await backupCache.smembers('mm:running:symbols').catch(() => []);
+  let allSymbols = await operatingCache.smembers('mm:all:symbols').catch(() => []);
+  const runningSymbols = await operatingCache.smembers('mm:running:symbols').catch(() => []);
   const runningSet = new Set(runningSymbols);
 
   // 마이그레이션: mm:all:symbols가 비어있으면 mm:running:symbols에서 복사
   if (allSymbols.length === 0 && runningSymbols.length > 0) {
     for (const sym of runningSymbols) {
-      await backupCache.sadd('mm:all:symbols', sym);
+      await operatingCache.sadd('mm:all:symbols', sym);
     }
     allSymbols = runningSymbols;
     console.log(`[admin-ws] Migrated ${runningSymbols.length} symbols to mm:all:symbols`);
@@ -154,11 +173,11 @@ async function getMMData() {
 
   for (const symbol of allSymbols) {
     const [configStr, priceStr, orderCountStr, ohlcStr, startedAtStr] = await Promise.all([
-      backupCache.get(`mm:config:${symbol}`),
-      backupCache.get(`mm:price:${symbol}`),
-      backupCache.get(`mm:orderCount:${symbol}`),
+      operatingCache.get(`mm:config:${symbol}`),
+      operatingCache.get(`mm:price:${symbol}`),
+      operatingCache.get(`mm:orderCount:${symbol}`),
       depthCache.get(`ohlc:${symbol}`),
-      backupCache.get(`mm:started_at:${symbol}`),  // 시작 시간 조회
+      operatingCache.get(`mm:started_at:${symbol}`),  // 시작 시간 조회
     ]).catch(() => [null, null, null, null, null]);
 
     let config = { basePrice: 100 };
@@ -175,7 +194,7 @@ async function getMMData() {
     // 실행 중인데 started_at이 없으면 자동 설정 (마이그레이션)
     if (isRunning && !startedAtStr) {
       const now = Date.now();
-      await backupCache.set(`mm:started_at:${symbol}`, now.toString());
+      await operatingCache.set(`mm:started_at:${symbol}`, now.toString());
       phaseTime = 0;  // 새로 시작한 것처럼 0부터
       console.log(`[admin-ws] Auto-set started_at for ${symbol}`);
     } else if (isRunning && startedAtStr) {
@@ -204,10 +223,10 @@ async function getMMData() {
   }
 
   // mm:running 상태
-  const isRunning = await backupCache.get('mm:running').catch(() => 'false');
+  const isRunning = await operatingCache.get('mm:running').catch(() => 'false');
 
   // 연결 수 조회
-  const connections = await backupCache.scard('admin:connections').catch(() => 0);
+  const connections = await operatingCache.scard('admin:connections').catch(() => 0);
 
   return {
     running: isRunning === 'true',
@@ -239,8 +258,8 @@ async function handleMessage(event) {
   switch (action) {
     case 'subscribe':
       // MM 데이터 구독 시작
-      await ensureConnected(backupCache);
-      await backupCache.sadd('admin:mm:subscribers', connectionId);
+      await ensureConnected(operatingCache);
+      await operatingCache.sadd('admin:mm:subscribers', connectionId);
 
       // 즉시 현재 데이터 전송
       const mmData = await getMMData();
@@ -254,8 +273,8 @@ async function handleMessage(event) {
       return { statusCode: 200, body: 'Subscribed' };
 
     case 'unsubscribe':
-      await ensureConnected(backupCache);
-      await backupCache.srem('admin:mm:subscribers', connectionId);
+      await ensureConnected(operatingCache);
+      await operatingCache.srem('admin:mm:subscribers', connectionId);
       console.log(`[admin-ws] OK Unsubscribed from MM data: ${connectionId}`);
       return { statusCode: 200, body: 'Unsubscribed' };
 
@@ -297,7 +316,7 @@ async function handleMessage(event) {
 // === MM 제어 핸들러 ===
 async function handleMMControl(event, apiClient, connectionId, body) {
   const { action, symbol, basePrice, config } = body;
-  await ensureConnected(backupCache);
+  await ensureConnected(operatingCache);
 
   const sym = (symbol || '').toUpperCase();
   const cfg = config || {};
@@ -312,7 +331,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         // 기존 설정 조회
         let existingConfig = { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeInterval: 3, tradeQuantity: 50 };
         try {
-          const existingStr = await backupCache.get(`mm:config:${sym}`);
+          const existingStr = await operatingCache.get(`mm:config:${sym}`);
           if (existingStr) existingConfig = JSON.parse(existingStr);
         } catch (e) {}
         // 단순 사인파 설정
@@ -324,12 +343,12 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           tradeInterval: cfg.tradeInterval ?? existingConfig.tradeInterval ?? 3,
           tradeQuantity: cfg.tradeQuantity ?? existingConfig.tradeQuantity ?? 50,
         };
-        await backupCache.set('mm:running', 'true');
-        await backupCache.sadd('mm:all:symbols', sym);       // 전체 목록에 추가
-        await backupCache.sadd('mm:running:symbols', sym);   // 실행 목록에 추가
-        await backupCache.set(`mm:config:${sym}`, JSON.stringify(startConfig));
+        await operatingCache.set('mm:running', 'true');
+        await operatingCache.sadd('mm:all:symbols', sym);       // 전체 목록에 추가
+        await operatingCache.sadd('mm:running:symbols', sym);   // 실행 목록에 추가
+        await operatingCache.set(`mm:config:${sym}`, JSON.stringify(startConfig));
         // 시작 시간 저장 (phase_time 계산용)
-        await backupCache.set(`mm:started_at:${sym}`, Date.now().toString());
+        await operatingCache.set(`mm:started_at:${sym}`, Date.now().toString());
         // EC2 MM Service에 시작 명령 전송
         await sendMMControl('start', sym);
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'start', symbol: sym });
@@ -337,18 +356,18 @@ async function handleMMControl(event, apiClient, connectionId, body) {
 
       case 'stop':
         if (sym) {
-          await backupCache.srem('mm:running:symbols', sym);
+          await operatingCache.srem('mm:running:symbols', sym);
           // 시작 시간 제거
-          await backupCache.del(`mm:started_at:${sym}`);
-          const remaining = await backupCache.scard('mm:running:symbols');
+          await operatingCache.del(`mm:started_at:${sym}`);
+          const remaining = await operatingCache.scard('mm:running:symbols');
           if (remaining === 0) {
-            await backupCache.set('mm:running', 'false');
+            await operatingCache.set('mm:running', 'false');
           }
           // EC2 MM Service에 중지 명령 전송
           await sendMMControl('stop', sym);
         } else {
-          await backupCache.set('mm:running', 'false');
-          await backupCache.del('mm:running:symbols');
+          await operatingCache.set('mm:running', 'false');
+          await operatingCache.del('mm:running:symbols');
           // EC2 MM Service에 전체 중지 명령 전송
           await sendMMControl('stopAll');
         }
@@ -356,13 +375,13 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         break;
 
       case 'startAll':
-        await backupCache.set('mm:running', 'true');
+        await operatingCache.set('mm:running', 'true');
         // 모든 심볼에 대해 시작 시간 설정
-        const allSymbols = await backupCache.smembers('mm:all:symbols').catch(() => []);
+        const allSymbols = await operatingCache.smembers('mm:all:symbols').catch(() => []);
         const now = Date.now().toString();
         for (const s of allSymbols) {
-          await backupCache.sadd('mm:running:symbols', s);
-          await backupCache.set(`mm:started_at:${s}`, now);
+          await operatingCache.sadd('mm:running:symbols', s);
+          await operatingCache.set(`mm:started_at:${s}`, now);
         }
         // EC2 MM Service에 전체 시작 명령 전송
         await sendMMControl('startAll');
@@ -370,13 +389,13 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         break;
 
       case 'stopAll':
-        await backupCache.set('mm:running', 'false');
+        await operatingCache.set('mm:running', 'false');
         // 모든 심볼의 시작 시간 제거
-        const runningSymbols = await backupCache.smembers('mm:running:symbols').catch(() => []);
+        const runningSymbols = await operatingCache.smembers('mm:running:symbols').catch(() => []);
         for (const s of runningSymbols) {
-          await backupCache.del(`mm:started_at:${s}`);
+          await operatingCache.del(`mm:started_at:${s}`);
         }
-        await backupCache.del('mm:running:symbols');
+        await operatingCache.del('mm:running:symbols');
         // EC2 MM Service에 전체 중지 명령 전송
         await sendMMControl('stopAll');
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'stopAll' });
@@ -398,8 +417,8 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           tradeQuantity: cfg.tradeQuantity ?? 50,
         };
         console.log('[admin-ws] Saving config:', JSON.stringify(saveConfig));
-        await backupCache.sadd('mm:all:symbols', sym);  // 전체 목록에 추가 (대기 상태)
-        await backupCache.set(`mm:config:${sym}`, JSON.stringify(saveConfig));
+        await operatingCache.sadd('mm:all:symbols', sym);  // 전체 목록에 추가 (대기 상태)
+        await operatingCache.set(`mm:config:${sym}`, JSON.stringify(saveConfig));
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'save', symbol: sym });
         break;
 
@@ -409,12 +428,12 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           return { statusCode: 400, body: 'Symbol required' };
         }
         // 심볼을 모든 목록에서 제거
-        await backupCache.srem('mm:all:symbols', sym);
-        await backupCache.srem('mm:running:symbols', sym);
-        await backupCache.del(`mm:config:${sym}`);
-        await backupCache.del(`mm:price:${sym}`);
-        await backupCache.del(`mm:orderCount:${sym}`);
-        await backupCache.del(`mm:started_at:${sym}`);  // 시작 시간도 제거
+        await operatingCache.srem('mm:all:symbols', sym);
+        await operatingCache.srem('mm:running:symbols', sym);
+        await operatingCache.del(`mm:config:${sym}`);
+        await operatingCache.del(`mm:price:${sym}`);
+        await operatingCache.del(`mm:orderCount:${sym}`);
+        await operatingCache.del(`mm:started_at:${sym}`);  // 시작 시간도 제거
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'delete', symbol: sym });
         break;
     }
@@ -435,12 +454,12 @@ async function broadcastMMData(event) {
   const apiClient = getApiClient(event);
   if (!apiClient) return;
 
-  await ensureConnected(backupCache);
+  await ensureConnected(operatingCache);
 
   // 활성 연결 목록으로 구독자 필터링
   const [subscribers, connections] = await Promise.all([
-    backupCache.smembers('admin:mm:subscribers').catch(() => []),
-    backupCache.smembers('admin:connections').catch(() => []),
+    operatingCache.smembers('admin:mm:subscribers').catch(() => []),
+    operatingCache.smembers('admin:connections').catch(() => []),
   ]);
 
   const connSet = new Set(connections);
@@ -449,7 +468,7 @@ async function broadcastMMData(event) {
   // 유효하지 않은 구독자 정리
   const staleSubscribers = subscribers.filter(s => !connSet.has(s));
   if (staleSubscribers.length > 0) {
-    await Promise.all(staleSubscribers.map(s => backupCache.srem('admin:mm:subscribers', s)));
+    await Promise.all(staleSubscribers.map(s => operatingCache.srem('admin:mm:subscribers', s)));
     console.log(`[admin-ws] Cleaned up ${staleSubscribers.length} stale subscribers`);
   }
 
@@ -496,9 +515,9 @@ export const handler = async (event, context) => {
 export const pushHandler = async (event) => {
   console.log('[admin-ws-push] Starting periodic push');
 
-  await ensureConnected(backupCache);
+  await ensureConnected(operatingCache);
 
-  const subscribers = await backupCache.smembers('admin:mm:subscribers').catch(() => []);
+  const subscribers = await operatingCache.smembers('admin:mm:subscribers').catch(() => []);
   if (subscribers.length === 0) {
     console.log('[admin-ws-push] No subscribers');
     return { statusCode: 200, body: 'No subscribers' };
@@ -529,8 +548,8 @@ export const pushHandler = async (event) => {
       sent++;
     } catch (err) {
       if (err.statusCode === 410) {
-        await backupCache.srem('admin:mm:subscribers', connId).catch(() => {});
-        await backupCache.srem('admin:connections', connId).catch(() => {});
+        await operatingCache.srem('admin:mm:subscribers', connId).catch(() => {});
+        await operatingCache.srem('admin:connections', connId).catch(() => {});
       }
     }
   }

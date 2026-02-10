@@ -19,7 +19,7 @@ import {
   AdminUpdateUserAttributesCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import crypto from 'crypto';
 
 const cognito = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
@@ -31,11 +31,11 @@ const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET;
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID;
 const CALLBACK_URL = process.env.CALLBACK_URL;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://supernoba.com';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://supernoba.io';
 const STATE_TABLE = process.env.STATE_TABLE || 'supernoba-oauth-state';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+// 통합된 users 테이블 (user-cache + wallets 통합)
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const SETTINGS_KEY = 'SYSTEM_SETTINGS';
 
 // 기본 설정값
@@ -113,6 +113,11 @@ export const handler = async (event) => {
     // POST /auth/init - 신규 사용자 초기화
     if (path.endsWith('/init') && method === 'POST') {
       return await handleUserInit(event);
+    }
+
+    // POST /auth/sync-user - 유저 정보 동기화 (멀티 소셜 로그인 지원)
+    if (path.endsWith('/sync-user') && method === 'POST') {
+      return await handleSyncUser(event);
     }
 
     return { statusCode: 404, headers: CORS_HEADERS, body: JSON.stringify({ error: 'Not Found' }) };
@@ -301,6 +306,14 @@ async function getXUserInfo(accessToken) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error('[auth] User info fetch failed:', errorText);
+    
+    // 429 (Rate Limit) 에러 시 DynamoDB에서 최근 사용자 조회 시도
+    if (response.status === 429) {
+      console.log('[auth] Rate limited, trying to find cached user...');
+      // 레이트 리밋 시 에러 메시지 개선
+      throw new Error('X API 요청 한도 초과. 1-2분 후 다시 시도해주세요.');
+    }
+    
     throw new Error('Failed to get X user info');
   }
 
@@ -444,9 +457,9 @@ async function handleInitCheck(event) {
 
   const settings = await getSystemSettings();
 
-  // user_cache 존재 여부 확인
+  // users 테이블에서 조회
   const userResult = await ddb.send(new GetCommand({
-    TableName: USER_CACHE_TABLE,
+    TableName: USERS_TABLE,
     Key: { user_id: userId }
   }));
 
@@ -475,25 +488,21 @@ async function handleUserInit(event) {
 
   // 이미 초기화된 사용자인지 확인
   const existingUserResult = await ddb.send(new GetCommand({
-    TableName: USER_CACHE_TABLE,
+    TableName: USERS_TABLE,
     Key: { user_id: userId }
   }));
 
   if (existingUserResult.Item) {
-    // 이미 존재하는 사용자 - wallet 조회
-    const walletResult = await ddb.send(new GetCommand({
-      TableName: WALLETS_TABLE,
-      Key: { user_id: userId, currency: 'BOLT' }
-    }));
-
-    const userCache = existingUserResult.Item;
+    // 이미 존재하는 사용자
+    const user = existingUserResult.Item;
+    const boltBalance = user.balances?.BOLT || { available: 0, locked: 0 };
 
     return ok({
       is_new_user: false,
       initialized: true,
-      balance: walletResult.Item?.available || 0,
-      is_admin: userCache.is_admin === true,
-      is_tester: userCache.is_tester === true,
+      balance: boltBalance.available,
+      is_admin: user.is_admin === true,
+      is_tester: user.is_tester === true,
       settings: {
         maintenanceMode: settings.system?.maintenanceMode || false,
         tradingEnabled: settings.system?.tradingEnabled !== false,
@@ -507,11 +516,13 @@ async function handleUserInit(event) {
     return err(403, 'NEW_REGISTRATION_DISABLED');
   }
 
-  // user_cache 생성
+  // 통합된 users 테이블에 생성
   const now = new Date().toISOString();
+  const welcomeBonus = settings.user?.welcomeBonus || 0;
+  
   try {
     await ddb.send(new PutCommand({
-      TableName: USER_CACHE_TABLE,
+      TableName: USERS_TABLE,
       Item: {
         user_id: userId,
         email: email || null,
@@ -521,6 +532,14 @@ async function handleUserInit(event) {
         provider: provider || 'unknown',
         is_admin: false,
         is_tester: false,
+        // Multi-currency balances
+        balances: {
+          BOLT: {
+            available: welcomeBonus,
+            locked: 0
+          }
+        },
+        version: 1,
         created_at: now,
         updated_at: now
       },
@@ -534,30 +553,8 @@ async function handleUserInit(event) {
         message: 'User already exists'
       });
     }
-    console.error('Failed to create user_cache:', insertError);
+    console.error('Failed to create user:', insertError);
     return err(500, 'Failed to create user profile');
-  }
-
-  // wallets 생성
-  const welcomeBonus = settings.user?.welcomeBonus || 0;
-  try {
-    await ddb.send(new PutCommand({
-      TableName: WALLETS_TABLE,
-      Item: {
-        user_id: userId,
-        currency: 'BOLT',
-        available: welcomeBonus,
-        locked: 0,
-        version: 1,
-        created_at: now,
-        updated_at: now
-      },
-      ConditionExpression: 'attribute_not_exists(user_id)'
-    }));
-  } catch (walletError) {
-    if (walletError.name !== 'ConditionalCheckFailedException') {
-      console.error('Failed to create wallet:', walletError);
-    }
   }
 
   console.log(`[auth] New user initialized: ${userId}, bonus: ${welcomeBonus}`);
@@ -572,5 +569,152 @@ async function handleUserInit(event) {
       tradingEnabled: settings.system?.tradingEnabled !== false,
       newRegistrationEnabled: settings.system?.newRegistrationEnabled !== false,
     }
+  });
+}
+
+/**
+ * POST /auth/sync-user - 유저 정보 동기화 (멀티 소셜 로그인 지원)
+ * 
+ * 요청 바디:
+ * - userId: 프론트엔드에서 생성한 유저 ID (x_xxx 또는 google_xxx)
+ * - email: 이메일
+ * - displayName: 표시 이름 (소셜 플랫폼의 닉네임)
+ * - avatarUrl: 프로필 이미지
+ * - provider: 'x' | 'google'
+ * - cognitoSub: Cognito sub (UUID)
+ * - providerUserId: 소셜 플랫폼 고유 ID
+ */
+async function handleSyncUser(event) {
+  const body = JSON.parse(event.body || '{}');
+  const { userId, email, displayName, avatarUrl, provider, cognitoSub, providerUserId } = body;
+
+  if (!userId || !provider) {
+    return err(400, 'userId and provider are required');
+  }
+
+  const now = new Date().toISOString();
+  const settings = await getSystemSettings();
+
+  // 기존 유저 조회
+  const existingUserResult = await ddb.send(new GetCommand({
+    TableName: USERS_TABLE,
+    Key: { user_id: userId }
+  }));
+
+  if (existingUserResult.Item) {
+    // 기존 유저 - linked_accounts 업데이트
+    const user = existingUserResult.Item;
+    const linkedAccounts = user.linked_accounts || {};
+    const cognitoSubs = user.cognito_subs || [];
+
+    // provider별 계정 정보 업데이트
+    linkedAccounts[provider] = {
+      id: providerUserId || userId.replace(`${provider}_`, ''),
+      email: email || null,
+      username: provider === 'x' ? (body.username || '') : null,
+      linked_at: linkedAccounts[provider]?.linked_at || now,
+      updated_at: now,
+    };
+
+    // Cognito sub 추가 (중복 제거)
+    if (cognitoSub && !cognitoSubs.includes(cognitoSub)) {
+      cognitoSubs.push(cognitoSub);
+    }
+
+    // 이메일 결정: 가상 이메일이면 '-', 실제 이메일이면 사용
+    let finalEmail = user.email;
+    if (email && !email.endsWith('@x.supernoba.com')) {
+      finalEmail = email;
+    } else if (!finalEmail || finalEmail === '-') {
+      finalEmail = email?.endsWith('@x.supernoba.com') ? '-' : (email || '-');
+    }
+
+    await ddb.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { user_id: userId },
+      UpdateExpression: `SET 
+        linked_accounts = :linkedAccounts,
+        cognito_subs = :cognitoSubs,
+        email = :email,
+        username = if_not_exists(username, :username),
+        full_name = if_not_exists(full_name, :fullName),
+        avatar_url = :avatarUrl,
+        primary_provider = if_not_exists(primary_provider, :provider),
+        updated_at = :now`,
+      ExpressionAttributeValues: {
+        ':linkedAccounts': linkedAccounts,
+        ':cognitoSubs': cognitoSubs,
+        ':email': finalEmail,
+        ':username': displayName || email?.split('@')[0] || 'User',
+        ':fullName': displayName || '',
+        ':avatarUrl': avatarUrl || user.avatar_url || null,
+        ':provider': provider,
+        ':now': now,
+      },
+    }));
+
+    console.log(`[auth] User synced: ${userId}, provider: ${provider}`);
+
+    return ok({
+      synced: true,
+      is_new_user: false,
+      user_id: userId,
+    });
+  }
+
+  // 신규 유저 생성
+  if (!settings.system?.newRegistrationEnabled) {
+    return err(403, 'NEW_REGISTRATION_DISABLED');
+  }
+
+  const welcomeBonus = settings.user?.welcomeBonus || 0;
+  
+  // 이메일 결정
+  const finalEmail = email?.endsWith('@x.supernoba.com') ? '-' : (email || '-');
+
+  // linked_accounts 초기화
+  const linkedAccounts = {
+    [provider]: {
+      id: providerUserId || userId.replace(`${provider}_`, ''),
+      email: email || null,
+      username: provider === 'x' ? (body.username || '') : null,
+      linked_at: now,
+    }
+  };
+
+  await ddb.send(new PutCommand({
+    TableName: USERS_TABLE,
+    Item: {
+      user_id: userId,
+      email: finalEmail,
+      username: displayName || email?.split('@')[0] || 'User',
+      full_name: displayName || '',
+      avatar_url: avatarUrl || null,
+      provider: provider,
+      primary_provider: provider,
+      linked_accounts: linkedAccounts,
+      cognito_subs: cognitoSub ? [cognitoSub] : [],
+      is_admin: false,
+      is_tester: false,
+      balances: {
+        BOLT: {
+          available: welcomeBonus,
+          locked: 0
+        }
+      },
+      version: 1,
+      created_at: now,
+      updated_at: now
+    },
+    ConditionExpression: 'attribute_not_exists(user_id)'
+  }));
+
+  console.log(`[auth] New user synced: ${userId}, provider: ${provider}, bonus: ${welcomeBonus}`);
+
+  return ok({
+    synced: true,
+    is_new_user: true,
+    user_id: userId,
+    welcome_bonus: welcomeBonus,
   });
 }

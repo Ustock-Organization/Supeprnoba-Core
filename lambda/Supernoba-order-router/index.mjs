@@ -4,8 +4,18 @@
 
 import { KinesisClient, PutRecordCommand } from '@aws-sdk/client-kinesis';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, UpdateCommand, GetCommand, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, UpdateCommand, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import crypto from 'crypto';
+
+// === Common Layer Import (Valkey Client) ===
+let getValkeyClient;
+let valkey = null;
+try {
+  ({ getValkeyClient } = await import('/opt/nodejs/index.mjs'));
+  valkey = getValkeyClient({ type: 'operating', preset: 'default' });
+} catch (e) {
+  console.warn('[order-router] Common layer not available (Valkey disabled):', e.message);
+}
 
 // === Auth Layer Import (Strict - No Anonymous Fallback) ===
 let auth;
@@ -33,12 +43,9 @@ const kinesis = new KinesisClient({ region: 'ap-northeast-2' });
 // === Config ===
 const HOLDINGS_TABLE = process.env.HOLDINGS_TABLE || 'supernoba-holdings';
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'supernoba-orders';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 const KINESIS_STREAM = process.env.KINESIS_ORDERS_STREAM || 'supernoba-orders';
-const NOTIFICATION_STREAM = process.env.NOTIFICATION_STREAM || 'supernoba-order-status';
-
 // CORS Headers - Allow specific origins in production
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',');
 const HEADERS = {
@@ -56,31 +63,6 @@ const MIN_PRICE = Number(process.env.MIN_PRICE) || 0.01; // 최소 가격 0.01
 const MAX_BALANCE_PERCENT = Number(process.env.MAX_BALANCE_PERCENT) || 100; // 잔고의 최대 %까지 주문 가능 (기본 100%)
 const IDEMPOTENCY_TABLE = process.env.IDEMPOTENCY_TABLE || 'supernoba-idempotency';
 const IDEMPOTENCY_TTL_SECONDS = 60 * 60; // 1시간 동안 같은 idempotency key 사용 불가
-
-// === 주문 상태 알림 발행 (notifier로 전송) ===
-async function publishOrderStatus(orderId, userId, symbol, side, status, extra = {}) {
-  try {
-    const event = {
-      event: 'ORDER_STATUS',
-      order_id: orderId,
-      user_id: userId,
-      symbol: symbol.toUpperCase(),
-      side,
-      status,
-      timestamp: Date.now(),
-      ...extra
-    };
-    await kinesis.send(new PutRecordCommand({
-      StreamName: NOTIFICATION_STREAM,
-      Data: Buffer.from(JSON.stringify(event)),
-      PartitionKey: userId
-    }));
-    console.log(`[order-router] Published ${status}: ${orderId} for user ${userId}`);
-  } catch (e) {
-    // 알림 실패는 주문 처리에 영향 주지 않음 (best-effort)
-    console.warn(`[order-router] Failed to publish ${status}:`, e.message);
-  }
-}
 
 // === Singletons ===
 const testerCache = new Map(); // userId -> { isTester: boolean, expiry: timestamp }
@@ -134,6 +116,21 @@ async function isActiveSymbol(symbol, userId = null) {
   // 포맷 검증
   if (!isValidSymbolFormat(normalized)) {
     return { valid: false, error: 'INVALID_SYMBOL_FORMAT', message: '잘못된 심볼 형식입니다 (영문 대문자, 숫자 2-20자)' };
+  }
+
+  // blocked:symbols 체크 (Valkey Set) - DynamoDB 캐시보다 먼저 실행하여 즉시 차단
+  // 상장폐지 진행 중인 종목은 2분 symbolCache TTL 관계없이 즉시 거부
+  if (valkey) {
+    try {
+      const isBlocked = await valkey.sismember('blocked:symbols', normalized);
+      if (isBlocked) {
+        console.log(`[SymbolCheck] Blocked symbol rejected: ${normalized}`);
+        return { valid: false, error: 'SYMBOL_BLOCKED', message: `해당 종목은 상장폐지 진행 중이므로 거래할 수 없습니다 (${normalized})` };
+      }
+    } catch (e) {
+      // Valkey 장애 시 fail-open: DynamoDB 캐시 방식으로 진행
+      console.warn(`[SymbolCheck] Valkey blocked:symbols check failed (continuing):`, e.message);
+    }
   }
 
   // 캐시 확인
@@ -202,10 +199,10 @@ async function isAuthorizedTester(userId) {
     return cached.isTester;
   }
 
-  // DynamoDB user-cache에서 조회
+  // DynamoDB users 테이블에서 조회
   try {
     const { Item } = await ddb.send(new GetCommand({
-      TableName: USER_CACHE_TABLE,
+      TableName: USERS_TABLE,
       Key: { user_id: userId }
     }));
 
@@ -227,7 +224,7 @@ async function calculateMarketBuyLock(quantity, maxPrice) {
   }
 
   // 사용자 제공 max_price 기반으로 lock (10% 버퍼)
-  const lockAmount = Math.ceil(maxPrice * quantity * 1.1);
+  const lockAmount = Math.ceil(maxPrice * quantity);
 
   console.log(`[MarketBuyLock] qty=${quantity}, maxPrice=${maxPrice}, lockAmount=${lockAmount}`);
   return { success: true, lockAmount };
@@ -250,49 +247,30 @@ async function withRetry(fn, maxRetries = 3, baseDelay = 50) {
 }
 
 // === Balance Lock (DynamoDB - BUY orders) ===
+// supernoba-users 테이블의 balances.BOLT 사용 (통합)
 async function lockBalanceOnce(userId, amount) {
   try {
-    const { Item: wallet } = await ddb.send(new GetCommand({
-      TableName: WALLETS_TABLE,
-      Key: { user_id: userId, currency: 'BOLT' }
+    const { Item: user } = await ddb.send(new GetCommand({
+      TableName: USERS_TABLE,
+      Key: { user_id: userId },
+      ProjectionExpression: 'balances, version'
     }));
 
-    if (!wallet) {
-      // 지갑이 없으면 생성 (available: 0)
-      try {
-        await ddb.send(new PutCommand({
-          TableName: WALLETS_TABLE,
-          Item: {
-            user_id: userId,
-            currency: 'BOLT',
-            available: 0,
-            locked: 0,
-            version: 1,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          },
-          ConditionExpression: 'attribute_not_exists(user_id)'
-        }));
-      } catch (e) {
-        if (e.name !== 'ConditionalCheckFailedException') {
-          return { success: false, error: 'WALLET_INIT_FAIL', message: '지갑 생성 실패' };
-        }
-      }
-      return { success: false, error: 'INSUFFICIENT_FUNDS', message: '잔고 부족 (가용: 0)' };
-    }
-
-    if (wallet.available < amount) {
-      return { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (가용: ${wallet.available})` };
+    const available = Number(user?.balances?.BOLT?.available || 0);
+    if (!user || available < amount) {
+      return { success: false, error: 'INSUFFICIENT_FUNDS', message: `잔고 부족 (가용: ${available})` };
     }
 
     await ddb.send(new UpdateCommand({
-      TableName: WALLETS_TABLE,
-      Key: { user_id: userId, currency: 'BOLT' },
-      UpdateExpression: 'SET available = available - :amt, locked = locked + :amt, version = version + :one, updated_at = :now',
-      ConditionExpression: 'available >= :amt AND version = :ver',
+      TableName: USERS_TABLE,
+      Key: { user_id: userId },
+      UpdateExpression: 'SET balances.BOLT.available = balances.BOLT.available - :amt, '
+                      + 'balances.BOLT.locked = balances.BOLT.locked + :amt, '
+                      + 'version = version + :one, updated_at = :now',
+      ConditionExpression: 'balances.BOLT.available >= :amt AND version = :ver',
       ExpressionAttributeValues: {
         ':amt': amount,
-        ':ver': wallet.version || 1,
+        ':ver': user.version || 1,
         ':one': 1,
         ':now': new Date().toISOString()
       }
@@ -318,24 +296,26 @@ const lockBalance = withAmountCheck(lockBalanceOnce);
 
 async function unlockBalanceOnce(userId, amount) {
   try {
-    const { Item: wallet } = await ddb.send(new GetCommand({
-      TableName: WALLETS_TABLE,
-      Key: { user_id: userId, currency: 'BOLT' }
+    const { Item: user } = await ddb.send(new GetCommand({
+      TableName: USERS_TABLE,
+      Key: { user_id: userId },
+      ProjectionExpression: 'balances, version'
     }));
 
-    if (!wallet) {
-      return { success: false, error: 'WALLET_NOT_FOUND', message: '지갑을 찾을 수 없습니다' };
+    if (!user) {
+      return { success: false, error: 'WALLET_NOT_FOUND', message: '사용자를 찾을 수 없습니다' };
     }
 
     await ddb.send(new UpdateCommand({
-      TableName: WALLETS_TABLE,
-      Key: { user_id: userId, currency: 'BOLT' },
-      UpdateExpression: 'SET available = available + :amt, locked = if_not_exists(locked, :zero) - :amt, version = version + :one, updated_at = :now',
+      TableName: USERS_TABLE,
+      Key: { user_id: userId },
+      UpdateExpression: 'SET balances.BOLT.available = balances.BOLT.available + :amt, '
+                      + 'balances.BOLT.locked = balances.BOLT.locked - :amt, '
+                      + 'version = version + :one, updated_at = :now',
       ConditionExpression: 'version = :ver',
       ExpressionAttributeValues: {
         ':amt': amount,
-        ':zero': 0,
-        ':ver': wallet.version || 1,
+        ':ver': user.version || 1,
         ':one': 1,
         ':now': new Date().toISOString()
       }
@@ -471,8 +451,25 @@ export const handler = async (event) => {
 
     // === ADD Order ===
     if (action === 'ADD') {
-      // [1] 테스터 계정 검증 (관리자 주문은 바이패스)
+      // [0] 정지 사용자 체크 (관리자 주문 바이패스, CANCEL은 허용)
       if (!isAdminOrder) {
+        // Valkey에서 정지 상태 확인 (fail-open)
+        if (valkey) {
+          try {
+            const isSuspended = await valkey.get(`user:${user_id}:suspended`);
+            if (isSuspended === 'true') {
+              console.log(`[order-router] Blocked suspended user: ${user_id}`);
+              return { statusCode: 403, headers: HEADERS, body: JSON.stringify({
+                error: 'USER_SUSPENDED',
+                message: '정지된 계정입니다. 주문을 넣을 수 없습니다.'
+              })};
+            }
+          } catch (e) {
+            console.warn(`[order-router] Suspend check failed (fail-open): ${e.message}`);
+          }
+        }
+
+        // [1] 테스터 계정 검증
         const isTester = await isAuthorizedTester(user_id);
         if (!isTester) {
           return { statusCode: 403, headers: HEADERS, body: JSON.stringify({
@@ -509,8 +506,15 @@ export const handler = async (event) => {
         })};
       }
 
-      // [3] 가격 결정 (MARKET: price=0, 엔진에서 시장가로 처리)
-      const finalPrice = type === 'MARKET' ? 0 : Number(price);
+      // [3] 가격 결정 (MARKET BUY: Order Collar - max_price를 LIMIT+IOC로 전송)
+      // MARKET SELL: price=0 유지 (주식 잠금, 통화가 아님)
+      let finalPrice;
+      if (type === 'MARKET') {
+        const isBuySide = side.toUpperCase() === 'BUY';
+        finalPrice = (isBuySide && max_price) ? Number(max_price) : 0;
+      } else {
+        finalPrice = Number(price);
+      }
 
       if (type === 'LIMIT' && (isNaN(finalPrice) || finalPrice <= 0)) {
         return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'INVALID_PRICE', message: '가격은 0보다 커야 합니다' }) };
@@ -617,12 +621,8 @@ export const handler = async (event) => {
           PartitionKey: symbol
         }));
 
-        // [7] ACCEPTED 알림 발행 (notifier → WebSocket)
-        await publishOrderStatus(orderId, user_id, symbol, isBuy ? 'BUY' : 'SELL', 'ACCEPTED', {
-          price: finalPrice,
-          quantity: finalQty,
-          order_type: type
-        });
+        // [7] ACCEPTED 알림은 stock-processor가 Engine 확인 후 WebSocket으로 발행
+        // (GAP 4 fix: premature ACCEPTED 알림 제거 — Engine 처리 전 알림은 REJECTED 시 UI 불일치 유발)
 
         return { statusCode: 200, headers: HEADERS, body: JSON.stringify({
           order_id: orderId,
@@ -647,7 +647,18 @@ export const handler = async (event) => {
           } else {
             await unlockHoldings(user_id, symbol, lockAmount);
           }
-          console.log(`[ADD] ✅ Rollback unlock success: user=${user_id}, amount=${lockAmount}`);
+          console.log(`[ADD] Rollback unlock success: user=${user_id}, amount=${lockAmount}`);
+
+          // GAP 2 fix: Clean up orphan PENDING order to prevent permanent ghost
+          try {
+            await ddb.send(new DeleteCommand({
+              TableName: ORDERS_TABLE,
+              Key: { user_id, order_id: orderId }
+            }));
+            console.log(`[ADD] Cleaned up PENDING order: ${orderId}`);
+          } catch (delErr) {
+            console.error('[ADD] PENDING order cleanup failed:', delErr.message);
+          }
         } catch (unlockErr) {
           // Critical: 자금 잠금 해제 실패 - 수동 개입 필요
           console.error('[ADD] ❌ CRITICAL: Unlock rollback failed:', {
@@ -693,11 +704,8 @@ export const handler = async (event) => {
           PartitionKey: symbol
         }));
 
-        // CANCELLED 알림 발행 (C++ 처리 완료 전 즉시 알림)
-        await publishOrderStatus(order_id, user_id, order.symbol, order.side, 'CANCELLED', {
-          price: order.price,
-          quantity: order.quantity
-        });
+        // GAP 3 fix: CANCELLED 알림은 stock-processor가 Engine 확인 후 WebSocket으로 발행
+        // (premature CANCELLED 알림 제거 — CANCEL_REJECTED 시 UI 불일치 유발)
 
         return { statusCode: 200, headers: HEADERS, body: JSON.stringify({ message: 'Cancel Sent' }) };
       } catch (e) {

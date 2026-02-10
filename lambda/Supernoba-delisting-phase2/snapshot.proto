@@ -17,6 +17,9 @@ service SnapshotService {
 
     // 종목 단위 일괄 주문 취소
     rpc CancelAllOrders(CancelAllRequest) returns (CancelAllResponse);
+
+    // 개별 주문 취소 (사용자 삭제 Phase 2에서 사용)
+    rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
 }
 
 message SnapshotRequest {
@@ -67,4 +70,14 @@ message HealthResponse {
     int32 symbol_count = 3;
     int64 orders_processed = 4;
     int64 trades_executed = 5;
+}
+
+message CancelOrderRequest {
+    string symbol = 1;
+    string order_id = 2;
+}
+
+message CancelOrderResponse {
+    bool success = 1;
+    string error = 2;
 }

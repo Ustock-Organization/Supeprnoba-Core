@@ -16,7 +16,7 @@
  * - GET /auth - 관리자 권한 확인 (공개)
  */
 
-import Redis from 'ioredis';
+import { getValkeyClient } from '/opt/nodejs/index.mjs';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { ScanCommand, QueryCommand, PutCommand, DeleteCommand, GetCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
@@ -43,10 +43,8 @@ const loadAuth = async () => {
 const { verifyAdmin, authErrorResponse } = await loadAuth();
 
 // 환경변수
-const VALKEY_HOST = process.env.VALKEY_HOST;
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+// WALLETS_TABLE 제거됨 — supernoba-users.balances.BOLT로 통합
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
@@ -70,9 +68,8 @@ const DEFAULT_TICKER_TAPE = {
   scrollSpeed: 40
 };
 
-// 클라이언트
-const valkey = new Redis({ host: VALKEY_HOST, port: 6379, tls: {}, connectTimeout: 5000, maxRetriesPerRequest: 3 });
-valkey.on('error', (e) => console.error('Redis:', e.message));
+// 클라이언트 (Common Layer 4-Cache)
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
 // 공통 헤더
@@ -92,7 +89,6 @@ const checkAdmin = async (event) => {
   return { authorized: true, userId: result.userId, method: result.method };
 };
 
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => ({ statusCode: 200, headers: H, body: JSON.stringify(d) });
 const err = (c, m) => ({ statusCode: c, headers: H, body: JSON.stringify({ error: m }) });
 
@@ -106,8 +102,9 @@ export const handler = async (event) => {
 
     // ==========================================
     // GET /auth - 관리자 권한 확인 (공개)
+    // 경로: /auth?userId=xxx 또는 쿼리: ?type=auth&userId=xxx
     // ==========================================
-    if (path.includes('/auth') && m === 'GET') {
+    if ((path.includes('/auth') || q.type === 'auth') && m === 'GET') {
       const { userId, twitterUsername, googleEmail } = q;
       let admin = false;
 
@@ -138,7 +135,7 @@ export const handler = async (event) => {
       const alerts = [];
 
       // 엔진 오류
-      const engineErrors = await valkey.lrange('engine:errors', 0, 99);
+      const engineErrors = await operatingCache.lrange('engine:errors', 0, 99);
       if (engineErrors.length > 0) {
         alerts.push({
           type: 'ENGINE_ERRORS',
@@ -157,7 +154,7 @@ export const handler = async (event) => {
       for (const item of (Items || [])) {
         const hasPrevClose = item.prevClose !== null && item.prevClose !== undefined && item.prevClose > 0;
         const hasListingPrice = item.listingPrice !== null && item.listingPrice !== undefined && item.listingPrice > 0;
-        const redisListingPrice = await valkey.get(`symbol:${item.symbol}:listingPrice`);
+        const redisListingPrice = await operatingCache.get(`symbol:${item.symbol}:listingPrice`);
 
         if (!hasPrevClose && !hasListingPrice && !redisListingPrice) {
           missingPriceSymbols.push({
@@ -182,7 +179,7 @@ export const handler = async (event) => {
       }
 
       // 마켓메이커 상태
-      const runningSymbols = await valkey.smembers('mm:running:symbols');
+      const runningSymbols = await operatingCache.smembers('mm:running:symbols');
       if (runningSymbols.length > 0) {
         alerts.push({
           type: 'MARKET_MAKER_RUNNING',
@@ -263,7 +260,7 @@ export const handler = async (event) => {
 
       let activeSymbols = [];
       try {
-        const cached = await valkey.get(TICKER_CACHE_KEY);
+        const cached = await operatingCache.get(TICKER_CACHE_KEY);
         if (cached) {
           activeSymbols = JSON.parse(cached);
         } else {
@@ -272,7 +269,7 @@ export const handler = async (event) => {
             .filter(s => s.status === 'ACTIVE')
             .sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
             .map(s => ({ symbol: s.symbol, name: s.name, volume24h: s.volume24h || 0, logoUrl: s.logoUrl }));
-          await valkey.setex(TICKER_CACHE_KEY, TICKER_CACHE_TTL, JSON.stringify(activeSymbols));
+          await operatingCache.setex(TICKER_CACHE_KEY, TICKER_CACHE_TTL, JSON.stringify(activeSymbols));
         }
       } catch (cacheErr) {
         console.error('[tickerTape GET] Cache/DB error:', cacheErr.message);
@@ -362,7 +359,7 @@ export const handler = async (event) => {
           }
         }));
 
-        await valkey.del(TICKER_CACHE_KEY);
+        await operatingCache.del(TICKER_CACHE_KEY);
 
         return ok({ success: true, tickerTape: newTickerTape });
       } catch (dbErr) {
@@ -373,7 +370,8 @@ export const handler = async (event) => {
 
     // GET /settings - 전체 시스템 설정 (관리자)
     if (path.includes('/settings') && m === 'GET' && !path.includes('/site') && !path.includes('/tickerTape')) {
-      if (!isAdmin(event)) return err(403, 'Unauthorized');
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
 
       try {
         const result = await dynamodb.send(new GetCommand({
@@ -406,7 +404,7 @@ export const handler = async (event) => {
         }));
 
         try {
-          await valkey.set('system:settings', JSON.stringify(settings));
+          await operatingCache.set('system:settings', JSON.stringify(settings));
         } catch (e) {
           console.log('Valkey save error (ignored):', e.message);
         }
@@ -436,7 +434,8 @@ export const handler = async (event) => {
     // ==========================================
     // Users 엔드포인트 (관리자 전용)
     // ==========================================
-    if (!isAdmin(event)) return err(403, 'Unauthorized');
+    const usersAdminCheck = await checkAdmin(event);
+    if (!usersAdminCheck.authorized) return usersAdminCheck.response;
 
     // GET /users/{userId} - 개별 사용자 상세
     if (m === 'GET') {
@@ -455,25 +454,13 @@ export const handler = async (event) => {
           console.error('[GET USER] Profile fetch error:', profileErr.message);
         }
 
-        // 지갑 정보
-        let wallets = [];
-        try {
-          const { Items } = await dynamodb.send(new QueryCommand({
-            TableName: WALLETS_TABLE,
-            KeyConditionExpression: 'user_id = :uid',
-            ExpressionAttributeValues: { ':uid': userId }
-          }));
-          wallets = Items || [];
-        } catch (walletErr) {
-          console.error('[GET USER] Wallet fetch error:', walletErr.message);
-        }
-
-        const effectiveWallets = wallets.length > 0 ? wallets : [{
+        // balances.BOLT에서 직접 읽기 (통합)
+        const boltBalance = profile?.balances?.BOLT || { available: 0, locked: 0 };
+        const effectiveWallets = [{
           user_id: userId,
           currency: 'BOLT',
-          available: 0,
-          locked: 0,
-          is_virtual: true
+          available: boltBalance.available,
+          locked: boltBalance.locked
         }];
 
         // 주문 이력
@@ -553,26 +540,16 @@ export const handler = async (event) => {
         const offset = (parseInt(page) - 1) * parseInt(limit);
         const paginatedUsers = users.slice(offset, offset + parseInt(limit));
 
-        const enrichedUsers = await Promise.all(paginatedUsers.map(async (user) => {
-          let wallets = [];
-          try {
-            const { Items } = await dynamodb.send(new QueryCommand({
-              TableName: WALLETS_TABLE,
-              KeyConditionExpression: 'user_id = :uid',
-              ExpressionAttributeValues: { ':uid': user.user_id }
-            }));
-            wallets = Items || [];
-          } catch (e) { }
-
-          const boltWallet = wallets.find(w => w.currency === 'BOLT');
+        const enrichedUsers = paginatedUsers.map((user) => {
+          const boltWallet = user.balances?.BOLT;
           return {
             ...user,
             id: user.user_id,
             bolt_balance: boltWallet?.available ?? 0,
-            bolt_locked: boltWallet?.locked || 0,
-            wallet_exists: boltWallet !== undefined
+            bolt_locked: boltWallet?.locked ?? 0,
+            wallet_exists: !!boltWallet
           };
-        }));
+        });
 
         return ok({
           users: enrichedUsers,
@@ -622,7 +599,7 @@ export const handler = async (event) => {
           }));
 
           try {
-            await valkey.set('system:settings', JSON.stringify(settings));
+            await operatingCache.set('system:settings', JSON.stringify(settings));
           } catch (e) {
             console.log('Valkey save error (ignored):', e.message);
           }
@@ -705,7 +682,7 @@ export const handler = async (event) => {
         }
 
         try {
-          await valkey.set(`user:${userId}:suspended`, 'true');
+          await operatingCache.set(`user:${userId}:suspended`, 'true');
         } catch (e) {
           console.log('Valkey error (ignored):', e.message);
         }
@@ -744,7 +721,7 @@ export const handler = async (event) => {
         }
 
         try {
-          await valkey.del(`user:${userId}:suspended`);
+          await operatingCache.del(`user:${userId}:suspended`);
         } catch (e) {
           console.log('Valkey error (ignored):', e.message);
         }
@@ -757,27 +734,26 @@ export const handler = async (event) => {
         const { currency = 'BOLT', newBalance, adjustReason } = b;
         if (typeof newBalance !== 'number' || newBalance < 0) return err(400, 'newBalance must be a non-negative number');
 
-        let currentBalance = 0, currentLocked = 0;
+        let currentBalance = 0;
         try {
-          const { Item: wallet } = await dynamodb.send(new GetCommand({
-            TableName: WALLETS_TABLE,
-            Key: { user_id: userId, currency: currency }
+          const { Item: user } = await dynamodb.send(new GetCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            ProjectionExpression: 'balances'
           }));
-          currentBalance = wallet?.available || 0;
-          currentLocked = wallet?.locked || 0;
+          currentBalance = user?.balances?.BOLT?.available || 0;
         } catch (e) {
-          console.log('Wallet fetch error (ignored):', e.message);
+          console.log('Balance fetch error (ignored):', e.message);
         }
 
         try {
-          await dynamodb.send(new PutCommand({
-            TableName: WALLETS_TABLE,
-            Item: {
-              user_id: userId,
-              currency,
-              available: newBalance,
-              locked: currentLocked,
-              updated_at: new Date().toISOString()
+          await dynamodb.send(new UpdateCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now',
+            ExpressionAttributeValues: {
+              ':bal': newBalance,
+              ':now': new Date().toISOString()
             }
           }));
         } catch (updateErr) {

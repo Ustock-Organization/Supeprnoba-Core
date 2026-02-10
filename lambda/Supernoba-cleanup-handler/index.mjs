@@ -1,27 +1,9 @@
-import Redis from 'ioredis';
+import { getValkeyClient } from '/opt/nodejs/index.mjs';
 
-const VALKEY_TLS = process.env.VALKEY_TLS === 'true';
-// 2분 기본값 (하트비트 30초 * 4 = 4번 연속 실패 시 stale)
 const STALE_THRESHOLD_MS = parseInt(process.env.STALE_THRESHOLD_MS || '120000');
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100');
 
-// Valkey client configuration
-const valkey = new Redis({
-  host: process.env.VALKEY_HOST || 'supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com',
-  port: parseInt(process.env.VALKEY_PORT || '6379'),
-  tls: VALKEY_TLS ? {} : undefined,
-  connectTimeout: 5000,
-  maxRetriesPerRequest: 2,
-  lazyConnect: true,
-  retryStrategy: (times) => {
-    if (times > 3) return null;
-    return Math.min(times * 200, 1000);
-  },
-});
-
-valkey.on('error', (err) => {
-  console.error('[cleanup] Redis connection error:', err.message);
-});
+const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 
 /**
  * Scan for all ws:* keys in Valkey
@@ -250,11 +232,6 @@ export const handler = async (event) => {
   const startTime = Date.now();
 
   try {
-    // Ensure connection is established
-    if (valkey.status !== 'ready') {
-      await valkey.connect();
-    }
-
     const stats = await cleanupStaleConnections();
 
     const duration = Date.now() - startTime;

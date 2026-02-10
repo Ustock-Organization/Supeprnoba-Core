@@ -16,7 +16,10 @@
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
@@ -28,9 +31,13 @@ import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+const ANNOUNCEMENTS_TABLE = process.env.ANNOUNCEMENTS_TABLE || 'supernoba-announcements';
+const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'supernoba-announcements-media';
+const s3 = new S3Client({ region: 'ap-northeast-2' });
 
 // Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'admin' });
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
+const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
 // Layer의 CORS.FULL 사용
@@ -100,7 +107,7 @@ export const handler = async (event) => {
       const alerts = [];
 
       // 엔진 오류
-      const engineErrors = await valkey.lrange('engine:errors', 0, 99);
+      const engineErrors = await operatingCache.lrange('engine:errors', 0, 99);
       if (engineErrors.length > 0) {
         alerts.push({
           type: 'ENGINE_ERRORS',
@@ -119,7 +126,7 @@ export const handler = async (event) => {
       for (const item of (Items || [])) {
         const hasPrevClose = item.prevClose !== null && item.prevClose !== undefined && item.prevClose > 0;
         const hasListingPrice = item.listingPrice !== null && item.listingPrice !== undefined && item.listingPrice > 0;
-        const redisListingPrice = await valkey.get(`symbol:${item.symbol}:listingPrice`);
+        const redisListingPrice = await operatingCache.get(`symbol:${item.symbol}:listingPrice`);
 
         if (!hasPrevClose && !hasListingPrice && !redisListingPrice) {
           missingPriceSymbols.push({
@@ -144,7 +151,7 @@ export const handler = async (event) => {
       }
 
       // 마켓메이커 상태
-      const runningSymbols = await valkey.smembers('mm:running:symbols');
+      const runningSymbols = await operatingCache.smembers('mm:running:symbols');
       if (runningSymbols.length > 0) {
         alerts.push({
           type: 'MARKET_MAKER_RUNNING',
@@ -186,6 +193,20 @@ export const handler = async (event) => {
 
         const { defaultSymbol } = JSON.parse(event.body || '{}');
         if (!defaultSymbol) return err(400, 'defaultSymbol required');
+
+        // 'RANDOM'은 특수값 — 종목 검증 스킵
+        if (defaultSymbol === 'RANDOM') {
+          await dynamodb.send(new PutCommand({
+            TableName: SETTINGS_TABLE,
+            Item: {
+              setting_id: 'SITE_CONFIG',
+              defaultSymbol: 'RANDOM',
+              updated_at: new Date().toISOString()
+            }
+          }));
+          console.log('[siteConfig] Default symbol set to: RANDOM');
+          return ok({ success: true, defaultSymbol: 'RANDOM' });
+        }
 
         // 종목 존재 및 ACTIVE 상태 검증
         const { Item: symbolItem } = await dynamodb.send(new GetCommand({
@@ -258,7 +279,7 @@ export const handler = async (event) => {
 
         let activeSymbols = [];
         try {
-          const cached = await valkey.get(TICKER_CACHE_KEY);
+          const cached = await operatingCache.get(TICKER_CACHE_KEY);
           if (cached) {
             activeSymbols = JSON.parse(cached);
           } else {
@@ -278,7 +299,7 @@ export const handler = async (event) => {
             // DynamoDB에서 종목 메타데이터(이름, 로고) 가져오기
             const { Items: allSymbols } = await dynamodb.send(new ScanCommand({ TableName: SYMBOLS_TABLE }));
             const symbolMap = {};
-            (allSymbols || []).filter(s => s.status === 'ACTIVE').forEach(s => {
+            (allSymbols || []).filter(s => s.status === 'ACTIVE' && s.is_test !== true).forEach(s => {
               symbolMap[s.symbol] = { symbol: s.symbol, name: s.name, logoUrl: s.logoUrl };
             });
 
@@ -293,7 +314,7 @@ export const handler = async (event) => {
               if (!rankedSet.has(s.symbol)) activeSymbols.push(s);
             });
 
-            await valkey.setex(TICKER_CACHE_KEY, TICKER_CACHE_TTL, JSON.stringify(activeSymbols));
+            await operatingCache.setex(TICKER_CACHE_KEY, TICKER_CACHE_TTL, JSON.stringify(activeSymbols));
           }
         } catch (cacheErr) {
           console.error(`[${settingsKey} GET] Cache/DB error:`, cacheErr.message);
@@ -306,9 +327,43 @@ export const handler = async (event) => {
           displaySymbols = activeSymbols.slice(0, tickerTapeSettings.autoCount || 10).map(s => s.symbol);
         }
 
+        // Valkey ticker:* + prev:* 에서 가격 + prevClose 읽기
+        let initialPrices = [];
+        if (displaySymbols.length > 0) {
+          try {
+            const tickerKeys = displaySymbols.map(sym => `ticker:${sym}`);
+            const prevKeys = displaySymbols.map(sym => `prev:${sym}`);
+            const [tickerDataRaw, prevDataRaw] = await Promise.all([
+              depthCache.mget(...tickerKeys),
+              depthCache.mget(...prevKeys)
+            ]);
+
+            initialPrices = displaySymbols.map((sym, idx) => {
+              let price = 0, prevClose = 0, change = 0, changePct = 0;
+              try {
+                if (tickerDataRaw[idx]) {
+                  const td = JSON.parse(tickerDataRaw[idx]);
+                  price = td.p || 0;
+                }
+                if (prevDataRaw[idx]) {
+                  prevClose = JSON.parse(prevDataRaw[idx]).close || 0;
+                }
+                if (prevClose > 0 && price > 0) {
+                  change = price - prevClose;
+                  changePct = (change / prevClose) * 100;
+                }
+              } catch (e) {}
+              return { symbol: sym, price, prevClose, change, changePct };
+            });
+          } catch (e) {
+            console.error(`[${settingsKey} GET] Ticker price read error:`, e.message);
+          }
+        }
+
         return ok({
           settings: tickerTapeSettings,
           displaySymbols,
+          initialPrices,
           allActiveSymbols: activeSymbols
         });
       }
@@ -400,7 +455,7 @@ export const handler = async (event) => {
             }
           }));
 
-          await valkey.del(TICKER_CACHE_KEY);
+          await operatingCache.del(TICKER_CACHE_KEY);
 
           return ok({ success: true, [settingsKey]: newTickerTape });
         } catch (dbErr) {
@@ -471,6 +526,138 @@ export const handler = async (event) => {
           console.error('[gameSettings PUT] Error:', e.message);
           return err(500, 'Failed to save game settings: ' + e.message);
         }
+      }
+    }
+
+    // ==========================================
+    // announcements - 공지사항 CRUD
+    // ==========================================
+    if (q.type === 'announcements') {
+      // POST with action=upload-url → S3 presigned PUT URL (admin only)
+      if (m === 'POST' && q.action === 'upload-url') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { filename, contentType, announcementId } = JSON.parse(event.body || '{}');
+        if (!filename || !contentType) return err(400, 'filename and contentType required');
+
+        const key = `announcements/${announcementId || 'temp'}/${Date.now()}_${filename}`;
+        const command = new PutObjectCommand({
+          Bucket: MEDIA_BUCKET,
+          Key: key,
+          ContentType: contentType,
+        });
+        const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+        const mediaUrl = `s3://${MEDIA_BUCKET}/${key}`;
+
+        return ok({ uploadUrl, mediaUrl, key });
+      }
+
+      // GET → list announcements (admin sees all statuses)
+      if (m === 'GET') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        let items;
+        if (q.category) {
+          // Use GSI to filter by category
+          const result = await dynamodb.send(new QueryCommand({
+            TableName: ANNOUNCEMENTS_TABLE,
+            IndexName: 'category-status-index',
+            KeyConditionExpression: 'category = :cat',
+            ExpressionAttributeValues: { ':cat': q.category },
+          }));
+          items = result.Items || [];
+        } else {
+          const result = await dynamodb.send(new ScanCommand({ TableName: ANNOUNCEMENTS_TABLE }));
+          items = result.Items || [];
+        }
+
+        // Sort by priority (ascending), then by created_at (descending)
+        items.sort((a, b) => (a.priority || 999) - (b.priority || 999) || (b.created_at || '').localeCompare(a.created_at || ''));
+
+        return ok({ announcements: items });
+      }
+
+      // POST → create announcement
+      if (m === 'POST') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const body = JSON.parse(event.body || '{}');
+        const { category, title, content, display_mode, media_url, media_type, status, priority } = body;
+
+        if (!category || !title) return err(400, 'category and title required');
+        if (!['greeting', 'detail'].includes(category)) return err(400, 'category must be greeting or detail');
+        if (category === 'detail' && display_mode === 'content') return err(400, 'detail category only supports board mode');
+
+        const now = new Date().toISOString();
+        const announcement_id = `ann_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+
+        const item = {
+          announcement_id,
+          category,
+          title,
+          content: content || '',
+          display_mode: display_mode || 'board',
+          media_url: media_url || '',
+          media_type: media_type || '',
+          status: status || 'DRAFT',
+          priority: priority !== undefined ? priority : 100,
+          created_by: adminCheck.userId || 'admin',
+          created_at: now,
+          updated_at: now,
+        };
+
+        await dynamodb.send(new PutCommand({ TableName: ANNOUNCEMENTS_TABLE, Item: item }));
+        console.log(`[announcements] Created: ${announcement_id} (${category}/${title})`);
+
+        return ok({ success: true, announcement: item });
+      }
+
+      // PUT → update announcement
+      if (m === 'PUT') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const id = q.id;
+        if (!id) return err(400, 'id query parameter required');
+
+        const { Item: existing } = await dynamodb.send(new GetCommand({
+          TableName: ANNOUNCEMENTS_TABLE,
+          Key: { announcement_id: id },
+        }));
+        if (!existing) return err(404, 'Announcement not found');
+
+        const body = JSON.parse(event.body || '{}');
+        const updatedItem = {
+          ...existing,
+          ...body,
+          announcement_id: id, // prevent overwrite
+          updated_at: new Date().toISOString(),
+        };
+
+        await dynamodb.send(new PutCommand({ TableName: ANNOUNCEMENTS_TABLE, Item: updatedItem }));
+        console.log(`[announcements] Updated: ${id}`);
+
+        return ok({ success: true, announcement: updatedItem });
+      }
+
+      // DELETE → delete announcement
+      if (m === 'DELETE') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const id = q.id;
+        if (!id) return err(400, 'id query parameter required');
+
+        await dynamodb.send(new DeleteCommand({
+          TableName: ANNOUNCEMENTS_TABLE,
+          Key: { announcement_id: id },
+        }));
+        console.log(`[announcements] Deleted: ${id}`);
+
+        return ok({ success: true, deleted: id });
       }
     }
 

@@ -12,7 +12,7 @@ try {
 }
 
 // Layer를 통한 Valkey 클라이언트 (default 프리셋: 적절한 재시도)
-const valkey = getValkeyClient({ type: 'depth', preset: 'default' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'default' });
 
 // API Gateway Management API Client (이벤트별로 재생성)
 function getApiClient(event) {

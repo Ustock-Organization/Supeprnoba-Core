@@ -41,6 +41,9 @@ function deploy(funcName, funcPath, hasNodeModules) {
 try {
   deploy('Supernoba-connect-handler', 'Supernoba-connect-handler', true);
   deploy('Supernoba-subscribe-handler', 'Supernoba-subscribe-handler', false);
+  deploy('Supernoba-disconnect-handler', 'Supernoba-disconnect-handler', false);
+  deploy('Supernoba-admin-ws-handler', 'Supernoba-admin-ws-handler', true);
+  deploy('Supernoba-cleanup-handler', 'Supernoba-cleanup-handler', true);
   console.log('\n🎉 All deployments complete!');
 } catch (err) {
   console.error('Deployment failed:', err.message);

@@ -2,7 +2,7 @@
 // Valkey에서 실시간 캔들 + RDS에서 히스토리 캔들 조회
 
 import pg from 'pg';
-import Redis from 'ioredis';
+import { getValkeyClient as getLayerValkeyClient } from '/opt/nodejs/index.mjs';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
 const { Client } = pg;
@@ -25,16 +25,10 @@ const RDS_PORT = parseInt(process.env.RDS_PORT || '5432');
 const DB_NAME = process.env.DB_NAME || 'postgres';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 const AWS_REGION = process.env.AWS_REGION || 'ap-northeast-2';
-const VALKEY_HOST = process.env.VALKEY_HOST || 'master.supernoba-depth-cache.5vrxzz.apn2.cache.amazonaws.com';
-const VALKEY_PORT = parseInt(process.env.VALKEY_PORT || '6379');
-
-// Valkey 클라이언트 (Lambda 컨테이너 재사용을 위해 전역)
-let valkeyClient = null;
-
 // 타임프레임별 초 수
 const INTERVAL_SECONDS = {
   '1m': 60, '3m': 180, '5m': 300, '10m': 600,
-  '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, 
+  '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400,
   '1d': 86400, '1w': 604800
 };
 
@@ -55,18 +49,10 @@ function elapsed(start) {
   return `${(Date.now() - start)}ms`;
 }
 
-// Valkey 연결 가져오기
+// Valkey 연결 (Common Layer 4-Cache)
+const candleCache = getLayerValkeyClient({ type: 'candle', preset: 'default' });
 function getValkeyClient() {
-  if (!valkeyClient) {
-    valkeyClient = new Redis({
-      host: VALKEY_HOST,
-      port: VALKEY_PORT,
-      tls: {},
-      connectTimeout: 5000,
-      maxRetriesPerRequest: 1
-    });
-  }
-  return valkeyClient;
+  return candleCache;
 }
 
 // Valkey에서 현재 캔들 + closed 리스트 조회

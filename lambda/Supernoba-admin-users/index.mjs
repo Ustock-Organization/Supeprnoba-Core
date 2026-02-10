@@ -5,6 +5,18 @@ import { ScanCommand, QueryCommand, PutCommand, DeleteCommand, GetCommand, Updat
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+
+// Cognito 사용자 비활성화/활성화
+import { CognitoIdentityProviderClient, AdminDisableUserCommand, AdminEnableUserCommand } from '@aws-sdk/client-cognito-identity-provider';
+// 미체결 주문 취소 (Kinesis)
+import { KinesisClient, PutRecordCommand } from '@aws-sdk/client-kinesis';
+// WebSocket 강제 종료
+import { ApiGatewayManagementApiClient, DeleteConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+// Step Functions (사용자 삭제)
+import { SFNClient, StartExecutionCommand, StopExecutionCommand, DescribeExecutionCommand } from '@aws-sdk/client-sfn';
+
 // 설정 테이블 (DynamoDB)
 const SETTINGS_TABLE = 'supernoba-settings';
 const SETTINGS_KEY = 'SYSTEM_SETTINGS';
@@ -24,24 +36,32 @@ const DEFAULT_SETTINGS = {
 // 설정 캐시
 let cachedSettings = null;
 
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
+const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
 
 // Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'admin' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+const cognito = new CognitoIdentityProviderClient({ region: 'ap-northeast-2' });
+const kinesis = new KinesisClient({ region: 'ap-northeast-2' });
+const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || 'ap-northeast-2_dhsiCqgku';
+const KINESIS_ORDERS_STREAM = process.env.KINESIS_ORDERS_STREAM || 'supernoba-orders';
+const WS_ENDPOINT = process.env.WEBSOCKET_ENDPOINT || '';
+const sfn = new SFNClient({ region: 'ap-northeast-2' });
+const DELETE_USER_STATE_MACHINE_ARN = process.env.DELETE_USER_STATE_MACHINE_ARN || 'arn:aws:states:ap-northeast-2:264520158196:stateMachine:supernoba-user-deletion';
+const DELETE_JOBS_TABLE = process.env.DELETE_JOBS_TABLE || 'supernoba-delete-user-jobs';
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => response.ok(d, H);
 const err = (c, m) => response.error(c, m, H);
 
 export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
-  if (!isAdmin(event)) return err(403, 'Unauthorized');
+  
+  // Cognito 인증 확인
+  const authResult = await verifyAdmin(event);
+  if (!authResult.success) return authErrorResponse(authResult, H);
 
   try {
     const m = event.httpMethod;
@@ -66,27 +86,13 @@ export const handler = async (event) => {
           console.error('[GET USER] Profile fetch error:', profileErr.message);
         }
 
-        // DynamoDB에서 지갑 정보 조회
-        let wallets = [];
-        try {
-          const { Items } = await dynamodb.send(new QueryCommand({
-            TableName: WALLETS_TABLE,
-            KeyConditionExpression: 'user_id = :uid',
-            ExpressionAttributeValues: { ':uid': userId }
-          }));
-          wallets = Items || [];
-        } catch (walletErr) {
-          console.error('[GET USER] Wallet fetch error:', walletErr.message);
-        }
-
-        // 지갑이 없는 경우 기본 BOLT 지갑 정보 추가 (신규 가입자는 0원)
-        const boltWallet = wallets.find(w => w.currency === 'BOLT');
-        const effectiveWallets = wallets.length > 0 ? wallets : [{
+        // balances.BOLT에서 직접 읽기 (통합)
+        const boltBalance = profile?.balances?.BOLT || { available: 0, locked: 0 };
+        const effectiveWallets = [{
           user_id: userId,
           currency: 'BOLT',
-          available: 0,
-          locked: 0,
-          is_virtual: true // 실제 DB에 존재하지 않음을 표시
+          available: boltBalance.available,
+          locked: boltBalance.locked
         }];
 
         // DynamoDB에서 주문 이력
@@ -174,30 +180,17 @@ export const handler = async (event) => {
         const offset = (parseInt(page) - 1) * parseInt(limit);
         const paginatedUsers = users.slice(offset, offset + parseInt(limit));
 
-        // 각 사용자의 잔고 정보 추가
-        const enrichedUsers = await Promise.all(paginatedUsers.map(async (user) => {
-          let wallets = [];
-          try {
-            const { Items } = await dynamodb.send(new QueryCommand({
-              TableName: WALLETS_TABLE,
-              KeyConditionExpression: 'user_id = :uid',
-              ExpressionAttributeValues: { ':uid': user.user_id }
-            }));
-            wallets = Items || [];
-          } catch (e) {
-            // 지갑 조회 실패 시 무시
-          }
-
-          const boltWallet = wallets.find(w => w.currency === 'BOLT');
-          const hasWallet = boltWallet !== undefined;
+        // 각 사용자의 잔고 정보 추가 (balances.BOLT에서 직접 읽기)
+        const enrichedUsers = paginatedUsers.map((user) => {
+          const boltWallet = user.balances?.BOLT;
           return {
             ...user,
             id: user.user_id, // 호환성 유지
-            bolt_balance: hasWallet ? (boltWallet.available ?? 0) : 0,
-            bolt_locked: boltWallet?.locked || 0,
-            wallet_exists: hasWallet
+            bolt_balance: boltWallet?.available ?? 0,
+            bolt_locked: boltWallet?.locked ?? 0,
+            wallet_exists: !!boltWallet
           };
-        }));
+        });
 
         return ok({
           users: enrichedUsers,
@@ -342,6 +335,73 @@ export const handler = async (event) => {
         });
       }
 
+      // deleteUserStatus / abortDeleteUser는 userId 불필요 (jobId만 필요)
+      if (action === 'deleteUserStatus') {
+        const { jobId } = b;
+        if (!jobId) return err(400, 'jobId is required');
+        try {
+          const { Item: job } = await dynamodb.send(new GetCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Key: { job_id: jobId }
+          }));
+          if (!job) return err(404, 'Job not found');
+          return ok(job);
+        } catch (e) {
+          return err(500, 'Failed to fetch job status: ' + e.message);
+        }
+      }
+
+      if (action === 'abortDeleteUser') {
+        const { jobId } = b;
+        if (!jobId) return err(400, 'jobId is required');
+        try {
+          const { Item: job } = await dynamodb.send(new GetCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Key: { job_id: jobId }
+          }));
+          if (!job) return err(404, 'Job not found');
+          const completedPhases = job.phases_completed || [];
+          if (completedPhases.includes('CANCEL_ORDERS')) {
+            return err(400, 'Cannot abort: deletion has passed Phase 2 (irreversible)');
+          }
+          if (job.execution_arn) {
+            await sfn.send(new StopExecutionCommand({
+              executionArn: job.execution_arn,
+              cause: 'Admin abort'
+            }));
+          }
+          await dynamodb.send(new UpdateCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Key: { job_id: jobId },
+            UpdateExpression: 'SET #status = :status, aborted_at = :now, aborted_by = :by, updated_at = :now',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':status': 'ABORTED',
+              ':now': new Date().toISOString(),
+              ':by': authResult.userId
+            }
+          }));
+          // is_deleting 해제 (사용자 복구)
+          const targetUserId = job.user_id;
+          if (targetUserId) {
+            await dynamodb.send(new UpdateCommand({
+              TableName: USER_CACHE_TABLE,
+              Key: { user_id: targetUserId },
+              UpdateExpression: 'REMOVE is_deleting SET updated_at = :now',
+              ExpressionAttributeValues: { ':now': new Date().toISOString() }
+            }));
+            try {
+              await valkey.del(`user:${targetUserId}:deleting`);
+            } catch (e) {
+              console.log('Valkey cleanup (ignored):', e.message);
+            }
+          }
+          return ok({ success: true, message: 'Deletion aborted' });
+        } catch (e) {
+          return err(500, 'Abort failed: ' + e.message);
+        }
+      }
+
       // 나머지 액션은 userId 필요
       if (!userId) return err(400, 'userId is required');
 
@@ -385,6 +445,91 @@ export const handler = async (event) => {
           console.log('Audit log error (ignored):', e.message);
         }
 
+        // Cognito 사용자 비활성화 (모든 cognito_subs에 대해)
+        try {
+          const { Item: userInfo } = await dynamodb.send(new GetCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId }
+          }));
+          const cognitoSubs = userInfo?.cognito_subs || [];
+          for (const sub of cognitoSubs) {
+            try {
+              await cognito.send(new AdminDisableUserCommand({
+                UserPoolId: COGNITO_USER_POOL_ID,
+                Username: sub
+              }));
+              console.log(`[suspend] Cognito disabled: ${sub}`);
+            } catch (cognitoErr) {
+              console.warn(`[suspend] Cognito disable failed for ${sub}: ${cognitoErr.message}`);
+            }
+          }
+        } catch (e) {
+          console.warn('[suspend] Cognito disable lookup failed:', e.message);
+        }
+
+        // 미체결 주문 일괄 취소 (Kinesis CANCEL 발행)
+        try {
+          const ordersResult = await dynamodb.send(new QueryCommand({
+            TableName: 'supernoba-orders',
+            KeyConditionExpression: 'user_id = :uid',
+            ExpressionAttributeValues: { ':uid': userId }
+          }));
+          const openOrders = (ordersResult.Items || []).filter(
+            o => ['ACCEPTED', 'PARTIALLY_FILLED', 'PARTIAL_FILL', 'PENDING'].includes(o.status)
+          );
+          for (const order of openOrders) {
+            try {
+              await kinesis.send(new PutRecordCommand({
+                StreamName: KINESIS_ORDERS_STREAM,
+                Data: Buffer.from(JSON.stringify({
+                  action: 'CANCEL',
+                  order_id: order.order_id,
+                  user_id: userId,
+                  symbol: order.symbol,
+                  timestamp: Date.now()
+                })),
+                PartitionKey: order.symbol
+              }));
+              console.log(`[suspend] Cancelled order: ${order.order_id}`);
+            } catch (cancelErr) {
+              console.warn(`[suspend] Cancel failed for ${order.order_id}: ${cancelErr.message}`);
+            }
+          }
+          if (openOrders.length > 0) {
+            console.log(`[suspend] Cancelled ${openOrders.length} open orders for ${userId}`);
+          }
+        } catch (e) {
+          console.warn('[suspend] Order cancellation failed:', e.message);
+        }
+
+        // WebSocket 연결 강제 종료
+        if (WS_ENDPOINT) {
+          try {
+            const connections = await valkey.smembers(`user:${userId}:connections`);
+            if (connections && connections.length > 0) {
+              const wsClient = new ApiGatewayManagementApiClient({
+                region: 'ap-northeast-2',
+                endpoint: WS_ENDPOINT
+              });
+              for (const connId of connections) {
+                try {
+                  await wsClient.send(new DeleteConnectionCommand({ ConnectionId: connId }));
+                  console.log(`[suspend] Disconnected WS: ${connId}`);
+                } catch (wsErr) {
+                  if (wsErr.statusCode === 410) {
+                    // Already disconnected, clean up
+                    await valkey.srem(`user:${userId}:connections`, connId).catch(() => {});
+                  } else {
+                    console.warn(`[suspend] WS disconnect failed for ${connId}: ${wsErr.message}`);
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('[suspend] WS disconnect failed:', e.message);
+          }
+        }
+
         return ok({ success: true, message: `User ${userId} suspended` });
       }
 
@@ -401,6 +546,28 @@ export const handler = async (event) => {
           }));
         } catch (e) {
           return err(500, 'Failed to unsuspend user: ' + e.message);
+        }
+
+        // Cognito 사용자 재활성화
+        try {
+          const { Item: userInfo } = await dynamodb.send(new GetCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId }
+          }));
+          const cognitoSubs = userInfo?.cognito_subs || [];
+          for (const sub of cognitoSubs) {
+            try {
+              await cognito.send(new AdminEnableUserCommand({
+                UserPoolId: COGNITO_USER_POOL_ID,
+                Username: sub
+              }));
+              console.log(`[unsuspend] Cognito enabled: ${sub}`);
+            } catch (cognitoErr) {
+              console.warn(`[unsuspend] Cognito enable failed for ${sub}: ${cognitoErr.message}`);
+            }
+          }
+        } catch (e) {
+          console.warn('[unsuspend] Cognito enable lookup failed:', e.message);
         }
 
         try {
@@ -450,35 +617,70 @@ export const handler = async (event) => {
         return ok({ success: true, message: `User ${userId} admin status set to ${isAdmin}` });
       }
 
+      // 테스터 권한 설정
+      if (action === 'setTester') {
+        const { isTester } = b;
+        if (typeof isTester !== 'boolean') return err(400, 'isTester must be a boolean');
+
+        try {
+          await dynamodb.send(new UpdateCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            UpdateExpression: 'SET is_tester = :isTester, updated_at = :updatedAt',
+            ExpressionAttributeValues: {
+              ':isTester': isTester,
+              ':updatedAt': new Date().toISOString()
+            }
+          }));
+        } catch (e) {
+          return err(500, 'Failed to update tester status: ' + e.message);
+        }
+
+        try {
+          await dynamodb.send(new PutCommand({
+            TableName: AUDIT_LOGS_TABLE,
+            Item: {
+              log_id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              action: 'set_tester',
+              target_user_id: userId,
+              details: { isTester },
+              created_at: new Date().toISOString()
+            }
+          }));
+        } catch (e) {
+          console.log('Audit log error (ignored):', e.message);
+        }
+
+        return ok({ success: true, message: `User ${userId} tester status set to ${isTester}` });
+      }
+
       // 잔고 설정 (값 직접 변경)
       if (action === 'setBalance') {
         const { currency = 'BOLT', newBalance, adjustReason } = b;
         if (typeof newBalance !== 'number' || newBalance < 0) return err(400, 'newBalance must be a non-negative number');
 
-        // DynamoDB에서 현재 잔고 조회
+        // users 테이블에서 현재 잔고 조회
         let currentBalance = 0;
-        let currentLocked = 0;
         try {
-          const { Item: wallet } = await dynamodb.send(new GetCommand({
-            TableName: WALLETS_TABLE,
-            Key: { user_id: userId, currency: currency }
+          const { Item: user } = await dynamodb.send(new GetCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            ProjectionExpression: 'balances'
           }));
-          currentBalance = wallet?.available || 0;
-          currentLocked = wallet?.locked || 0;
+          currentBalance = user?.balances?.BOLT?.available || 0;
         } catch (e) {
-          console.log('Wallet fetch error (ignored):', e.message);
+          console.log('Balance fetch error (ignored):', e.message);
         }
 
-        // DynamoDB에 잔고 저장 (Upsert)
+        // users 테이블의 balances.BOLT.available 직접 업데이트
         try {
-          await dynamodb.send(new PutCommand({
-            TableName: WALLETS_TABLE,
-            Item: {
-              user_id: userId,
-              currency,
-              available: newBalance,
-              locked: currentLocked,
-              updated_at: new Date().toISOString()
+          await dynamodb.send(new UpdateCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now',
+            ExpressionAttributeValues: {
+              ':bal': newBalance,
+              ':now': new Date().toISOString()
             }
           }));
         } catch (updateErr) {
@@ -589,7 +791,95 @@ export const handler = async (event) => {
         });
       }
 
-      return err(400, 'Invalid action. Supported: getSettings, saveSettings, suspend, unsuspend, setBalance, setHolding, getAllHoldings');
+      // 사용자 삭제 (Step Functions 비동기 실행)
+      if (action === 'deleteUser') {
+        // Pre-check: 사용자 존재 확인
+        try {
+          const { Item: targetUser } = await dynamodb.send(new GetCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId }
+          }));
+          if (!targetUser) return err(404, 'User not found');
+        } catch (e) {
+          return err(500, 'User lookup failed: ' + e.message);
+        }
+
+        const jobId = `delete-${userId}-${Date.now()}`;
+        const now = new Date().toISOString();
+
+        // Job 레코드 생성
+        try {
+          await dynamodb.send(new PutCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Item: {
+              job_id: jobId,
+              user_id: userId,
+              status: 'IN_PROGRESS',
+              phase: 'STARTING',
+              phases_completed: [],
+              started_at: now,
+              started_by: authResult.userId,
+              updated_at: now
+            }
+          }));
+        } catch (e) {
+          return err(500, 'Failed to create job: ' + e.message);
+        }
+
+        // Step Functions 실행
+        try {
+          const execution = await sfn.send(new StartExecutionCommand({
+            stateMachineArn: DELETE_USER_STATE_MACHINE_ARN,
+            name: jobId,
+            input: JSON.stringify({ job_id: jobId, user_id: userId })
+          }));
+
+          // Job에 execution ARN 저장
+          await dynamodb.send(new UpdateCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Key: { job_id: jobId },
+            UpdateExpression: 'SET execution_arn = :arn, updated_at = :now',
+            ExpressionAttributeValues: {
+              ':arn': execution.executionArn,
+              ':now': now
+            }
+          }));
+
+          // 감사 로그
+          try {
+            await dynamodb.send(new PutCommand({
+              TableName: AUDIT_LOGS_TABLE,
+              Item: {
+                log_id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                action: 'delete_user_initiated',
+                target_user_id: userId,
+                details: { job_id: jobId, started_by: authResult.userId },
+                created_at: now
+              }
+            }));
+          } catch (e) {
+            console.log('Audit log error (ignored):', e.message);
+          }
+
+          return ok({ success: true, job_id: jobId, message: 'User deletion started' });
+        } catch (e) {
+          // SFN 실행 실패 시 job 상태 업데이트
+          await dynamodb.send(new UpdateCommand({
+            TableName: DELETE_JOBS_TABLE,
+            Key: { job_id: jobId },
+            UpdateExpression: 'SET #status = :status, error = :error, updated_at = :now',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':status': 'FAILED',
+              ':error': e.message,
+              ':now': now
+            }
+          })).catch(() => {});
+          return err(500, 'Failed to start deletion: ' + e.message);
+        }
+      }
+
+      return err(400, 'Invalid action. Supported: getSettings, saveSettings, suspend, unsuspend, setAdmin, setTester, setBalance, setHolding, getAllHoldings, deleteUser, deleteUserStatus, abortDeleteUser');
     }
 
     return err(404, 'Not found');

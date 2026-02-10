@@ -7,15 +7,17 @@ import pg from 'pg';
 // Common Layer - Valkey, CORS
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
+// Auth Layer - Cognito JWT 검증
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+
 const { Client: PgClient } = pg;
-const ADMIN_KEY = process.env.ADMIN_API_KEY;
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
+const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
 const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 
 // Layer를 통한 클라이언트 초기화
-const valkey = getValkeyClient({ preset: 'admin' });
+const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 const secrets = new SecretsManagerClient({ region: 'ap-northeast-2' });
 
@@ -23,39 +25,42 @@ let dbCreds = null, pgClient = null;
 
 // Layer의 CORS.READONLY 사용 (GET, OPTIONS)
 const H = CORS.READONLY;
-const isAdmin = (e) => !ADMIN_KEY || (e.headers?.Authorization || e.headers?.authorization) === ADMIN_KEY;
 const ok = (d) => response.ok(d, H);
 const err = (c, m) => response.error(c, m, H);
 
 async function getPg() {
   if (pgClient) return pgClient;
   if (!dbCreds) {
-    if (process.env.DB_USERNAME && process.env.DB_PASSWORD) {
-      dbCreds = { username: process.env.DB_USERNAME, password: process.env.DB_PASSWORD };
-    } else if (DB_SECRET_ARN) {
+    if (DB_SECRET_ARN) {
       const r = await secrets.send(new GetSecretValueCommand({ SecretId: DB_SECRET_ARN }));
       const s = JSON.parse(r.SecretString);
       dbCreds = { username: s.username, password: s.password };
+    } else if (process.env.DB_USERNAME && process.env.DB_PASSWORD) {
+      dbCreds = { username: process.env.DB_USERNAME, password: process.env.DB_PASSWORD };
     } else {
       dbCreds = { username: 'postgres', password: 'postgres' };
     }
   }
-  pgClient = new PgClient({
+  const client = new PgClient({
     host: RDS_HOST,
     port: 5432,
-    database: 'postgres',
+    database: process.env.DB_NAME || 'supernoba',
     user: dbCreds.username,
     password: dbCreds.password,
     ssl: { rejectUnauthorized: false },
     connectionTimeoutMillis: 5000
   });
-  await pgClient.connect();
+  await client.connect();
+  pgClient = client;
   return pgClient;
 }
 
 export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: H, body: '' };
-  if (!isAdmin(event)) return err(403, 'Unauthorized');
+  
+  // Cognito JWT 인증
+  const authResult = await verifyAdmin(event);
+  if (!authResult.success) return authErrorResponse(authResult, H);
   if (event.httpMethod !== 'GET') return err(405, 'Method not allowed');
 
   try {

@@ -16,20 +16,59 @@ $REGION = "ap-northeast-2"
 #   - Supernoba-notifier → Supernoba-back/src/processors/notification_processor.cpp
 #   - Supernoba-order-status-processor → Supernoba-back/src/processors/order_status_processor.cpp
 $LAMBDA_FUNCTIONS = @(
+    # === REST API ===
     @{ Name = "Supernoba-admin"; Path = "Supernoba-admin"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-admin-core"; Path = "Supernoba-admin-core"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-admin-stats"; Path = "Supernoba-admin-stats"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-admin-monitoring"; Path = "Supernoba-admin-monitoring"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-admin-users"; Path = "Supernoba-admin-users"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-admin-mm"; Path = "Supernoba-admin-mm"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-symbol-admin"; Path = "Supernoba-symbol-admin"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-order-router"; Path = "Supernoba-order-router"; HasPackageJson = $true; HasBuild = $true },
     @{ Name = "Supernoba-asset-handler"; Path = "Supernoba-asset-handler"; HasPackageJson = $true; HasBuild = $false },
-    # DEPRECATED: stock-processor로 이전됨
-    # @{ Name = "Supernoba-fill-processor"; Path = "Supernoba-fill-processor"; HasPackageJson = $true; HasBuild = $false },
-    # @{ Name = "Supernoba-history-saver"; Path = "Supernoba-history-saver"; HasPackageJson = $true; HasBuild = $false },
-    # @{ Name = "Supernoba-notifier"; Path = "Supernoba-notifier"; HasPackageJson = $true; HasBuild = $false },
-    # @{ Name = "Supernoba-order-status-processor"; Path = "Supernoba-order-status-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-chart-data-handler"; Path = "Supernoba-chart-data-handler"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-history"; Path = "Supernoba-history"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-rankings"; Path = "Supernoba-rankings"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-treemap-data"; Path = "Supernoba-treemap-data"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-announcements"; Path = "Supernoba-announcements"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-approval-handler"; Path = "Supernoba-approval-handler"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-preview-handler"; Path = "Supernoba-preview-handler"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-favorites"; Path = "Supernoba-favorites"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-creator-requests"; Path = "Supernoba-creator-requests"; HasPackageJson = $true; HasBuild = $false },
+
+    # === WebSocket ===
     @{ Name = "Supernoba-connect-handler"; Path = "Supernoba-connect-handler"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-subscribe-handler"; Path = "Supernoba-subscribe-handler"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-subscribe-handler"; Path = "Supernoba-subscribe-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-disconnect-handler"; Path = "Supernoba-disconnect-handler"; HasPackageJson = $false; HasBuild = $false },
-    @{ Name = "Supernoba-rankings"; Path = "Supernoba-rankings"; HasPackageJson = $false; HasBuild = $false },
-    @{ Name = "Supernoba-treemap-data"; Path = "Supernoba-treemap-data"; HasPackageJson = $false; HasBuild = $false }
+    @{ Name = "Supernoba-admin-ws-handler"; Path = "Supernoba-admin-ws-handler"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-cleanup-handler"; Path = "Supernoba-cleanup-handler"; HasPackageJson = $true; HasBuild = $false },
+
+    # === Event/Batch ===
+    @{ Name = "Supernoba-user-init"; Path = "Supernoba-user-init"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-ipo-processor"; Path = "Supernoba-ipo-processor"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-auth"; Path = "Supernoba-auth"; HasPackageJson = $true; HasBuild = $false },
+
+    # === Utility ===
+    @{ Name = "Supernoba-ec2-mgmt"; Path = "Supernoba-ec2-mgmt"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-x-auth"; Path = "Supernoba-x-auth"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-symbol-cleanup"; Path = "Supernoba-symbol-cleanup"; HasPackageJson = $true; HasBuild = $false },
+
+    # === Step Functions (delisting) ===
+    @{ Name = "Supernoba-delisting-phase1"; Path = "Supernoba-delisting-phase1"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-delisting-phase2"; Path = "Supernoba-delisting-phase2"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-delisting-phase3"; Path = "Supernoba-delisting-phase3"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-delisting-phase4"; Path = "Supernoba-delisting-phase4"; HasPackageJson = $true; HasBuild = $false },
+
+    # === Step Functions (delete-user) ===
+    @{ Name = "Supernoba-delete-user-phase1"; Path = "Supernoba-delete-user-phase1"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase2"; Path = "Supernoba-delete-user-phase2"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase3"; Path = "Supernoba-delete-user-phase3"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase4"; Path = "Supernoba-delete-user-phase4"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase5"; Path = "Supernoba-delete-user-phase5"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase6"; Path = "Supernoba-delete-user-phase6"; HasPackageJson = $false; HasBuild = $false }
+
+    # DEPRECATED: stock-processor (C++)로 이전됨 - 2026-01-12
+    # Supernoba-fill-processor, Supernoba-history-saver, Supernoba-notifier, Supernoba-order-status-processor
 )
 
 Write-Host "==========================================" -ForegroundColor Cyan
