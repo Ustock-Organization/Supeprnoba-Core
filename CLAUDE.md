@@ -413,39 +413,45 @@ sudo ./install-services.sh
 
 ---
 
-## Valkey (Redis) 키 구조
+## Valkey 4-Cache 키 구조
 
+### Depth Cache (포트 6379)
 ```
-# 실시간 호가
 depth:{SYMBOL}                    # JSON: {b: [[price, qty]...], a: [...]}
-
-# 티커 정보
 ticker:{SYMBOL}                   # JSON: {p, c, cp, h, l, v, pc}
+ohlc:{SYMBOL}                     # JSON: {o, h, l, c, v, change, t}
+prev:{SYMBOL}                     # String: 전일 종가
+```
 
-# 캔들 데이터
+### Candle Cache (포트 6380)
+```
 candle:1m:{SYMBOL}               # Hash: {o, h, l, c, v, t, t_epoch}
 candle:closed:1m:{SYMBOL}        # List: 마감된 1분봉 (집계 대기)
+```
 
-# 전일종가
-prev:{SYMBOL}                    # String: 전일 종가
+### Backup Cache (포트 6381)
+```
+snapshot:{SYMBOL}                # String: 오더북 스냅샷
+kinesis:checkpoint:*             # String: Kinesis 체크포인트
+ranking:marketcap                # SortedSet: 시가총액 순위
+ranking:volume                   # SortedSet: 거래량 순위
+ranking:gainers/losers           # SortedSet: 급등/급락 순위
+rankings:snapshot                # String: 랭킹 JSON (TTL 15s)
+```
 
-# WebSocket 연결
-user:{userId}:connections        # Set: 사용자 연결 ID 목록
+### Operating Cache (포트 6382)
+```
 ws:{connectionId}                # String: 연결 정보
+user:{userId}:connections        # Set: 사용자 연결 ID 목록
 symbol:{SYMBOL}:main             # Set: 해당 종목 구독 연결 목록
-
-# Market Maker (MM)
-mm:control                       # Pub/Sub: 제어 명령 채널 (start, stop, reload)
+subscribed:symbols               # Set: 구독 가능한 종목 목록
+deleted:symbols                  # Set: 삭제된 종목 목록
+mm:control                       # Pub/Sub: 제어 명령 채널
 mm:status                        # Pub/Sub: 상태 브로드캐스트 채널
 mm:running                       # String: 전체 실행 상태 (1/0)
 mm:running:symbols               # Set: 실행 중인 종목 목록
-mm:config:{SYMBOL}               # Hash: 종목별 MM 설정 (basePrice, period, amplitude 등)
+mm:config:{SYMBOL}               # Hash: 종목별 MM 설정
 mm:price:{SYMBOL}                # String: 현재 MM 가격
-mm:started_at:{SYMBOL}           # String: 종목 시작 시간
-
-# 종목 관리
-subscribed:symbols               # Set: 구독 가능한 종목 목록
-deleted:symbols                  # Set: 삭제된 종목 목록 (복구 대기)
 ```
 
 ---

@@ -556,42 +556,84 @@ candleSeries.update(aggregatedCandle)  ← 마지막 캔들만 업데이트 (권
 
 ---
 
-## ElastiCache 구성 (Dual Valkey)
+## Valkey 4-Cache 구성
 
-| 캐시 | 엔드포인트 | 용도 | TLS |
-|------|-----------|------|-----|
-| **Backup Cache** | `master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com:6379` | 오더북 스냅샷, 전일 데이터 | ❌ |
-| **Depth Cache** | `supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com:6379` | 실시간 호가, 구독자 관리 | ❌ |
+EC2에서는 모든 캐시가 `127.0.0.1`의 서로 다른 포트에서 실행됩니다.
+Lambda에서는 ElastiCache 엔드포인트(TLS)를 사용합니다.
+
+| 포트 | 캐시 | 용도 | ElastiCache 엔드포인트 |
+|------|------|------|----------------------|
+| 6379 | **Depth Cache** | 실시간 호가, 티커, OHLC, 전일종가 | `supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com` |
+| 6380 | **Candle Cache** | 1분봉 활성/마감 데이터 | (EC2 로컬 전용) |
+| 6381 | **Backup Cache** | 오더북 스냅샷, Kinesis 체크포인트, 랭킹 | `master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com` |
+| 6382 | **Operating Cache** | WebSocket 연결, 구독, MM, 종목 관리 | (EC2 로컬 전용) |
+
+### 환경변수
+
+```bash
+# common.env (EC2)
+DEPTH_CACHE_HOST=127.0.0.1
+DEPTH_CACHE_PORT=6379
+CANDLE_CACHE_HOST=127.0.0.1
+CANDLE_CACHE_PORT=6380
+BACKUP_CACHE_HOST=127.0.0.1
+BACKUP_CACHE_PORT=6381
+OPERATING_CACHE_HOST=127.0.0.1
+OPERATING_CACHE_PORT=6382
+```
 
 ---
 
-## Redis 키 구조
+## Valkey 키 구조
 
-### Depth Cache (실시간 데이터)
-
-| 키 패턴                        | 타입     | 용도                                                  | 생성 위치                                     |
-| --------------------------- | ------ | --------------------------------------------------- | ----------------------------------------- |
-| `depth:SYMBOL`              | String | 실시간 호가 10단계 (Main)                                  | C++ `market_data_handler.cpp`             |
-| `ticker:SYMBOL`             | String | 간략 시세 (Sub)                                         | C++ `updateTickerCache()`                 |
-| `active:symbols`            | Set    | 거래 가능 종목 목록 (Admin 관리)                              | `symbol-manager`                          |
-| `subscribed:symbols`        | Set    | 현재 구독자 있는 심볼 (자동)                                   | `subscribe-handler`, `disconnect-handler` |
-| `symbol:SYMBOL:main`        | Set    | Main 구독자 connectionId                               | `subscribe-handler`                       |
-| `symbol:SYMBOL:sub`         | Set    | Sub 구독자 connectionId                                | `subscribe-handler`                       |
-| `symbol:SYMBOL:subscribers` | Set    | 레거시 구독자 (호환용)                                       | `subscribe-handler`                       |
-| `conn:CONNID:main`          | String | 연결별 Main 구독 심볼                                      | `subscribe-handler`                       |
-| `ws:CONNID`                 | String | WebSocket 연결 정보 `{userId, isLoggedIn, connectedAt}` | `connect-handler`                         |
-| `user:USERID:connections`   | Set    | 사용자별 연결 목록                                          | `connect-handler`                         |
-| `realtime:connections`      | Set    | 로그인 사용자 connectionId 목록 (50ms 폴링)                   | `connect-handler`                         |
-| `candle:1m:SYMBOL`          | Hash   | 활성 1분봉 `{o, h, l, c, v, t, t_epoch}`<br/>EXPIRE 300초 | C++ Lua Script (`updateCandle`) |
-| `candle:closed:1m:SYMBOL`   | List   | 마감 1분봉 버퍼 (최대 1000개, 백업 전)<br/>EXPIRE 3600초 | C++ Lua Script (분 변경 시) |
-| `ohlc:SYMBOL`               | String | 당일 OHLC 캐시 `{o, h, l, c, v, change, t}` | C++ `updateTickerCache()` |
-
-### Backup Cache (영구 데이터)
+### Depth Cache (포트 6379) — 실시간 시세 데이터
 
 | 키 패턴 | 타입 | 용도 | 생성 위치 |
 |---------|------|------|----------|
-| `snapshot:SYMBOL` | String | 오더북 스냅샷 | C++ `redis_client.cpp` |
-| `prev:SYMBOL` | String | 전일 OHLC | C++ `savePrevDayData()` |
+| `depth:{SYMBOL}` | String | 실시간 호가 10단계 JSON `{b:[[price,qty]...], a:[...]}` | C++ `market_data_handler.cpp` |
+| `ticker:{SYMBOL}` | String | 간략 시세 JSON `{p, c, cp, h, l, v, pc}` | C++ `updateTickerCache()` |
+| `ohlc:{SYMBOL}` | String | 당일 OHLC 캐시 `{o, h, l, c, v, change, t}` | C++ `updateTickerCache()` |
+| `prev:{SYMBOL}` | String | 전일 종가 | C++ `savePrevDayData()` |
+
+### Candle Cache (포트 6380) — 캔들 데이터
+
+| 키 패턴 | 타입 | 용도 | 생성 위치 |
+|---------|------|------|----------|
+| `candle:1m:{SYMBOL}` | Hash | 활성 1분봉 `{o, h, l, c, v, t, t_epoch}` EXPIRE 300초 | C++ Lua Script (`updateCandle`) |
+| `candle:closed:1m:{SYMBOL}` | List | 마감 1분봉 버퍼 (최대 1000개) EXPIRE 3600초 | C++ Lua Script (분 변경 시) |
+
+### Backup Cache (포트 6381) — 영구/배치 데이터
+
+| 키 패턴 | 타입 | 용도 | 생성 위치 |
+|---------|------|------|----------|
+| `snapshot:{SYMBOL}` | String | 오더북 스냅샷 | C++ `redis_client.cpp` |
+| `kinesis:checkpoint:*` | String | Kinesis 샤드 체크포인트 | C++ `KinesisConsumer` |
+| `ranking:marketcap` | SortedSet | 시가총액 순위 | C++ `RankingManager` |
+| `ranking:volume` | SortedSet | 거래량 순위 (KST 일일 리셋) | C++ `RankingManager` |
+| `ranking:gainers` / `ranking:losers` | SortedSet | 급등/급락 순위 | C++ Aggregator |
+| `rankings:snapshot` | String | 랭킹 JSON (TTL 15s) | C++ `RankingManager` |
+| `engine:*` / `system:*` | String | 엔진/시스템 메타데이터 | C++ Engine |
+
+### Operating Cache (포트 6382) — WebSocket/구독/MM
+
+| 키 패턴 | 타입 | 용도 | 생성 위치 |
+|---------|------|------|----------|
+| `ws:{connectionId}` | String | WebSocket 연결 정보 `{userId, isLoggedIn, connectedAt}` | `connect-handler` |
+| `user:{userId}:connections` | Set | 사용자별 연결 목록 | `connect-handler` |
+| `symbol:{SYMBOL}:main` | Set | Main 구독자 connectionId | `subscribe-handler` |
+| `symbol:{SYMBOL}:sub` | Set | Sub 구독자 connectionId | `subscribe-handler` |
+| `subscribed:symbols` | Set | 현재 구독자 있는 심볼 (자동) | `subscribe-handler` |
+| `conn:{connId}:main` | String | 연결별 Main 구독 심볼 | `subscribe-handler` |
+| `active:symbols` | Set | 거래 가능 종목 목록 | `symbol-manager` |
+| `deleted:symbols` | Set | 삭제된 종목 목록 (복구 대기) | `symbol-admin` |
+| `blocked:*` / `order:*` | String | 차단/주문 상태 | `order-router` |
+| `mm:control` | Pub/Sub | MM 제어 명령 채널 | `admin-mm` |
+| `mm:status` | Pub/Sub | MM 상태 브로드캐스트 채널 | `mm-service` |
+| `mm:running` | String | 전체 실행 상태 (1/0) | `mm-service` |
+| `mm:running:symbols` | Set | 실행 중인 종목 목록 | `mm-service` |
+| `mm:config:{SYMBOL}` | Hash | 종목별 MM 설정 | `admin-mm` |
+| `mm:price:{SYMBOL}` | String | 현재 MM 가격 | `mm-service` |
+| `admin:*` | String | 관리자 WebSocket 연결 | `admin-ws-handler` |
 
 ---
 
