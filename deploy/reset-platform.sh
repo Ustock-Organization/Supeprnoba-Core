@@ -12,7 +12,11 @@
 # 초기화 대상:
 #   - DynamoDB: supernoba-orders, supernoba-holdings, supernoba-wallets, supernoba-symbols
 #   - PostgreSQL: trade_history, candle_history
-#   - Valkey: depth:*, candle:*, ticker:*, mm:*, subscribed:symbols, snapshot:*, orderbook:*, ranking:*, backup:* 등
+#   - Valkey 4-Cache:
+#     - depth(6379): depth:*, ticker:*, ohlc:*, prev:*
+#     - candle(6380): candle:*
+#     - backup(6381): snapshot:*, kinesis:checkpoint:*, ranking:*, engine:*, system:*
+#     - operating(6382): ws:*, user:*, symbol:*, mm:*, admin:*, order:*, subscribed:*, deleted:*, active:*, blocked:*, conn:*
 #
 
 set -e
@@ -38,12 +42,15 @@ if [ -f "$SCRIPT_DIR/env/common.env" ]; then
     source "$SCRIPT_DIR/env/common.env"
 fi
 
-# 기본값 설정
+# 기본값 설정 — 4-Cache 아키텍처 (localhost)
 AWS_REGION="${AWS_REGION:-ap-northeast-2}"
-BACKUP_CACHE_HOST="${BACKUP_CACHE_HOST:-master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com}"
-BACKUP_CACHE_PORT="${BACKUP_CACHE_PORT:-6379}"
-DEPTH_CACHE_HOST="${DEPTH_CACHE_HOST:-supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com}"
-DEPTH_CACHE_PORT="${DEPTH_CACHE_PORT:-6379}"
+VALKEY_HOST="${VALKEY_HOST:-127.0.0.1}"
+
+# 4-Cache 포트 매핑
+DEPTH_PORT="${DEPTH_CACHE_PORT:-6379}"
+CANDLE_PORT="${CANDLE_CACHE_PORT:-6380}"
+BACKUP_PORT="${BACKUP_CACHE_PORT:-6381}"
+OPERATING_PORT="${OPERATING_CACHE_PORT:-6382}"
 
 # RDS: run-sql.sh가 AWS Secrets Manager에서 자격증명을 자동으로 가져옴
 # 테이블 목록은 sql/ops/reset_platform.sql에서 중앙 관리
@@ -51,24 +58,13 @@ DEPTH_CACHE_PORT="${DEPTH_CACHE_PORT:-6379}"
 # DynamoDB 테이블 목록
 DYNAMODB_TABLES=("supernoba-orders" "supernoba-holdings" "supernoba-wallets" "supernoba-symbols")
 
-# Valkey 키 패턴
-VALKEY_KEY_PATTERNS=(
-    "depth:*"
-    "candle:*"
-    "ticker:*"
-    "mm:*"
-    "prev:*"
-    "user:*"
-    "ws:*"
-    "symbol:*"
-    "active:symbols"
-    "subscribed:symbols"
-    "deleted:symbols"
-    # 백업 관련 키
-    "snapshot:*"
-    "orderbook:*"
-    "ranking:*"
-    "backup:*"
+# 4-Cache별 키 패턴
+DEPTH_KEY_PATTERNS=("depth:*" "ticker:*" "ohlc:*" "prev:*")
+CANDLE_KEY_PATTERNS=("candle:*")
+BACKUP_KEY_PATTERNS=("snapshot:*" "kinesis:checkpoint:*" "ranking:*" "engine:*" "system:*")
+OPERATING_KEY_PATTERNS=(
+    "ws:*" "user:*" "symbol:*" "mm:*" "admin:*" "order:*"
+    "subscribed:*" "deleted:*" "active:*" "blocked:*" "conn:*"
 )
 
 # 모드 설정
@@ -206,114 +202,98 @@ reset_postgresql() {
     fi
 }
 
-#===== Valkey 함수 =====
+#===== Valkey 4-Cache 함수 =====
 
-# Valkey 키 수 조회
+# redis-cli로 키 수 조회 (패턴별)
 count_valkey_keys() {
-    local host=$1
-    local port=$2
-    local pattern=$3
-
-    # Node.js 스크립트로 TLS 연결
-    node --input-type=module -e "
-import Redis from 'ioredis';
-const redis = new Redis({
-    host: '$host',
-    port: $port,
-    tls: {},
-    connectTimeout: 5000
-});
-redis.keys('$pattern').then(keys => {
-    console.log(keys.length);
-    redis.quit();
-}).catch(e => {
-    console.log('0');
-    redis.quit();
-});
-" 2>/dev/null || echo "0"
+    local port=$1
+    local pattern=$2
+    redis-cli -h "$VALKEY_HOST" -p "$port" KEYS "$pattern" 2>/dev/null | wc -l
 }
 
-# Valkey 키 삭제
+# redis-cli로 키 삭제 (패턴별)
 delete_valkey_keys() {
-    local host=$1
+    local port=$1
+    local pattern=$2
+    local keys
+    keys=$(redis-cli -h "$VALKEY_HOST" -p "$port" KEYS "$pattern" 2>/dev/null)
+    if [ -z "$keys" ]; then
+        echo "0"
+        return
+    fi
+    local count=0
+    while IFS= read -r key; do
+        if [ -n "$key" ]; then
+            redis-cli -h "$VALKEY_HOST" -p "$port" DEL "$key" > /dev/null 2>&1
+            ((count++))
+        fi
+    done <<< "$keys"
+    echo "$count"
+}
+
+# 캐시별 키 현황 출력
+show_cache_status() {
+    local name=$1
     local port=$2
-    local pattern=$3
-
-    # Node.js 스크립트로 TLS 연결 및 삭제
-    node --input-type=module -e "
-import Redis from 'ioredis';
-const redis = new Redis({
-    host: '$host',
-    port: $port,
-    tls: {},
-    connectTimeout: 5000
-});
-
-async function deleteKeys() {
-    const keys = await redis.keys('$pattern');
-    if (keys.length === 0) {
-        console.log('0');
-        return;
-    }
-
-    // Pipeline으로 배치 삭제
-    const pipeline = redis.pipeline();
-    for (const key of keys) {
-        pipeline.del(key);
-    }
-    await pipeline.exec();
-    console.log(keys.length);
-}
-
-deleteKeys().then(() => redis.quit()).catch(e => {
-    console.error(e.message);
-    redis.quit();
-});
-" 2>/dev/null || echo "0"
-}
-
-# Valkey 초기화
-reset_valkey() {
-    echo ""
-    echo -e "${CYAN}=== Valkey Reset ===${NC}"
+    shift 2
+    local patterns=("$@")
 
     echo ""
-    log_info "Backup Cache ($BACKUP_CACHE_HOST):"
-    for pattern in "${VALKEY_KEY_PATTERNS[@]}"; do
-        local count=$(count_valkey_keys "$BACKUP_CACHE_HOST" "$BACKUP_CACHE_PORT" "$pattern")
+    log_info "$name Cache ($VALKEY_HOST:$port):"
+    local dbsize=$(redis-cli -h "$VALKEY_HOST" -p "$port" DBSIZE 2>/dev/null | awk '{print $NF}')
+    log_info "  DBSIZE: ${dbsize:-0}"
+
+    for pattern in "${patterns[@]}"; do
+        local count=$(count_valkey_keys "$port" "$pattern")
         if [ "$count" != "0" ]; then
             log_info "  $pattern: $count keys"
         fi
     done
+}
 
+# 캐시별 키 삭제
+delete_cache_keys() {
+    local name=$1
+    local port=$2
+    shift 2
+    local patterns=("$@")
+
+    log_info "Deleting $name Cache keys..."
+    for pattern in "${patterns[@]}"; do
+        local deleted=$(delete_valkey_keys "$port" "$pattern")
+        if [ "$deleted" != "0" ]; then
+            log_success "  Deleted $deleted keys matching $pattern"
+        fi
+    done
+}
+
+# Valkey 4-Cache 초기화
+reset_valkey() {
     echo ""
-    log_info "Depth Cache ($DEPTH_CACHE_HOST):"
-    local depth_count=$(count_valkey_keys "$DEPTH_CACHE_HOST" "$DEPTH_CACHE_PORT" "depth:*")
-    log_info "  depth:*: $depth_count keys"
+    echo -e "${CYAN}=== Valkey 4-Cache Reset ===${NC}"
+
+    # 4개 캐시별 현황 표시
+    show_cache_status "Depth"     "$DEPTH_PORT"     "${DEPTH_KEY_PATTERNS[@]}"
+    show_cache_status "Candle"    "$CANDLE_PORT"    "${CANDLE_KEY_PATTERNS[@]}"
+    show_cache_status "Backup"    "$BACKUP_PORT"    "${BACKUP_KEY_PATTERNS[@]}"
+    show_cache_status "Operating" "$OPERATING_PORT" "${OPERATING_KEY_PATTERNS[@]}"
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would delete all matching keys"
+        echo ""
+        log_info "[DRY-RUN] Would delete all matching keys across 4 caches"
         return 0
     fi
 
     if $CONFIRMED; then
-        log_info "Deleting Valkey keys..."
+        echo ""
+        log_info "Deleting Valkey keys across 4 caches..."
 
-        # Backup Cache 키 삭제
-        for pattern in "${VALKEY_KEY_PATTERNS[@]}"; do
-            local deleted=$(delete_valkey_keys "$BACKUP_CACHE_HOST" "$BACKUP_CACHE_PORT" "$pattern")
-            if [ "$deleted" != "0" ]; then
-                log_success "  Deleted $deleted keys matching $pattern"
-            fi
-        done
+        delete_cache_keys "Depth"     "$DEPTH_PORT"     "${DEPTH_KEY_PATTERNS[@]}"
+        delete_cache_keys "Candle"    "$CANDLE_PORT"    "${CANDLE_KEY_PATTERNS[@]}"
+        delete_cache_keys "Backup"    "$BACKUP_PORT"    "${BACKUP_KEY_PATTERNS[@]}"
+        delete_cache_keys "Operating" "$OPERATING_PORT" "${OPERATING_KEY_PATTERNS[@]}"
 
-        # Depth Cache 키 삭제
-        local deleted=$(delete_valkey_keys "$DEPTH_CACHE_HOST" "$DEPTH_CACHE_PORT" "depth:*")
-        if [ "$deleted" != "0" ]; then
-            log_success "  Deleted $deleted keys from Depth Cache"
-        fi
-
-        log_success "Valkey keys deleted"
+        log_success "All Valkey keys deleted across 4 caches"
     fi
 }
 
@@ -355,6 +335,12 @@ show_help() {
     echo "  --dry-run     Show what would be deleted without actually deleting"
     echo "  --confirm     Actually perform the reset (requires confirmation)"
     echo "  --help        Show this help message"
+    echo ""
+    echo "4-Cache Ports:"
+    echo "  Depth:     $DEPTH_PORT     (depth, ticker, ohlc, prev)"
+    echo "  Candle:    $CANDLE_PORT    (candle)"
+    echo "  Backup:    $BACKUP_PORT    (snapshot, checkpoint, ranking)"
+    echo "  Operating: $OPERATING_PORT (ws, user, symbol, mm, admin)"
     echo ""
     echo "Examples:"
     echo "  $0 --dry-run   # Preview what will be deleted"
@@ -399,17 +385,19 @@ main() {
     else
         echo "  Mode: LIVE (data WILL be deleted!)"
     fi
+    echo "  Valkey Host: $VALKEY_HOST"
+    echo "  Ports: depth=$DEPTH_PORT candle=$CANDLE_PORT backup=$BACKUP_PORT operating=$OPERATING_PORT"
     echo "============================================"
     echo ""
 
     # 경고 메시지
     if $CONFIRMED && ! $DRY_RUN; then
-        echo -e "${RED}⚠️  WARNING: This will DELETE ALL DATA!${NC}"
+        echo -e "${RED}WARNING: This will DELETE ALL DATA!${NC}"
         echo ""
         echo "The following will be cleared:"
         echo "  - DynamoDB: orders, holdings, wallets, symbols"
         echo "  - PostgreSQL: trade_history, candle_history"
-        echo "  - Valkey: depth, candle, ticker, mm, snapshot, orderbook, ranking, backup keys"
+        echo "  - Valkey 4-Cache: depth, candle, backup, operating keys"
         echo ""
         read -p "Type 'DELETE ALL' to confirm: " confirm
         if [ "$confirm" != "DELETE ALL" ]; then
@@ -430,7 +418,7 @@ main() {
     # PostgreSQL 초기화
     reset_postgresql
 
-    # Valkey 초기화
+    # Valkey 4-Cache 초기화
     reset_valkey
 
     echo ""

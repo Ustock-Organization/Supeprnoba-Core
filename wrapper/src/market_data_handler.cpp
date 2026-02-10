@@ -14,10 +14,13 @@
 
 namespace aws_wrapper {
 
-MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* redis,
+MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* depth_redis,
+                                     RedisClient* candle_redis,
                                      NotificationClient* notifier, RankingManager* ranking_manager)
-    : producer_(producer), redis_(redis), notifier_(notifier), ranking_manager_(ranking_manager) {
-    Logger::info("MarketDataHandler initialized, Redis:", redis_ ? "connected" : "none",
+    : producer_(producer), depth_redis_(depth_redis), candle_redis_(candle_redis),
+      notifier_(notifier), ranking_manager_(ranking_manager) {
+    Logger::info("MarketDataHandler initialized, Depth Redis:", depth_redis_ ? "connected" : "none",
+                 "Candle Redis:", candle_redis_ ? "connected" : "none",
                  "Notifier:", notifier_ ? "enabled" : "disabled",
                  "RankingManager:", ranking_manager_ ? "enabled" : "disabled");
 }
@@ -26,15 +29,9 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
     Logger::info("Order ACCEPTED:", order->order_id(), order->symbol());
     Metrics::instance().incrementOrdersAccepted();
     
-    // Direct WebSocket notification (preferred)
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   0, 0, "ACCEPTED");
-    }
-    
+    // NOTE: 직접 WebSocket 알림 제거됨 (2026-02-08)
+    // 모든 ORDER_STATUS 알림은 Kinesis → stock-processor 단일 경로로 통합
+
     // Kinesis로 ACCEPTED 이벤트 발행 (order-status 스트림) - 주문 정보 포함
     if (producer_) {
         std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
@@ -49,19 +46,12 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Order REJECTED:", order->order_id(), "reason:", reason);
     Metrics::instance().incrementOrdersRejected();
     
-    // WebSocket 알림 전송
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   0, 0, "REJECTED", reason);
-    }
-    
     // Kinesis로 REJECTED 이벤트 발행 (order-status 스트림)
     if (producer_) {
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
-                                      order->user_id(), "REJECTED", reason ? reason : "");
+                                      order->user_id(), "REJECTED", reason ? reason : "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published REJECTED event to Kinesis:", order->order_id());
     }
 
@@ -107,7 +97,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     day.last_price = fill_price;
     day.volume += fill_qty;  // 거래량 누적
 
-    Logger::info("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume);
+    Logger::debug("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume);
     
     // === OHLC 캐시 저장 (당일만) ===
     auto now = std::chrono::system_clock::now();
@@ -115,7 +105,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         now.time_since_epoch()).count();
     auto epoch_sec = epoch_ms / 1000;
     
-    if (redis_ && redis_->isConnected()) {
+    if (depth_redis_ && depth_redis_->isConnected()) {
         nlohmann::json ohlc;
         ohlc["o"] = day.open_price;
         ohlc["h"] = day.high_price;
@@ -123,11 +113,13 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         ohlc["c"] = day.last_price;
         ohlc["v"] = day.volume;
         ohlc["t"] = epoch_sec;  // Unix timestamp (초)
-        redis_->set("ohlc:" + symbol, ohlc.dump());
+        depth_redis_->set("ohlc:" + symbol, ohlc.dump());
         Logger::debug("OHLC saved:", symbol);
+    }
 
-        // === 1분봉 캔들 업데이트 (Lua Script) ===
-        redis_->updateCandle(symbol, fill_price, fill_qty, epoch_sec);
+    // === 1분봉 캔들 업데이트 (Lua Script) ===
+    if (candle_redis_ && candle_redis_->isConnected()) {
+        candle_redis_->updateCandle(symbol, fill_price, fill_qty, epoch_sec);
     }
 
     // === 랭킹 업데이트 (거래량/시총만 - 변동률은 Aggregator가 관리) ===
@@ -146,29 +138,12 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     bool order_fully_filled = (order->filled_qty() >= order->order_qty());
     bool matched_order_fully_filled = (matched_order->filled_qty() >= matched_order->order_qty());
     
-    // === 부분 체결 실시간 알림 (엔진 직접 전송) ===
-    // 전량 체결은 Lambda가 처리하므로 엔진에서는 부분 체결만 알림
-    if (notifier_ && (!order_fully_filled || !matched_order_fully_filled)) {
-        // 부분 체결된 주문에 대해 실시간 상태 업데이트
-        if (!order_fully_filled) {
-            std::string side = order->is_buy() ? "BUY" : "SELL";
-            std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-            notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                       order->symbol(), side, order->price(), order->order_qty(), type, 
-                                       order->filled_qty(), fill_price, "PARTIALLY_FILLED");
-            Logger::info("PARTIAL_FILL notification sent:", order->order_id());
-        }
-        
-        if (!matched_order_fully_filled) {
-            std::string side = matched_order->is_buy() ? "BUY" : "SELL";
-            std::string type = (matched_order->price() == 0) ? "MARKET" : "LIMIT";
-            notifier_->sendOrderStatus(matched_order->user_id(), matched_order->order_id(), 
-                                       matched_order->symbol(), side, matched_order->price(), matched_order->order_qty(), type, 
-                                       matched_order->filled_qty(), fill_price, "PARTIALLY_FILLED");
-            Logger::info("PARTIAL_FILL notification sent:", matched_order->order_id());
-        }
-    }
-    
+    // NOTE: 부분 체결 실시간 알림은 stock-processor에서 통합 발송 (엔진 직접 알림 제거)
+    // 이전에 여기서 PARTIALLY_FILLED WebSocket 알림을 전송했으나,
+    // stock-processor의 FillProcessor가 동일 이벤트에 대해 별도 FILL 알림을 보내
+    // 체결 1건당 알림 2개가 발생하는 문제가 있었음.
+    // 이제 모든 체결 알림은 stock-processor에서 주문 단위로 집계하여 1회 발송.
+
     // === Kinesis Fan-Out Publishing ===
     // Engine -> Kinesis -> [DB, Balance]
     // FILL 이벤트는 fills 스트림으로 발행 (부분/전량 모두)
@@ -191,16 +166,20 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         
         // 전량 체결된 주문은 ORDER_STATUS (FILLED)를 order-status 스트림으로 발행
         if (buyer_fully_filled) {
-            std::string buyer_side = order->is_buy() ? "BUY" : "SELL";
-            std::string buyer_type = (order->is_buy() ? order->price() : matched_order->price()) == 0 ? "MARKET" : "LIMIT";
-            producer_->publishOrderStatus(symbol, bo, buyer_id, "FILLED", "");
+            const auto& buyer_order = order->is_buy() ? order : matched_order;
+            std::string buyer_type = (buyer_order->price() == 0) ? "MARKET" : "LIMIT";
+            producer_->publishOrderStatus(symbol, bo, buyer_id, "FILLED", "",
+                                          buyer_order->price(), buyer_order->order_qty(),
+                                          true, buyer_type);
             Logger::info("Published FILLED status for buyer:", bo);
         }
-        
+
         if (seller_fully_filled) {
-            std::string seller_side = order->is_buy() ? "SELL" : "BUY";
-            std::string seller_type = (order->is_buy() ? matched_order->price() : order->price()) == 0 ? "MARKET" : "LIMIT";
-            producer_->publishOrderStatus(symbol, so, seller_id, "FILLED", "");
+            const auto& seller_order = order->is_buy() ? matched_order : order;
+            std::string seller_type = (seller_order->price() == 0) ? "MARKET" : "LIMIT";
+            producer_->publishOrderStatus(symbol, so, seller_id, "FILLED", "",
+                                          seller_order->price(), seller_order->order_qty(),
+                                          false, seller_type);
             Logger::info("Published FILLED status for seller:", so);
         }
     }
@@ -224,19 +203,12 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
     
-    // WebSocket 알림 전송
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   order->filled_qty(), 0, "CANCELLED");
-    }
-    
     // Kinesis로 CANCEL 이벤트 발행 (DynamoDB 업데이트를 위해)
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                      order->user_id(), "CANCELLED", "");
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
+                                      order->user_id(), "CANCELLED", "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published CANCEL event to Kinesis:", order->order_id());
     }
 }
@@ -244,19 +216,12 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
 void MarketDataHandler::on_cancel_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Cancel REJECTED:", order->order_id(), "reason:", reason);
     
-    // WebSocket 알림 전송
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   order->filled_qty(), 0, "CANCEL_REJECTED", reason);
-    }
-    
     // Kinesis로 CANCEL_REJECTED 이벤트 발행
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                      order->user_id(), "CANCEL_REJECTED", reason ? reason : "");
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
+                                      order->user_id(), "CANCEL_REJECTED", reason ? reason : "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published CANCEL_REJECTED event to Kinesis:", order->order_id());
     }
 }
@@ -267,19 +232,12 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
     Logger::info("Order REPLACED:", order->order_id(), 
                  "delta:", size_delta, "new_price:", new_price);
     
-    // WebSocket 알림 전송
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   order->filled_qty(), 0, "REPLACED");
-    }
-    
     // Kinesis로 REPLACED 이벤트 발행
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                      order->user_id(), "REPLACED", "");
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
+                                      order->user_id(), "REPLACED", "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published REPLACED event to Kinesis:", order->order_id());
     }
 }
@@ -287,19 +245,12 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
 void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* reason) {
     Logger::warn("Replace REJECTED:", order->order_id(), "reason:", reason);
     
-    // WebSocket 알림 전송
-    if (notifier_) {
-        std::string side = order->is_buy() ? "BUY" : "SELL";
-        std::string type = (order->price() == 0) ? "MARKET" : "LIMIT";
-        notifier_->sendOrderStatus(order->user_id(), order->order_id(), 
-                                   order->symbol(), side, order->price(), order->order_qty(), type, 
-                                   order->filled_qty(), 0, "REPLACE_REJECTED", reason);
-    }
-    
     // Kinesis로 REPLACE_REJECTED 이벤트 발행
     if (producer_) {
-        producer_->publishOrderStatus(order->symbol(), order->order_id(), 
-                                      order->user_id(), "REPLACE_REJECTED", reason ? reason : "");
+        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        producer_->publishOrderStatus(order->symbol(), order->order_id(),
+                                      order->user_id(), "REPLACE_REJECTED", reason ? reason : "",
+                                      order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published REPLACE_REJECTED event to Kinesis:", order->order_id());
     }
 }
@@ -360,18 +311,38 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
 
     // 현재가만 추가 (변동률 c, yc, pc는 클라이언트에서 계산)
     DayData& day = getDayData(symbol);
+
+    // Cold start: 엔진 재시작 후 첫 체결 전이면 OHLC 캐시에서 현재가 복원
+    if (day.last_price == 0 && depth_redis_ && depth_redis_->isConnected()) {
+        auto ohlc_str = depth_redis_->get("ohlc:" + symbol);
+        if (ohlc_str.has_value()) {
+            try {
+                auto ohlc = nlohmann::json::parse(ohlc_str.value());
+                day.last_price = ohlc.value("c", (uint64_t)0);
+                day.open_price = ohlc.value("o", (uint64_t)0);
+                day.high_price = ohlc.value("h", (uint64_t)0);
+                day.low_price = ohlc.value("l", (uint64_t)0);
+                day.volume = ohlc.value("v", (uint64_t)0);
+                Logger::info("DayData restored from OHLC cache:", symbol,
+                             "price:", day.last_price);
+            } catch (const std::exception& e) {
+                Logger::warn("Failed to parse OHLC cache for:", symbol, e.what());
+            }
+        }
+    }
+
     depth_json["p"] = day.last_price;
     
     // Valkey에 depth 캐시 저장 (Streaming Server가 읽어감)
-    Logger::debug("Depth cache check - redis_:", redis_ ? "exists" : "null", 
-                  "connected:", (redis_ && redis_->isConnected()) ? "yes" : "no");
-    if (redis_ && redis_->isConnected()) {
+    Logger::debug("Depth cache check - depth_redis_:", depth_redis_ ? "exists" : "null",
+                  "connected:", (depth_redis_ && depth_redis_->isConnected()) ? "yes" : "no");
+    if (depth_redis_ && depth_redis_->isConnected()) {
         std::string key = "depth:" + symbol;
         std::string json_str = depth_json.dump();
-        Logger::info("DEPTH_SAVE:", key, "=", json_str.substr(0, 200));  // 앞 200자만
-        bool saved = redis_->set(key, json_str);
+        Logger::debug("DEPTH_SAVE:", key, "=", json_str.substr(0, 200));  // 앞 200자만
+        bool saved = depth_redis_->set(key, json_str);
         if (saved) {
-            Logger::info("Depth saved OK:", key);
+            Logger::debug("Depth saved OK:", key);
         } else {
             Logger::warn("Failed to save depth to Valkey:", key);
         }
@@ -379,8 +350,11 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
         Logger::warn("Depth cache not connected, skipping save for:", symbol);
     }
     
-    // 참고: Kinesis 발행 제거됨 - Streaming Server 방식으로 전환
-    // producer_->publishDepth(symbol, depth_json);  // DEPRECATED
+    // Ticker 캐시도 갱신 (Sub 구독자에게 항시 현재 가격 제공)
+    // depth 변경 시마다 ticker를 갱신하여 체결 간격에 관계없이 가격 전송 보장
+    if (day.last_price > 0) {
+        updateTickerCache(symbol, day.last_price);
+    }
 }
 
 void MarketDataHandler::on_bbo_change(const OrderBook* book,
@@ -416,7 +390,7 @@ void MarketDataHandler::checkDayReset(const std::string& symbol) {
 }
 
 void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t price) {
-    if (!redis_ || !redis_->isConnected()) return;
+    if (!depth_redis_ || !depth_redis_->isConnected()) return;
 
     // Ticker JSON (Sub 데이터용) - 현재가만 전송, 변동률은 클라이언트 계산
     nlohmann::json ticker;
@@ -426,7 +400,7 @@ void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t pr
         std::chrono::system_clock::now().time_since_epoch()).count();
     ticker["p"] = price;
 
-    redis_->set("ticker:" + symbol, ticker.dump());
+    depth_redis_->set("ticker:" + symbol, ticker.dump());
     Logger::debug("Ticker saved:", symbol, "price:", price);
 }
 

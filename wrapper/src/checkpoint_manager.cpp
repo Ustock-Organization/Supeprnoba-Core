@@ -83,6 +83,31 @@ std::string CheckpointManager::getLastCheckpoint(const std::string& shard_id) {
     return "";
 }
 
+void CheckpointManager::clearAllCheckpoints() {
+    if (!redis_ || !redis_->isConnected()) {
+        Logger::warn("CheckpointManager: Redis not connected, cannot clear checkpoints");
+        return;
+    }
+
+    std::string pattern = "kinesis:checkpoint:" + config_.stream_name + ":*";
+    auto checkpoint_keys = redis_->keys(pattern);
+
+    int deleted = 0;
+    for (const auto& key : checkpoint_keys) {
+        if (redis_->del(key)) {
+            ++deleted;
+        }
+    }
+
+    // Clear in-memory buffer too
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        checkpoint_buffer_.clear();
+    }
+
+    Logger::info("Cleared", deleted, "checkpoint keys for stream:", config_.stream_name);
+}
+
 void CheckpointManager::flush() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
 

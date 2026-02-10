@@ -7,8 +7,7 @@
  * - COGNITO_USER_POOL_ID: Cognito User Pool ID (RS256)
  * - COGNITO_REGION: Cognito 리전 (기본: ap-northeast-2)
  * - SUPABASE_JWT_SECRET: Supabase JWT 시크릿 키 (HS256, 레거시)
- * - ADMIN_API_KEY: 관리자 API 키 (선택적)
- * - USER_CACHE_TABLE: 사용자 캐시 테이블 (기본: supernoba-user-cache)
+ * - USERS_TABLE: 사용자 캐시 테이블 (기본: supernoba-user-cache)
  */
 
 import { createHmac, createVerify } from 'crypto';
@@ -20,7 +19,7 @@ import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 const dynamodb = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' })
 );
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-user-cache';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 
 // Cognito JWKS 캐시
 let cognitoJwksCache = null;
@@ -358,62 +357,26 @@ export async function verifyAuth(event, options = {}) {
   }
 }
 
-// Lazy-loaded secrets manager for secure admin key
-let cachedAdminApiKey = null;
-let secretsManagerAvailable = null;
-
-async function getSecureAdminApiKey() {
-  // Return cached value if available
-  if (cachedAdminApiKey) return cachedAdminApiKey;
-
-  // Try to use Secrets Manager (only attempt once)
-  if (secretsManagerAvailable === null) {
-    try {
-      const { getAdminApiKey } = await import('/opt/nodejs/secretsManager.mjs');
-      cachedAdminApiKey = await getAdminApiKey();
-      secretsManagerAvailable = true;
-      return cachedAdminApiKey;
-    } catch (e) {
-      console.warn('[verifyAdmin] Secrets Manager not available, using env fallback');
-      secretsManagerAvailable = false;
-    }
-  }
-
-  // Fallback to environment variable
-  return process.env.ADMIN_API_KEY;
-}
-
 /**
- * 관리자 인증 (기존 API 키 방식과 JWT 병행)
+ * 관리자 인증 (Cognito JWT 전용)
  *
  * @param {Object} event - Lambda 이벤트 객체
- * @param {Object} options - 옵션
- * @param {boolean} options.allowApiKey - API 키 인증 허용 여부 (기본: true)
  * @returns {AuthResult} 인증 결과
  */
-export async function verifyAdmin(event, options = {}) {
-  const { allowApiKey = true } = options;
-
-  // 1. 기존 API 키 방식 확인 (하위 호환성 + Secrets Manager 지원)
-  // Authorization 헤더 또는 X-Api-Key 헤더 모두 지원
-  if (allowApiKey) {
-    const adminApiKey = await getSecureAdminApiKey();
-    const authHeader = event.headers?.Authorization || event.headers?.authorization;
-    const xApiKey = event.headers?.['X-Api-Key'] || event.headers?.['x-api-key'];
-
-    // Authorization 헤더로 API 키 전달 (기존 방식)
-    if (adminApiKey && authHeader === adminApiKey) {
-      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
-    }
-    // X-Api-Key 헤더로 API 키 전달 (Admin Console 방식)
-    if (adminApiKey && xApiKey === adminApiKey) {
-      console.log('[verifyAdmin] Admin authenticated via X-Api-Key header');
-      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
-    }
+export async function verifyAdmin(event) {
+  // JWT 인증 시도 (5초 타임아웃)
+  const authPromise = verifyAuth(event);
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('AUTH_TIMEOUT')), 5000)
+  );
+  
+  let authResult;
+  try {
+    authResult = await Promise.race([authPromise, timeoutPromise]);
+  } catch (timeoutErr) {
+    console.error('[verifyAdmin] JWT verification timeout - VPC may not have internet access');
+    return { success: false, error: 'AUTH_TIMEOUT', message: '인증 서버 연결 실패. 관리자에게 문의하세요.' };
   }
-
-  // 2. JWT 인증 시도
-  const authResult = await verifyAuth(event);
 
   if (!authResult.success) {
     return authResult;
@@ -421,11 +384,18 @@ export async function verifyAdmin(event, options = {}) {
 
   // 3. 관리자 권한 확인
   // JWT 클레임 또는 DynamoDB user-cache에서 is_admin 확인
+
+  // 부트스트랩 관리자: Cognito sub로 직접 인식 (DynamoDB 설정 전 임시)
+  const BOOTSTRAP_ADMINS = [
+    '3438cdec-f071-700b-e035-dc6fc4f68009', // njg7194@gmail.com
+  ];
+
   let isAdmin =
     authResult.role === 'admin' ||
     authResult.role === 'service_role' ||
     authResult.payload?.app_metadata?.is_admin === true ||
-    authResult.payload?.user_metadata?.is_admin === true;
+    authResult.payload?.user_metadata?.is_admin === true ||
+    BOOTSTRAP_ADMINS.includes(authResult.userId);
 
   // JWT 클레임에 admin이 없으면 DynamoDB user-cache 조회
   if (!isAdmin && authResult.userId) {
@@ -454,11 +424,11 @@ export async function verifyAdmin(event, options = {}) {
         originalUserId: authResult.userId,
         email: authResult.email,
         customXUserId: authResult.payload?.['custom:x_user_id'],
-        table: USER_CACHE_TABLE
+        table: USERS_TABLE
       });
 
       const { Item } = await dynamodb.send(new GetCommand({
-        TableName: USER_CACHE_TABLE,
+        TableName: USERS_TABLE,
         Key: { user_id: userId }
       }));
 
@@ -509,16 +479,27 @@ export async function verifySelf(event, resourceUserId) {
     return { ...authResult, userId: resourceUserId };
   }
 
-  if (authResult.userId !== resourceUserId) {
+  // X 로그인 사용자: Cognito sub(UUID)와 요청의 x_ user_id 매핑
+  let resolvedUserId = authResult.userId;
+  const xUserId = authResult.payload?.['custom:x_user_id'];
+  if (xUserId) {
+    resolvedUserId = `x_${xUserId}`;
+  } else if (authResult.email?.includes('@x.supernoba.com')) {
+    const xId = authResult.email.split('@')[0];
+    resolvedUserId = `x_${xId}`;
+  }
+
+  if (resolvedUserId !== resourceUserId) {
+    console.warn('[verifySelf] User ID mismatch:', { resolved: resolvedUserId, resource: resourceUserId, original: authResult.userId });
     return {
       success: false,
       error: 'FORBIDDEN',
       message: '자신의 리소스에만 접근할 수 있습니다',
-      userId: authResult.userId
+      userId: resolvedUserId
     };
   }
 
-  return authResult;
+  return { ...authResult, userId: resolvedUserId };
 }
 
 /**
@@ -562,12 +543,7 @@ export function createFallbackAuth(context = 'lambda') {
   console.warn(`[${context}] Auth layer not available, using fallback`);
 
   const fallbackVerify = async () => ({ success: true, userId: null, anonymous: true });
-  const fallbackAdmin = async (event) => {
-    const adminApiKey = await getSecureAdminApiKey();
-    const authHeader = event.headers?.Authorization || event.headers?.authorization;
-    if (adminApiKey && authHeader === adminApiKey) {
-      return { success: true, userId: 'admin', role: 'admin', method: 'api_key' };
-    }
+  const fallbackAdmin = async () => {
     return { success: false, error: 'UNAUTHORIZED', message: '인증이 필요합니다' };
   };
   const fallbackErrorResponse = (result, headers = {}) => ({

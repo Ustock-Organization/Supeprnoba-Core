@@ -1,12 +1,13 @@
 #include "engine_core.h"
+#include "redis_client.h"
 #include "logger.h"
 #include <mutex>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
 
-EngineCore::EngineCore(MarketDataHandler* handler)
-    : handler_(handler) {
+EngineCore::EngineCore(MarketDataHandler* handler, RedisClient* redis)
+    : handler_(handler), operating_redis_(redis) {
     // MarketDataHandler에 EngineCore 참조 설정 (완전 체결된 주문 제거용)
     if (handler_) {
         handler_->setEngineCore(this);
@@ -30,7 +31,16 @@ EngineCore::OrderBookPtr EngineCore::getOrCreateBook(const std::string& symbol) 
     if (it != books_.end()) {
         return it->second;
     }
-    
+
+    // 삭제/차단된 종목인지 Valkey에서 확인
+    if (operating_redis_ && operating_redis_->isConnected()) {
+        if (operating_redis_->sismember("deleted:symbols", symbol) ||
+            operating_redis_->sismember("blocked:symbols", symbol)) {
+            Logger::warn("Blocked symbol, refusing to create OrderBook:", symbol);
+            return nullptr;
+        }
+    }
+
     auto book = std::make_shared<OrderBook>();
     book->set_symbol(symbol);
     
@@ -55,6 +65,16 @@ bool EngineCore::addOrder(OrderPtr order) {
 
         auto book = getOrCreateBook(symbol);
 
+        if (!book) {
+            lock.unlock();
+            // REJECTED 콜백 발행 (on_reject은 Kinesis로 REJECTED 이벤트 전송)
+            if (handler_) {
+                handler_->on_reject(order, "Symbol is blocked or deleted");
+            }
+            Logger::warn("Order rejected (blocked/deleted symbol):", order_id, symbol);
+            return false;
+        }
+
         // 주문 맵에 저장
         order_maps_[symbol][order_id] = order;
 
@@ -65,7 +85,7 @@ bool EngineCore::addOrder(OrderPtr order) {
         ++total_orders_processed_;
     }
 
-    Logger::info("Order added:", order_id, symbol);
+    Logger::debug("Order added:", order_id, symbol);
     return true;
 }
 
@@ -120,6 +140,51 @@ bool EngineCore::replaceOrder(const std::string& symbol,
     return true;
 }
 
+CancelAllResult EngineCore::cancelAllOrders(const std::string& symbol) {
+    CancelAllResult result{0, {}};
+
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+    auto book_it = books_.find(symbol);
+    if (book_it == books_.end()) {
+        Logger::warn("cancelAllOrders: no orderbook for", symbol);
+        return result;
+    }
+
+    auto map_it = order_maps_.find(symbol);
+    if (map_it == order_maps_.end()) {
+        return result;
+    }
+
+    // 주문 ID 목록을 먼저 수집 (iteration 중 erase 방지)
+    std::vector<std::pair<std::string, OrderPtr>> orders_to_cancel;
+    for (const auto& [id, order] : map_it->second) {
+        if (order->open_qty() > 0) {
+            orders_to_cancel.push_back({id, order});
+        }
+    }
+
+    // 각 주문에 대해 cancel + perform_callbacks 호출
+    for (const auto& [id, order] : orders_to_cancel) {
+        try {
+            book_it->second->cancel(order);
+            book_it->second->perform_callbacks();
+            // on_cancel 콜백이 Kinesis CANCELLED 이벤트 발행
+            // stock-processor가 DynamoDB 업데이트 + locked 해제
+            map_it->second.erase(id);
+            result.cancelled_count++;
+        } catch (const std::exception& e) {
+            Logger::error("cancelAllOrders failed for", id, ":", e.what());
+            result.failed_order_ids.push_back(id);
+        }
+    }
+
+    Logger::info("cancelAllOrders:", symbol,
+                 "cancelled:", result.cancelled_count,
+                 "failed:", result.failed_order_ids.size());
+    return result;
+}
+
 void EngineCore::removeFilledOrder(const std::string& symbol,
                                     const std::string& order_id) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
@@ -172,6 +237,7 @@ std::string EngineCore::snapshotOrderBook(const std::string& symbol) {
 bool EngineCore::restoreOrderBook(const std::string& symbol,
                                    const std::string& data) {
     size_t total = 0;
+    size_t mm_skipped = 0;
 
     try {
         auto snapshot = nlohmann::json::parse(data);
@@ -192,6 +258,7 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
             const auto& orders = snapshot["orders"];
             total = orders.size();
             size_t count = 0;
+            size_t restored = 0;
 
             // 프로그레스 바 표시
             std::cout << "\r  Restoring " << symbol << ": [";
@@ -200,28 +267,44 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
             // 주문 복원 (리스너 없이 조용히)
             for (const auto& j : orders) {
                 auto order = Order::fromJson(j);
+
+                // MM(마켓메이커) 주문은 복원하지 않음 — 고아 주문 누적 방지
+                const std::string& uid = order->user_id();
+                if (uid.find("mm-") == 0 || uid.find("mm_") == 0 ||
+                    uid == "mm-bid" || uid == "mm-ask" ||
+                    uid == "mm-kinesis-direct-buy" || uid == "mm-kinesis-direct-sell") {
+                    ++mm_skipped;
+                    ++count;
+                    continue;
+                }
+
                 order_maps_[symbol][order->order_id()] = order;
                 book->add(order);
+                ++restored;
 
-                // 프로그레스 업데이트 (10% 단위)
+                // 프로그레스 업데이트
                 ++count;
-                int progress = (count * 50) / total;  // 50칸 기준
-                static int last_progress = -1;
-                if (progress != last_progress) {
-                    std::cout << "\r  Restoring " << symbol << ": [";
-                    for (int i = 0; i < 50; ++i) {
-                        if (i < progress) std::cout << "█";
-                        else std::cout << "░";
+                if (total > 0) {
+                    int progress = (count * 50) / total;
+                    static int last_progress = -1;
+                    if (progress != last_progress) {
+                        std::cout << "\r  Restoring " << symbol << ": [";
+                        for (int i = 0; i < 50; ++i) {
+                            if (i < progress) std::cout << "█";
+                            else std::cout << "░";
+                        }
+                        std::cout << "] " << count << "/" << total;
+                        std::cout.flush();
+                        last_progress = progress;
                     }
-                    std::cout << "] " << count << "/" << total;
-                    std::cout.flush();
-                    last_progress = progress;
                 }
             }
 
             std::cout << "\r  Restoring " << symbol << ": [";
             for (int i = 0; i < 50; ++i) std::cout << "█";
-            std::cout << "] " << total << "/" << total << " ✓" << std::endl;
+            std::cout << "] " << restored << "/" << total
+                      << (mm_skipped > 0 ? " (MM skipped: " + std::to_string(mm_skipped) + ")" : "")
+                      << " ✓" << std::endl;
 
             // 리스너 등록 (복원 완료 후)
             book->set_order_listener(handler_);
@@ -229,7 +312,8 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
             book->set_bbo_listener(handler_);
         }
 
-        Logger::info("OrderBook restored:", symbol, "orders:", total);
+        Logger::info("OrderBook restored:", symbol, "orders:", total - mm_skipped,
+                     "mm_skipped:", mm_skipped);
         return true;
     } catch (const std::exception& e) {
         Logger::error("Failed to restore orderbook:", e.what());

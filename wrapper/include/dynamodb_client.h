@@ -30,22 +30,23 @@ public:
     bool initialize();
 
     /**
-     * ACCEPTED 상태의 모든 주문을 로드
+     * 활성 주문을 로드 (ACCEPTED + PARTIAL_FILL)
+     * PARTIAL_FILL 주문은 잔여 수량(quantity - filled_qty)으로 복원됩니다.
      * MM(마켓메이커) 주문은 제외합니다.
      *
      * @param table_name DynamoDB 테이블 이름
      * @return 주문 목록 (심볼별로 정렬됨)
      */
-    std::vector<OrderPtr> loadAcceptedOrders(const std::string& table_name = "supernoba-orders");
+    std::vector<OrderPtr> loadActiveOrders(const std::string& table_name = "supernoba-orders");
 
     /**
-     * 특정 심볼의 ACCEPTED 주문만 로드
+     * 특정 심볼의 활성 주문 로드 (ACCEPTED + PARTIAL_FILL)
      *
      * @param symbol 심볼명
      * @param table_name DynamoDB 테이블 이름
      * @return 주문 목록
      */
-    std::vector<OrderPtr> loadAcceptedOrdersBySymbol(
+    std::vector<OrderPtr> loadActiveOrdersBySymbol(
         const std::string& symbol,
         const std::string& table_name = "supernoba-orders");
 

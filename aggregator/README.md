@@ -54,8 +54,12 @@ cd aggregator
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| VALKEY_HOST | supernoba-depth-cache... | Valkey 호스트 |
-| VALKEY_PORT | 6379 | Valkey 포트 |
+| DEPTH_CACHE_HOST | 127.0.0.1 | Depth Cache 호스트 (시세, 전일종가) |
+| DEPTH_CACHE_PORT | 6379 | Depth Cache 포트 |
+| CANDLE_CACHE_HOST | 127.0.0.1 | Candle Cache 호스트 (1분봉) |
+| CANDLE_CACHE_PORT | 6380 | Candle Cache 포트 |
+| BACKUP_CACHE_HOST | 127.0.0.1 | Backup Cache 호스트 (랭킹) |
+| BACKUP_CACHE_PORT | 6381 | Backup Cache 포트 |
 | AWS_REGION | ap-northeast-2 | AWS 리전 |
 | DYNAMODB_CANDLE_TABLE | candle_history | DynamoDB 테이블 |
 | POLL_INTERVAL_MS | 100 | 폴링 간격 (ms) |

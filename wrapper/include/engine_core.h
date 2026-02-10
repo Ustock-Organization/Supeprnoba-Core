@@ -10,19 +10,27 @@
 
 namespace aws_wrapper {
 
+class RedisClient;  // forward declaration
+
+struct CancelAllResult {
+    int cancelled_count;
+    std::vector<std::string> failed_order_ids;
+};
+
 class EngineCore {
 public:
     // Depth levels: 10 bid + 10 ask
     using OrderBook = liquibook::book::DepthOrderBook<OrderPtr, 10>;
     using OrderBookPtr = std::shared_ptr<OrderBook>;
-    
-    explicit EngineCore(MarketDataHandler* handler);
-    
+
+    explicit EngineCore(MarketDataHandler* handler, RedisClient* redis = nullptr);
+
     // === 주문 API ===
     bool addOrder(OrderPtr order);
     bool cancelOrder(const std::string& symbol, const std::string& order_id);
     bool replaceOrder(const std::string& symbol, const std::string& order_id,
                       int64_t qty_delta, liquibook::book::Price new_price);
+    CancelAllResult cancelAllOrders(const std::string& symbol);
 
     // 완전 체결된 주문을 order_maps_에서 제거 (메모리 누수 방지)
     void removeFilledOrder(const std::string& symbol, const std::string& order_id);
@@ -55,7 +63,8 @@ private:
     std::map<std::string, std::map<std::string, OrderPtr>> order_maps_;
     mutable std::shared_mutex rw_mutex_;  // shared_mutex for read-write locking
     MarketDataHandler* handler_;
-    
+    RedisClient* operating_redis_ = nullptr;
+
     uint64_t total_orders_processed_ = 0;
     uint64_t total_trades_executed_ = 0;
 };

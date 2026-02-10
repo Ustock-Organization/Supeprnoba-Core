@@ -41,7 +41,7 @@ bool DynamoDBClient::initialize() {
     }
 }
 
-std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& table_name) {
+std::vector<OrderPtr> DynamoDBClient::loadActiveOrders(const std::string& table_name) {
     std::vector<OrderPtr> orders;
 
     if (!initialized_) {
@@ -53,13 +53,17 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& tabl
         Aws::DynamoDB::Model::ScanRequest request;
         request.SetTableName(table_name);
 
-        // status = 'ACCEPTED' 필터
-        request.SetFilterExpression("#s = :status");
+        // status IN ('ACCEPTED', 'PARTIAL_FILL') 필터
+        request.SetFilterExpression("#s = :accepted OR #s = :partial_fill");
         request.AddExpressionAttributeNames("#s", "status");
 
-        Aws::DynamoDB::Model::AttributeValue statusVal;
-        statusVal.SetS("ACCEPTED");
-        request.AddExpressionAttributeValues(":status", statusVal);
+        Aws::DynamoDB::Model::AttributeValue acceptedVal;
+        acceptedVal.SetS("ACCEPTED");
+        request.AddExpressionAttributeValues(":accepted", acceptedVal);
+
+        Aws::DynamoDB::Model::AttributeValue partialFillVal;
+        partialFillVal.SetS("PARTIAL_FILL");
+        request.AddExpressionAttributeValues(":partial_fill", partialFillVal);
 
         // 필요한 속성만 가져오기 (프로젝션)
         request.SetProjectionExpression(
@@ -68,7 +72,8 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& tabl
 
         std::string last_key;
         int total_scanned = 0;
-        int total_loaded = 0;
+        int total_accepted = 0;
+        int total_partial = 0;
 
         do {
             auto outcome = impl_->client->Scan(request);
@@ -129,17 +134,47 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& tabl
                     order->setPrice(static_cast<uint64_t>(std::stoull(it->second.GetN())));
                 }
 
-                // quantity
+                // quantity 및 filled_qty 파싱
+                uint64_t quantity = 0;
+                uint64_t filled_qty = 0;
+
                 it = item.find("quantity");
                 if (it != item.end()) {
-                    order->setOrderQty(static_cast<uint64_t>(std::stoull(it->second.GetN())));
+                    quantity = static_cast<uint64_t>(std::stoull(it->second.GetN()));
+                }
+
+                it = item.find("filled_qty");
+                if (it != item.end()) {
+                    filled_qty = static_cast<uint64_t>(std::stoull(it->second.GetN()));
+                }
+
+                // status 확인 - PARTIAL_FILL이면 잔여 수량으로 복원
+                std::string status;
+                it = item.find("status");
+                if (it != item.end()) {
+                    status = it->second.GetS();
+                }
+
+                if (status == "PARTIAL_FILL") {
+                    uint64_t remaining = quantity - filled_qty;
+                    if (remaining == 0) {
+                        Logger::warn("PARTIAL_FILL order has 0 remaining qty, skipping:",
+                                    order->order_id());
+                        continue;
+                    }
+                    order->setOrderQty(remaining);
+                    ++total_partial;
+                    Logger::info("PARTIAL_FILL order loaded:", order->order_id(),
+                                "original_qty:", quantity, "filled:", filled_qty,
+                                "remaining:", remaining);
+                } else {
+                    order->setOrderQty(quantity);
+                    ++total_accepted;
                 }
 
                 // created_at을 timestamp로 변환 (선택적)
                 it = item.find("created_at");
                 if (it != item.end()) {
-                    // ISO 8601 형식의 문자열을 epoch으로 변환하는 것은 복잡하므로
-                    // 현재 시간을 사용
                     auto now = std::chrono::system_clock::now();
                     auto epoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         now.time_since_epoch()).count();
@@ -147,7 +182,6 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& tabl
                 }
 
                 orders.push_back(order);
-                ++total_loaded;
             }
 
             // 페이지네이션 처리
@@ -159,16 +193,17 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrders(const std::string& tabl
         } while (true);
 
         Logger::info("DynamoDB scan complete: scanned=", total_scanned,
-                    ", loaded=", total_loaded, " ACCEPTED orders (MM excluded)");
+                    ", accepted=", total_accepted, ", partial_fill=", total_partial,
+                    " active orders loaded (MM excluded)");
 
     } catch (const std::exception& e) {
-        Logger::error("DynamoDB loadAcceptedOrders failed:", e.what());
+        Logger::error("DynamoDB loadActiveOrders failed:", e.what());
     }
 
     return orders;
 }
 
-std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrdersBySymbol(
+std::vector<OrderPtr> DynamoDBClient::loadActiveOrdersBySymbol(
     const std::string& symbol,
     const std::string& table_name) {
 
@@ -179,23 +214,25 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrdersBySymbol(
         return orders;
     }
 
-    // GSI가 없으면 Scan + Filter 사용
-    // 성능상 이슈가 있다면 symbol-status-index GSI 추가 권장
     try {
         Aws::DynamoDB::Model::ScanRequest request;
         request.SetTableName(table_name);
 
-        // symbol = :sym AND status = 'ACCEPTED'
-        request.SetFilterExpression("symbol = :sym AND #s = :status");
+        // symbol = :sym AND (status = 'ACCEPTED' OR status = 'PARTIAL_FILL')
+        request.SetFilterExpression("symbol = :sym AND (#s = :accepted OR #s = :partial_fill)");
         request.AddExpressionAttributeNames("#s", "status");
 
         Aws::DynamoDB::Model::AttributeValue symbolVal;
         symbolVal.SetS(symbol);
         request.AddExpressionAttributeValues(":sym", symbolVal);
 
-        Aws::DynamoDB::Model::AttributeValue statusVal;
-        statusVal.SetS("ACCEPTED");
-        request.AddExpressionAttributeValues(":status", statusVal);
+        Aws::DynamoDB::Model::AttributeValue acceptedVal;
+        acceptedVal.SetS("ACCEPTED");
+        request.AddExpressionAttributeValues(":accepted", acceptedVal);
+
+        Aws::DynamoDB::Model::AttributeValue partialFillVal;
+        partialFillVal.SetS("PARTIAL_FILL");
+        request.AddExpressionAttributeValues(":partial_fill", partialFillVal);
 
         request.SetProjectionExpression(
             "order_id, user_id, symbol, side, price, quantity, filled_qty, #s"
@@ -241,9 +278,33 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrdersBySymbol(
                     order->setPrice(static_cast<uint64_t>(std::stoull(it->second.GetN())));
                 }
 
+                // quantity 및 filled_qty 파싱
+                uint64_t quantity = 0;
+                uint64_t filled_qty = 0;
+
                 it = item.find("quantity");
                 if (it != item.end()) {
-                    order->setOrderQty(static_cast<uint64_t>(std::stoull(it->second.GetN())));
+                    quantity = static_cast<uint64_t>(std::stoull(it->second.GetN()));
+                }
+
+                it = item.find("filled_qty");
+                if (it != item.end()) {
+                    filled_qty = static_cast<uint64_t>(std::stoull(it->second.GetN()));
+                }
+
+                // PARTIAL_FILL이면 잔여 수량으로 복원
+                std::string status;
+                it = item.find("status");
+                if (it != item.end()) {
+                    status = it->second.GetS();
+                }
+
+                if (status == "PARTIAL_FILL") {
+                    uint64_t remaining = quantity - filled_qty;
+                    if (remaining == 0) continue;
+                    order->setOrderQty(remaining);
+                } else {
+                    order->setOrderQty(quantity);
                 }
 
                 auto now = std::chrono::system_clock::now();
@@ -260,10 +321,10 @@ std::vector<OrderPtr> DynamoDBClient::loadAcceptedOrdersBySymbol(
 
         } while (true);
 
-        Logger::info("Loaded", orders.size(), "ACCEPTED orders for symbol:", symbol);
+        Logger::info("Loaded", orders.size(), "active orders for symbol:", symbol);
 
     } catch (const std::exception& e) {
-        Logger::error("DynamoDB loadAcceptedOrdersBySymbol failed:", e.what());
+        Logger::error("DynamoDB loadActiveOrdersBySymbol failed:", e.what());
     }
 
     return orders;

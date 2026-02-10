@@ -2,25 +2,29 @@
 # ============================================================================
 # 상장폐지 통합 스크립트
 # 사용법: ./delist-symbol.sh <SYMBOL>
+#         ./delist-symbol.sh --dry-run <SYMBOL>
 #
 # 올바른 삭제 순서:
 # 1. Snapshot 삭제 (복원 방지)
 # 2. 엔진 재시작 (메모리 OrderBook 제거)
-# 3. Valkey 캐시 삭제
+# 3. Valkey 4-Cache 키 삭제
 # 4. RDS 데이터 삭제
 # 5. DynamoDB 데이터 삭제
 # ============================================================================
 
 set -e
 
-SYMBOL="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # 환경 변수 로드
 source "$SCRIPT_DIR/env/common.env" 2>/dev/null || true
 
-# Valkey 호스트 (기본값)
-BACKUP_CACHE_HOST="${BACKUP_CACHE_HOST:-master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com}"
+# 4-Cache 아키텍처 (localhost)
+VALKEY_HOST="${VALKEY_HOST:-127.0.0.1}"
+DEPTH_PORT="${DEPTH_CACHE_PORT:-6379}"
+CANDLE_PORT="${CANDLE_CACHE_PORT:-6380}"
+BACKUP_PORT="${BACKUP_CACHE_PORT:-6381}"
+OPERATING_PORT="${OPERATING_CACHE_PORT:-6382}"
 AWS_REGION="${AWS_REGION:-ap-northeast-2}"
 
 # 색상 정의
@@ -35,29 +39,104 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# 인자 파싱
+DRY_RUN=false
+SYMBOL=""
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        -*) log_error "Unknown option: $arg"; exit 1 ;;
+        *) SYMBOL="$arg" ;;
+    esac
+done
+
 # 사용법
 if [ -z "$SYMBOL" ]; then
-    echo "Usage: $0 <SYMBOL>"
+    echo "Usage: $0 [--dry-run] <SYMBOL>"
     echo "Example: $0 TEST001"
+    echo "         $0 --dry-run TEST001"
     exit 1
 fi
 
 echo ""
 echo "=============================================="
 echo "  Delisting: $SYMBOL"
+if $DRY_RUN; then
+    echo "  Mode: DRY-RUN (no changes will be made)"
+fi
+echo "  Valkey: $VALKEY_HOST (depth=$DEPTH_PORT candle=$CANDLE_PORT backup=$BACKUP_PORT operating=$OPERATING_PORT)"
 echo "=============================================="
 echo ""
 
-# 확인
+# dry-run: 4개 포트별 삭제 대상 키 표시
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Keys to delete:"
+    echo ""
+
+    log_info "Depth Cache ($VALKEY_HOST:$DEPTH_PORT):"
+    for key in "depth:$SYMBOL" "ticker:$SYMBOL" "ohlc:$SYMBOL" "prev:$SYMBOL"; do
+        exists=$(redis-cli -h "$VALKEY_HOST" -p "$DEPTH_PORT" EXISTS "$key" 2>/dev/null)
+        if [ "$exists" = "1" ]; then
+            echo "  DEL $key"
+        fi
+    done
+
+    echo ""
+    log_info "Candle Cache ($VALKEY_HOST:$CANDLE_PORT):"
+    candle_keys=$(redis-cli -h "$VALKEY_HOST" -p "$CANDLE_PORT" KEYS "candle:*:$SYMBOL" 2>/dev/null)
+    if [ -n "$candle_keys" ]; then
+        while IFS= read -r key; do
+            [ -n "$key" ] && echo "  DEL $key"
+        done <<< "$candle_keys"
+    fi
+
+    echo ""
+    log_info "Backup Cache ($VALKEY_HOST:$BACKUP_PORT):"
+    for key in "snapshot:$SYMBOL" "snapshot:$SYMBOL:timestamp"; do
+        exists=$(redis-cli -h "$VALKEY_HOST" -p "$BACKUP_PORT" EXISTS "$key" 2>/dev/null)
+        if [ "$exists" = "1" ]; then
+            echo "  DEL $key"
+        fi
+    done
+    echo "  ZREM ranking:marketcap $SYMBOL"
+    echo "  ZREM ranking:volume $SYMBOL"
+    echo "  ZREM ranking:gainers $SYMBOL"
+    echo "  ZREM ranking:losers $SYMBOL"
+
+    echo ""
+    log_info "Operating Cache ($VALKEY_HOST:$OPERATING_PORT):"
+    sym_keys=$(redis-cli -h "$VALKEY_HOST" -p "$OPERATING_PORT" KEYS "symbol:$SYMBOL:*" 2>/dev/null)
+    if [ -n "$sym_keys" ]; then
+        while IFS= read -r key; do
+            [ -n "$key" ] && echo "  DEL $key"
+        done <<< "$sym_keys"
+    fi
+    for key in "mm:config:$SYMBOL" "mm:price:$SYMBOL" "mm:orderCount:$SYMBOL" "mm:started_at:$SYMBOL"; do
+        exists=$(redis-cli -h "$VALKEY_HOST" -p "$OPERATING_PORT" EXISTS "$key" 2>/dev/null)
+        if [ "$exists" = "1" ]; then
+            echo "  DEL $key"
+        fi
+    done
+    echo "  SREM active:symbols $SYMBOL"
+    echo "  SREM subscribed:symbols $SYMBOL"
+    echo "  SREM mm:running:symbols $SYMBOL"
+    echo "  SADD deleted:symbols $SYMBOL"
+
+    echo ""
+    log_info "[DRY-RUN] No changes were made."
+    exit 0
+fi
+
+# 실행 확인
 read -p "Are you sure you want to delist $SYMBOL? (y/N): " confirm
 if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     log_warn "Aborted by user"
     exit 0
 fi
 
-# 1. Snapshot 삭제 (복원 방지) - 가장 먼저!
+# 1. Snapshot 삭제 (복원 방지) - 가장 먼저! — Backup Cache (6381)
 log_info "[1/5] Deleting Valkey snapshot (prevents restore on engine restart)..."
-redis-cli -h "$BACKUP_CACHE_HOST" --tls \
+redis-cli -h "$VALKEY_HOST" -p "$BACKUP_PORT" \
     DEL "snapshot:$SYMBOL" "snapshot:$SYMBOL:timestamp" 2>/dev/null || {
     log_warn "Failed to delete snapshot (may not exist)"
 }
@@ -72,16 +151,18 @@ else
     log_warn "supernoba-ctl.sh not found, skipping engine restart"
 fi
 
-# 3. Valkey 캐시 삭제
-log_info "[3/5] Deleting Valkey cache..."
-redis-cli -h "$BACKUP_CACHE_HOST" --tls << EOF
-DEL ticker:$SYMBOL
-DEL depth:$SYMBOL
-DEL ohlc:$SYMBOL
-DEL symbol:$SYMBOL:listingPrice
-DEL symbol:$SYMBOL:main
-DEL symbol:$SYMBOL:subscribers
-DEL symbol:$SYMBOL:sub
+# 3. Valkey 4-Cache 키 삭제
+log_info "[3/5] Deleting Valkey 4-Cache keys..."
+
+# 3a. Depth Cache (6379)
+log_info "  Depth Cache ($VALKEY_HOST:$DEPTH_PORT)..."
+redis-cli -h "$VALKEY_HOST" -p "$DEPTH_PORT" DEL \
+    "depth:$SYMBOL" "ticker:$SYMBOL" "ohlc:$SYMBOL" "prev:$SYMBOL" \
+    2>/dev/null || true
+
+# 3b. Candle Cache (6380)
+log_info "  Candle Cache ($VALKEY_HOST:$CANDLE_PORT)..."
+redis-cli -h "$VALKEY_HOST" -p "$CANDLE_PORT" << EOF
 DEL candle:1m:$SYMBOL
 DEL candle:3m:$SYMBOL
 DEL candle:5m:$SYMBOL
@@ -92,19 +173,36 @@ DEL candle:4h:$SYMBOL
 DEL candle:1d:$SYMBOL
 DEL candle:1w:$SYMBOL
 DEL candle:closed:1m:$SYMBOL
+EOF
+
+# 3c. Backup Cache (6381) — ranking ZREM
+log_info "  Backup Cache ($VALKEY_HOST:$BACKUP_PORT)..."
+redis-cli -h "$VALKEY_HOST" -p "$BACKUP_PORT" << EOF
+DEL ranking:$SYMBOL
+ZREM ranking:marketcap $SYMBOL
+ZREM ranking:volume $SYMBOL
+ZREM ranking:gainers $SYMBOL
+ZREM ranking:losers $SYMBOL
+EOF
+
+# 3d. Operating Cache (6382)
+log_info "  Operating Cache ($VALKEY_HOST:$OPERATING_PORT)..."
+redis-cli -h "$VALKEY_HOST" -p "$OPERATING_PORT" << EOF
+DEL symbol:$SYMBOL:listingPrice
+DEL symbol:$SYMBOL:main
+DEL symbol:$SYMBOL:subscribers
+DEL symbol:$SYMBOL:sub
 DEL mm:config:$SYMBOL
 DEL mm:price:$SYMBOL
 DEL mm:orderCount:$SYMBOL
 DEL mm:started_at:$SYMBOL
-DEL prev:$SYMBOL
-DEL ranking:$SYMBOL
 SREM active:symbols $SYMBOL
 SREM subscribed:symbols $SYMBOL
 SREM mm:running:symbols $SYMBOL
 SADD deleted:symbols $SYMBOL
 EOF
 
-log_success "Valkey cache deleted"
+log_success "Valkey 4-Cache keys deleted"
 
 # 4. RDS 삭제
 log_info "[4/5] Deleting RDS data..."
@@ -183,12 +281,19 @@ echo "  Delisting complete for: $SYMBOL"
 echo "=============================================="
 echo ""
 
-# 삭제 확인
-log_info "Verifying deletion..."
-remaining=$(redis-cli -h "$BACKUP_CACHE_HOST" --tls KEYS "*$SYMBOL*" 2>/dev/null | grep -v "deleted:symbols" || true)
+# 삭제 확인 — 4개 캐시 모두 검색
+log_info "Verifying deletion across 4 caches..."
+remaining=""
+for port in $DEPTH_PORT $CANDLE_PORT $BACKUP_PORT $OPERATING_PORT; do
+    keys=$(redis-cli -h "$VALKEY_HOST" -p "$port" KEYS "*$SYMBOL*" 2>/dev/null | grep -v "deleted:symbols" || true)
+    if [ -n "$keys" ]; then
+        remaining="${remaining}Port $port:\n${keys}\n"
+    fi
+done
+
 if [ -n "$remaining" ]; then
     log_warn "Some keys still exist:"
-    echo "$remaining"
+    echo -e "$remaining"
 else
-    log_success "All Valkey keys deleted (except deleted:symbols)"
+    log_success "All Valkey keys deleted across 4 caches (except deleted:symbols)"
 fi

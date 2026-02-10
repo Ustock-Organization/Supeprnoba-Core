@@ -1,19 +1,21 @@
 /**
  * Supernoba Valkey/Redis Client Layer
  *
- * 11개 Lambda 함수의 Redis 설정을 통합 관리
+ * Lambda 함수의 Redis 설정을 통합 관리 (4개 캐시 아키텍처)
  *
  * 환경변수:
  * - VALKEY_HOST: 기본 Redis 호스트
  * - VALKEY_PORT: Redis 포트 (기본: 6379)
  * - VALKEY_TLS: TLS 사용 여부 ('true' | 'false')
- * - DEPTH_CACHE_HOST: Depth Cache 전용 호스트 (선택)
- * - BACKUP_CACHE_HOST: Backup Cache 전용 호스트 (선택)
+ * - DEPTH_CACHE_HOST: Depth Cache 전용 호스트 (depth:*, ticker:*)
+ * - BACKUP_CACHE_HOST: Backup Cache 전용 호스트 (snapshot:*, checkpoint:*)
+ * - OPERATING_CACHE_HOST: Operating Cache 전용 호스트 (ws:*, mm:*, rankings:*)
+ * - CANDLE_CACHE_HOST: Candle Cache 전용 호스트 (candle:*, supernoba:trades)
  */
 
 import Redis from 'ioredis';
 
-// 캐시 타입별 호스트 설정
+// 캐시 타입별 호스트 설정 (4개 캐시 아키텍처)
 const CACHE_CONFIGS = {
   depth: {
     getHost: () => process.env.DEPTH_CACHE_HOST || process.env.VALKEY_HOST,
@@ -22,6 +24,14 @@ const CACHE_CONFIGS = {
   backup: {
     getHost: () => process.env.BACKUP_CACHE_HOST || process.env.VALKEY_HOST,
     name: 'backup-cache',
+  },
+  operating: {
+    getHost: () => process.env.OPERATING_CACHE_HOST || process.env.VALKEY_HOST,
+    name: 'operating-cache',
+  },
+  candle: {
+    getHost: () => process.env.CANDLE_CACHE_HOST || process.env.VALKEY_HOST,
+    name: 'candle-cache',
   },
   default: {
     getHost: () => process.env.VALKEY_HOST,
@@ -64,7 +74,7 @@ const instances = new Map();
  * Valkey/Redis 클라이언트 생성 또는 기존 인스턴스 반환
  *
  * @param {Object} options - 클라이언트 옵션
- * @param {string} [options.type='default'] - 캐시 타입 ('depth' | 'backup' | 'default')
+ * @param {string} [options.type='default'] - 캐시 타입 ('depth' | 'backup' | 'operating' | 'candle' | 'default')
  * @param {string} [options.preset='default'] - 연결 프리셋 ('websocket' | 'admin' | 'default')
  * @param {Object} [options.overrides={}] - 추가 Redis 옵션 (프리셋 덮어쓰기)
  * @returns {Redis} Redis 클라이언트 인스턴스
@@ -98,9 +108,17 @@ export function getValkeyClient(options = {}) {
   const presetOptions = CONNECTION_PRESETS[preset] || CONNECTION_PRESETS.default;
   const tls = process.env.VALKEY_TLS === 'true' ? {} : undefined;
 
+  // 캐시 타입별 포트 매핑 (EC2 4-Cache 아키텍처)
+  const CACHE_PORTS = {
+    depth: parseInt(process.env.DEPTH_CACHE_PORT || '6379', 10),
+    backup: parseInt(process.env.BACKUP_CACHE_PORT || '6381', 10),
+    operating: parseInt(process.env.OPERATING_CACHE_PORT || '6382', 10),
+    candle: parseInt(process.env.CANDLE_CACHE_PORT || '6380', 10),
+  };
+
   const client = new Redis({
     host,
-    port: parseInt(process.env.VALKEY_PORT || '6379', 10),
+    port: CACHE_PORTS[type] || parseInt(process.env.VALKEY_PORT || '6379', 10),
     tls,
     ...presetOptions,
     ...overrides,

@@ -37,7 +37,7 @@ public:
     /**
      * @param backup_redis 백업용 Valkey 클라이언트
      */
-    explicit RankingManager(RedisClient* backup_redis);
+    explicit RankingManager(RedisClient* write_redis, RedisClient* read_redis);
     ~RankingManager();
 
     // 복사/이동 금지 (스레드 소유)
@@ -82,7 +82,8 @@ public:
     void computeAndBroadcastSnapshot();
 
 private:
-    RedisClient* backup_redis_;
+    RedisClient* write_redis_;  // main thread (on_fill → zadd/zincrby)
+    RedisClient* read_redis_;   // bg thread (zrevrange/setEx/publish/del)
 
     // 총 발행 주식 수 캐시 (symbol -> totalShares)
     mutable std::mutex shares_mutex_;
@@ -92,6 +93,9 @@ private:
     std::atomic<bool> running_{false};
     std::thread snapshot_thread_;
 
+    // 일일 거래량 리셋 추적 (KST 기준 YYYYMMDD)
+    int last_volume_reset_kst_day_ = 0;
+
     // 스냅샷 생성 루프
     void snapshotLoop();
 
@@ -100,6 +104,12 @@ private:
 
     // ISO 8601 타임스탬프 생성
     std::string getCurrentISOTime() const;
+
+    // KST 기준 현재 날짜 (YYYYMMDD)
+    int getCurrentKSTDay() const;
+
+    // 일일 거래량 리셋 (KST 자정)
+    void resetDailyVolumeIfNeeded();
 };
 
 } // namespace aws_wrapper

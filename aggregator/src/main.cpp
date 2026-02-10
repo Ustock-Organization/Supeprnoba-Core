@@ -30,9 +30,20 @@ int64_t align_epoch_to_timeframe(int64_t epoch, int seconds) {
     return (epoch / seconds) * seconds;
 }
 
+// KST 오프셋 (UTC+9)
+static const int64_t KST_OFFSET = 9 * 3600;
+
+// UTC epoch → 해당 주 월요일 00:00 KST (UTC epoch 반환)
+static int64_t get_monday_kst(int64_t utc_epoch) {
+    const int SECONDS_1D = 86400;
+    int64_t kst_days = (utc_epoch + KST_OFFSET) / SECONDS_1D;
+    int kst_dow = (kst_days + 4) % 7;  // 0=일, 1=월, ..., 6=토
+    int days_since_monday = (kst_dow == 0) ? 6 : (kst_dow - 1);
+    return (kst_days - days_since_monday) * SECONDS_1D - KST_OFFSET;
+}
+
 // [Phase 3] YYYYMMDDHHmm 형식으로 변환 (KST 기준)
 std::string epoch_to_ymdhm(int64_t epoch) {
-    const int64_t KST_OFFSET = 9 * 3600;  // UTC+9
     time_t kst_time = static_cast<time_t>(epoch + KST_OFFSET);
     struct tm* tm = gmtime(&kst_time);
 
@@ -45,7 +56,6 @@ std::string epoch_to_ymdhm(int64_t epoch) {
 
 // epoch → YYYY-MM-DD 문자열 변환 (KST 기준, RDS용)
 std::string epoch_to_date(int64_t epoch) {
-    const int64_t KST_OFFSET = 9 * 3600;  // UTC+9
     time_t kst_time = static_cast<time_t>(epoch + KST_OFFSET);
     struct tm* tm = gmtime(&kst_time);
 
@@ -57,6 +67,7 @@ std::string epoch_to_date(int64_t epoch) {
 
 // [Phase 3] 계층적 집계 수행 (4h, 1d, 1w)
 // source_interval에서 데이터를 읽어 target_interval로 집계
+// replace=true: progressive 재집계 시 전체 덮어쓰기 (volume 이중 계산 방지)
 void aggregate_higher_timeframe(
     RdsClient& rds,
     Aggregator& agg,
@@ -64,7 +75,8 @@ void aggregate_higher_timeframe(
     const std::string& source_interval,
     const std::string& target_interval,
     int target_seconds,
-    int64_t target_epoch) {
+    int64_t target_epoch,
+    bool replace = false) {
 
     int64_t start_epoch = target_epoch - target_seconds;
     int64_t end_epoch = target_epoch;
@@ -88,10 +100,15 @@ void aggregate_higher_timeframe(
         return;
     }
 
-    // 저장
-    if (rds.put_candle(symbol, target_interval, agg_candle)) {
+    // 저장 (replace=true면 전체 덮어쓰기)
+    bool saved = replace
+        ? rds.put_candle_replace(symbol, target_interval, agg_candle)
+        : rds.put_candle(symbol, target_interval, agg_candle);
+
+    if (saved) {
         Logger::info("[HIER-AGG]", symbol, target_interval, "@", aligned_time,
-                    "aggregated from", source_candles.size(), source_interval, "candles");
+                    "aggregated from", source_candles.size(), source_interval, "candles",
+                    replace ? "(replace)" : "");
     } else {
         Logger::error("[HIER-AGG] Failed to save", symbol, target_interval);
     }
@@ -141,8 +158,9 @@ int main(int argc, char* argv[]) {
     }
 
     Logger::info("=== Configuration ===");
-    Logger::info("Valkey Host:", cfg.valkey_host);
-    Logger::info("Valkey Port:", cfg.valkey_port);
+    Logger::info("Depth Cache:", cfg.depth_host, ":", cfg.depth_port);
+    Logger::info("Candle Cache:", cfg.candle_host, ":", cfg.candle_port);
+    Logger::info("Backup Cache:", cfg.backup_host, ":", cfg.backup_port);
     Logger::info("AWS Region:", cfg.aws_region);
     Logger::info("DB Secret:", cfg.db_credentials_secret_name);
     Logger::info("Poll Interval:", cfg.poll_interval_ms, "ms");
@@ -163,14 +181,30 @@ int main(int argc, char* argv[]) {
     Logger::info("RDS Port:", db_creds->port);
     Logger::info("RDS DB:", db_creds->database);
 
-    // 클라이언트 초기화
-    ValkeyClient valkey(cfg.valkey_host, cfg.valkey_port);
-    if (!valkey.connect()) {
-        Logger::error("Failed to connect to Valkey");
+    // 클라이언트 초기화 — 3-Cache 아키텍처
+    ValkeyClient candle_valkey(cfg.candle_host, cfg.candle_port);
+    if (!candle_valkey.connect()) {
+        Logger::error("Failed to connect to Candle Cache");
         Aws::ShutdownAPI(options);
         return 1;
     }
-    Logger::info("Connected to Valkey");
+    Logger::info("Connected to Candle Cache:", cfg.candle_host, ":", cfg.candle_port);
+
+    ValkeyClient depth_valkey(cfg.depth_host, cfg.depth_port);
+    if (!depth_valkey.connect()) {
+        Logger::error("Failed to connect to Depth Cache");
+        Aws::ShutdownAPI(options);
+        return 1;
+    }
+    Logger::info("Connected to Depth Cache:", cfg.depth_host, ":", cfg.depth_port);
+
+    ValkeyClient backup_valkey(cfg.backup_host, cfg.backup_port);
+    if (!backup_valkey.connect()) {
+        Logger::error("Failed to connect to Backup Cache");
+        Aws::ShutdownAPI(options);
+        return 1;
+    }
+    Logger::info("Connected to Backup Cache:", cfg.backup_host, ":", cfg.backup_port);
 
     RdsClient rds(db_creds->host, db_creds->port, db_creds->database,
                   db_creds->username, db_creds->password);
@@ -191,12 +225,12 @@ int main(int argc, char* argv[]) {
     std::set<std::string> known_symbols;           // 알려진 심볼 목록
     std::map<std::string, int64_t> symbol_last_seen;  // 심볼별 마지막 활동 시간
 
-    // 1d/1w 계층적 집계 상태 추적
-    int64_t last_1d_check = 0;
-    int64_t last_1w_check = 0;
+    // 주기적 작업 상태 추적
+    int64_t last_ranking_check = 0;  // 시간별 랭킹 업데이트
     int64_t last_stats_time = 0;  // 통계 로깅 시간
     int64_t last_cleanup_time = 0;  // 정리 시간
 
+    const int SECONDS_1H = 3600;
     const int SECONDS_1D = 24 * 3600;
     const int SECONDS_1W = 7 * 24 * 3600;
 
@@ -218,15 +252,23 @@ int main(int argc, char* argv[]) {
             int64_t now = get_current_epoch();
 
             // 1. closed 캔들이 있는 심볼 목록 조회
-            auto symbols = valkey.get_closed_symbols();
+            auto symbols = candle_valkey.get_closed_symbols();
 
             for (const auto& symbol : symbols) {
                 // 2. 마감된 1분봉 POP (RPOP - 오래된 순)
-                auto closed_1m = valkey.pop_closed_candles(symbol, 60);  // 최대 60개씩 처리
+                auto closed_1m = candle_valkey.pop_closed_candles(symbol, 60);  // 최대 60개씩 처리
 
                 if (closed_1m.empty()) continue;
 
                 Logger::info("[INC]", symbol, "- processing", closed_1m.size(), "closed 1m candles");
+
+                // 새 심볼 발견 시 RDS 파티션 확인/생성
+                if (known_symbols.find(symbol) == known_symbols.end()) {
+                    if (rds_connected) {
+                        rds.ensure_partition(symbol);
+                        Logger::info("[PARTITION] Ensured partition for new symbol:", symbol);
+                    }
+                }
 
                 // 심볼 활동 기록
                 symbol_last_seen[symbol] = now;
@@ -244,7 +286,7 @@ int main(int argc, char* argv[]) {
                         std::string key = "candle:" + tf.interval + ":" + symbol;
 
                         // 현재 진행중인 캔들 조회
-                        Candle current = valkey.get_candle(key);
+                        Candle current = candle_valkey.get_candle(key);
 
                         // 증분 업데이트
                         auto result = aggregator.update_candle_incremental(
@@ -267,100 +309,125 @@ int main(int argc, char* argv[]) {
                                             "L:", result.closed_candle.low,
                                             "C:", result.closed_candle.close);
                             }
+
+                            // === EVENT-DRIVEN 1d + 1w AGGREGATION ===
+                            // 1h 마감 시 KST 일 경계 통과 확인 → 1d 집계 트리거
+                            if (tf.interval == "1h" && rds_connected) {
+                                int64_t closed_kst_day = (result.closed_candle.epoch() + KST_OFFSET) / SECONDS_1D;
+                                int64_t new_kst_day = (result.current_candle.epoch() + KST_OFFSET) / SECONDS_1D;
+
+                                if (closed_kst_day != new_kst_day) {
+                                    // KST 일 경계 통과 — 전일 1d 집계
+                                    int64_t day_end = new_kst_day * SECONDS_1D - KST_OFFSET;
+                                    int64_t day_start = day_end - SECONDS_1D;
+
+                                    Logger::info("[EVENT-1D]", symbol, "day boundary crossed, aggregating 1d...");
+
+                                    aggregate_higher_timeframe(rds, aggregator, symbol, "1h", "1d",
+                                                              SECONDS_1D, day_end, /*replace=*/true);
+
+                                    // prevClose 갱신
+                                    auto candles_1d = rds.get_candles_by_interval(symbol, "1d", day_start, day_end);
+                                    if (!candles_1d.empty()) {
+                                        double close_price = candles_1d.back().close;
+                                        double old_prev = depth_valkey.get_prev_close(symbol);
+                                        depth_valkey.set_prev_close(symbol, close_price);
+
+                                        std::string trading_date = epoch_to_date(day_start);
+                                        rds.update_prev_close(symbol, close_price, trading_date);
+
+                                        if (old_prev > 0) {
+                                            double pct = (close_price - old_prev) / old_prev * 100.0;
+                                            backup_valkey.update_ranking(symbol, pct);
+                                        }
+                                        Logger::info("[EVENT-1D]", symbol, "close:", close_price,
+                                                    "prev:", old_prev, "date:", trading_date);
+                                    }
+
+                                    // === Progressive 1w ===
+                                    int64_t closed_monday = get_monday_kst(day_start);
+                                    int64_t new_monday = get_monday_kst(day_end);
+                                    if (closed_monday != new_monday) {
+                                        // 주 경계 통과 — 이전 주 확정
+                                        Logger::info("[EVENT-1W]", symbol, "week boundary crossed, finalizing previous week");
+                                        aggregate_higher_timeframe(rds, aggregator, symbol, "1d", "1w",
+                                                                  SECONDS_1W, new_monday, /*replace=*/true);
+                                    }
+                                    // 현재 주 진행중 업데이트
+                                    Logger::info("[PROGRESSIVE-1W]", symbol, "updating current week candle");
+                                    aggregate_higher_timeframe(rds, aggregator, symbol, "1d", "1w",
+                                                              SECONDS_1W, new_monday + SECONDS_1W, /*replace=*/true);
+                                }
+                            }
                         }
 
                         // 업데이트된 캔들 Valkey에 저장 + TTL
                         int ttl = get_ttl_for_interval(tf.interval);
-                        valkey.set_candle(key, result.current_candle, ttl);
+                        candle_valkey.set_candle(key, result.current_candle, ttl);
                     }
                 }
 
                 // 4. 리스트 길이 체크 및 정리 (안전장치)
-                size_t list_len = valkey.get_list_length("candle:closed:1m:" + symbol);
+                size_t list_len = candle_valkey.get_list_length("candle:closed:1m:" + symbol);
                 if (list_len > 300) {
                     // 300개 초과 시 경고
                     Logger::warn("[WARN]", symbol, "closed list has", list_len, "candles");
                 }
             }
 
-            // 5. 1d/1w 계층적 집계 (RDS 기반 - 연결된 경우만)
-            if (rds_connected) {
-                // 1d 경계: KST 자정 기준 (UTC 15:00 = KST 00:00)
-                const int64_t KST_OFFSET = 9 * 3600;
-                int64_t now_kst = now + KST_OFFSET;
-                int64_t aligned_1d_kst = (now_kst / SECONDS_1D) * SECONDS_1D;
-                int64_t aligned_1d = aligned_1d_kst - KST_OFFSET;  // UTC epoch으로 변환
-
-                if (aligned_1d > last_1d_check && !known_symbols.empty()) {
-                    Logger::info("[HIER-AGG] 1d boundary reached (KST midnight), aggregating...");
-
-                    // 마감 일자 계산 (전일 KST 기준)
-                    std::string trading_date = epoch_to_date(aligned_1d - SECONDS_1D);
+            // 5. 시간별 랭킹 업데이트 (gainers/losers)
+            {
+                int64_t aligned_1h = (now / SECONDS_1H) * SECONDS_1H;
+                if (aligned_1h > last_ranking_check && !known_symbols.empty()) {
+                    Logger::info("[RANKING] Hourly ranking update, symbols:", known_symbols.size());
 
                     for (const auto& sym : known_symbols) {
-                        // 1. 1d 캔들 집계
-                        aggregate_higher_timeframe(rds, aggregator, sym, "1h", "1d",
-                                                  SECONDS_1D, aligned_1d);
+                        // 현재 가격: ticker:SYMBOL에서 조회
+                        double current_price = depth_valkey.get_ticker_price(sym);
+                        if (current_price <= 0) continue;
 
-                        // 2. 방금 저장된 1d 캔들 조회
-                        auto candles_1d = rds.get_candles_by_interval(
-                            sym, "1d", aligned_1d - SECONDS_1D, aligned_1d);
+                        // 전일종가: prev:SYMBOL에서 조회
+                        double prev_close = depth_valkey.get_prev_close(sym);
+                        if (prev_close <= 0) continue;
 
-                        if (!candles_1d.empty()) {
-                            double close_price = candles_1d.back().close;
-
-                            // 3. 이전 prev_close 조회 (변동률 계산용)
-                            double old_prev_close = valkey.get_prev_close(sym);
-
-                            // 4. Valkey prev:{symbol} 업데이트
-                            valkey.set_prev_close(sym, close_price);
-
-                            // 5. RDS symbol_prev_close 업데이트
-                            rds.update_prev_close(sym, close_price, trading_date);
-
-                            // 6. 변동률 계산 및 ranking 업데이트
-                            if (old_prev_close > 0) {
-                                double change_pct = (close_price - old_prev_close) / old_prev_close * 100.0;
-                                valkey.update_ranking(sym, change_pct);
-                                Logger::info("[DAILY-CLOSE]", sym, "close:", close_price,
-                                            "prev:", old_prev_close, "change:", change_pct, "%");
-                            } else {
-                                Logger::info("[DAILY-CLOSE]", sym, "close:", close_price, "(no prev)");
-                            }
-                        }
+                        // 변동률 계산 + 랭킹 업데이트
+                        double change_pct = (current_price - prev_close) / prev_close * 100.0;
+                        backup_valkey.update_ranking(sym, change_pct);
+                        Logger::debug("[RANKING-1H]", sym, "price:", current_price,
+                                     "prev:", prev_close, "change:", change_pct, "%");
                     }
-                    last_1d_check = aligned_1d;
-                }
-
-                int64_t aligned_1w = align_epoch_to_timeframe(now, SECONDS_1W);
-                if (aligned_1w > last_1w_check && !known_symbols.empty()) {
-                    Logger::info("[HIER-AGG] 1w boundary reached, aggregating...");
-                    for (const auto& sym : known_symbols) {
-                        aggregate_higher_timeframe(rds, aggregator, sym, "1d", "1w",
-                                                  SECONDS_1W, aligned_1w);
-                    }
-                    last_1w_check = aligned_1w;
+                    last_ranking_check = aligned_1h;
+                    Logger::info("[RANKING] Hourly ranking update complete");
                 }
             }
 
-            // 6. 주기적 통계 로깅 (5분마다)
+            // 6. (REMOVED — 1d/1w는 이제 1h 마감 이벤트 기반으로 처리됨)
+
+            // 7. 주기적 통계 로깅 (5분마다)
             if (now - last_stats_time > 300) {
                 Logger::info("[STATS] Symbols:", known_symbols.size(),
                             "Active:", symbol_last_seen.size());
                 last_stats_time = now;
             }
 
-            // 7. 비활성 심볼 정리 (10분마다, 1시간 이상 비활성)
+            // 8. 비활성 심볼 정리 (10분마다, 1시간 이상 비활성)
+            // [FIX] known_symbols는 보존 (1d/1w 계층적 집계에 필요)
+            //       symbol_last_seen만 정리하여 통계 정확도 유지
             if (now - last_cleanup_time > 600) {
                 const int64_t INACTIVE_THRESHOLD = 3600;  // 1시간
+                int cleaned = 0;
                 for (auto it = symbol_last_seen.begin(); it != symbol_last_seen.end();) {
                     if (now - it->second > INACTIVE_THRESHOLD) {
-                        Logger::info("[CLEANUP] Removing inactive symbol:", it->first);
-                        known_symbols.erase(it->first);
+                        Logger::debug("[CLEANUP] Symbol inactive (stats only):", it->first);
                         it = symbol_last_seen.erase(it);
+                        cleaned++;
                     } else {
                         ++it;
                     }
+                }
+                if (cleaned > 0) {
+                    Logger::info("[CLEANUP] Cleared", cleaned, "inactive from stats.",
+                                "known_symbols preserved:", known_symbols.size());
                 }
                 last_cleanup_time = now;
             }

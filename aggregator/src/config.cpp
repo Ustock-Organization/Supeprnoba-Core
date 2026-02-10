@@ -6,9 +6,20 @@ namespace aggregator {
 Config Config::from_env() {
     Config cfg;
 
-    // Valkey 설정
-    cfg.valkey_host = std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost";
-    cfg.valkey_port = std::getenv("VALKEY_PORT") ? std::atoi(std::getenv("VALKEY_PORT")) : 6379;
+    // Depth Cache
+    cfg.depth_host = std::getenv("DEPTH_CACHE_HOST") ? std::getenv("DEPTH_CACHE_HOST")
+        : (std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost");
+    cfg.depth_port = std::getenv("DEPTH_CACHE_PORT") ? std::atoi(std::getenv("DEPTH_CACHE_PORT")) : 6379;
+
+    // Candle Cache
+    cfg.candle_host = std::getenv("CANDLE_CACHE_HOST") ? std::getenv("CANDLE_CACHE_HOST")
+        : (std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost");
+    cfg.candle_port = std::getenv("CANDLE_CACHE_PORT") ? std::atoi(std::getenv("CANDLE_CACHE_PORT")) : 6380;
+
+    // Backup Cache
+    cfg.backup_host = std::getenv("BACKUP_CACHE_HOST") ? std::getenv("BACKUP_CACHE_HOST")
+        : (std::getenv("VALKEY_HOST") ? std::getenv("VALKEY_HOST") : "localhost");
+    cfg.backup_port = std::getenv("BACKUP_CACHE_PORT") ? std::atoi(std::getenv("BACKUP_CACHE_PORT")) : 6381;
 
     // AWS 설정
     cfg.aws_region = std::getenv("AWS_REGION") ? std::getenv("AWS_REGION") : "ap-northeast-2";

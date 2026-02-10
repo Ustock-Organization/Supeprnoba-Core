@@ -62,6 +62,12 @@ int main(int argc, char* argv[]) {
     const auto redis_port = Config::getInt(Config::REDIS_PORT, 6379);
     const auto depth_cache_host = Config::get("DEPTH_CACHE_HOST", redis_host);
     const auto depth_cache_port = Config::getInt("DEPTH_CACHE_PORT", redis_port);
+    const auto candle_cache_host = Config::get("CANDLE_CACHE_HOST", redis_host);
+    const auto candle_cache_port = Config::getInt("CANDLE_CACHE_PORT", redis_port);
+    const auto backup_cache_host = Config::get("BACKUP_CACHE_HOST", redis_host);
+    const auto backup_cache_port = Config::getInt("BACKUP_CACHE_PORT", redis_port);
+    const auto operating_cache_host = Config::get("OPERATING_CACHE_HOST", redis_host);
+    const auto operating_cache_port = Config::getInt("OPERATING_CACHE_PORT", redis_port);
     
     // Checkpoint 설정
     const bool checkpoint_enabled = Config::get("KINESIS_CHECKPOINT_ENABLED", "true") == "true";
@@ -73,27 +79,47 @@ int main(int argc, char* argv[]) {
     Logger::info("Kinesis Stream:", stream_name);
     Logger::info("AWS Region:", aws_region);
     Logger::info("gRPC Port:", grpc_port);
-    Logger::info("Redis (snapshot):", redis_host, ":", redis_port);
     Logger::info("Redis (depth):", depth_cache_host, ":", depth_cache_port);
+    Logger::info("Redis (candle):", candle_cache_host, ":", candle_cache_port);
+    Logger::info("Redis (backup):", backup_cache_host, ":", backup_cache_port);
+    Logger::info("Redis (operating):", operating_cache_host, ":", operating_cache_port);
     Logger::info("Checkpoint enabled:", checkpoint_enabled ? "YES" : "NO");
     Logger::info("Checkpoint interval:", checkpoint_interval_records, "records /", checkpoint_interval_seconds, "seconds");
     Logger::info("Drain timeout:", drain_timeout_seconds, "seconds");
     Logger::info("=====================");
     
     try {
-        // Redis 연결 (스냅샷 백업용)
-        RedisClient redis(redis_host, redis_port);
-        bool redis_connected = redis.connect();
-        if (!redis_connected) {
-            Logger::warn("Redis (snapshot) connection failed - continuing without cache");
-        }
-        
-        // Depth 캐시 연결 (실시간 호가용)
-        RedisClient depth_cache(depth_cache_host, depth_cache_port);
-        bool depth_connected = depth_cache.connect();
-        if (!depth_connected) {
-            Logger::warn("Redis (depth) connection failed - continuing without depth cache");
-        }
+        // 1. Depth cache (실시간 호가/티커)
+        RedisClient depth_redis(depth_cache_host, depth_cache_port);
+        bool depth_connected = depth_redis.connect();
+        if (!depth_connected) Logger::warn("Redis (depth) connection failed");
+
+        // 2. Candle cache (캔들 데이터)
+        RedisClient candle_redis(candle_cache_host, candle_cache_port);
+        bool candle_connected = candle_redis.connect();
+        if (!candle_connected) Logger::warn("Redis (candle) connection failed");
+
+        // 3. Backup cache — main thread (스냅샷/GrpcService)
+        RedisClient backup_redis(backup_cache_host, backup_cache_port);
+        bool backup_connected = backup_redis.connect();
+        if (!backup_connected) Logger::warn("Redis (backup) connection failed");
+
+        // 4. Backup cache — RankingManager writes (main thread, on_fill에서 호출)
+        RedisClient ranking_write_redis(backup_cache_host, backup_cache_port);
+        bool ranking_write_connected = backup_connected && ranking_write_redis.connect();
+
+        // 5. Backup cache — RankingManager bg thread
+        RedisClient ranking_bg_redis(backup_cache_host, backup_cache_port);
+        bool ranking_bg_connected = backup_connected && ranking_bg_redis.connect();
+
+        // 6. Backup cache — CheckpointManager bg thread
+        RedisClient checkpoint_redis(backup_cache_host, backup_cache_port);
+        bool checkpoint_connected = backup_connected && checkpoint_redis.connect();
+
+        // 7. Operating cache (연결 관리/상태)
+        RedisClient operating_redis(operating_cache_host, operating_cache_port);
+        bool operating_connected = operating_redis.connect();
+        if (!operating_connected) Logger::warn("Redis (operating) connection failed");
         
         // Kinesis Producer 생성
         KinesisProducer producer(aws_region);
@@ -102,9 +128,9 @@ int main(int argc, char* argv[]) {
         
         // NotificationClient 생성 (WebSocket 직접 알림)
         // 중요: RedisClient는 Thread-safe하지 않으므로, 백그라운드 스레드용으로 별도 연결 생성
-        RedisClient notification_redis(depth_cache_host, depth_cache_port);
+        RedisClient notification_redis(operating_cache_host, operating_cache_port);
         bool notification_redis_connected = false;
-        if (depth_connected) {
+        if (operating_connected) {
              notification_redis_connected = notification_redis.connect();
              if (notification_redis_connected) {
                  Logger::info("Redis (notification) connected");
@@ -125,10 +151,12 @@ int main(int argc, char* argv[]) {
             Logger::warn("WEBSOCKET_ENDPOINT not set - notifications disabled");
         }
 
-        // RankingManager 생성 (백업용 Redis 사용)
+        // RankingManager 생성 (백업용 Redis 2개: main thread write + bg thread read)
         // 주의: 스레드 시작은 snapshot 복원 후로 지연 (RedisClient thread-safety 문제 방지)
-        RankingManager ranking_manager(redis_connected ? &redis : nullptr);
-        bool ranking_enabled = redis_connected;
+        RankingManager ranking_manager(
+            ranking_write_connected ? &ranking_write_redis : nullptr,
+            ranking_bg_connected ? &ranking_bg_redis : nullptr);
+        bool ranking_enabled = ranking_write_connected && ranking_bg_connected;
         // ranking_manager.startSnapshotThread()는 나중에 호출됨
         if (ranking_enabled) {
             Logger::info("RankingManager created (thread will start after snapshot restore)");
@@ -137,25 +165,27 @@ int main(int argc, char* argv[]) {
         }
 
         // 핸들러 및 엔진 생성
-        MarketDataHandler handler(&producer, depth_connected ? &depth_cache : nullptr,
-                                  notifier_enabled ? &notifier : nullptr,
-                                  ranking_enabled ? &ranking_manager : nullptr);
-        EngineCore engine(&handler);
+        MarketDataHandler handler(&producer,
+            depth_connected ? &depth_redis : nullptr,
+            candle_connected ? &candle_redis : nullptr,
+            notifier_enabled ? &notifier : nullptr,
+            ranking_enabled ? &ranking_manager : nullptr);
+        EngineCore engine(&handler, operating_connected ? &operating_redis : nullptr);
         
         // === 시작 시 Redis에서 스냅샷 복원 ===
         // 먼저 deleted:symbols 로드 (상장폐지된 종목 필터링용)
         std::set<std::string> deleted_symbols;
-        if (redis_connected) {
-            auto deleted_vec = redis.smembers("deleted:symbols");
+        if (operating_connected) {
+            auto deleted_vec = operating_redis.smembers("deleted:symbols");
             deleted_symbols = std::set<std::string>(deleted_vec.begin(), deleted_vec.end());
             if (!deleted_symbols.empty()) {
                 Logger::info("Loaded", deleted_symbols.size(), "deleted symbols to filter");
             }
         }
 
-        if (redis_connected) {
+        if (backup_connected) {
             Logger::info("Restoring snapshots from Redis...");
-            auto snapshot_keys = redis.keys("snapshot:*");
+            auto snapshot_keys = backup_redis.keys("snapshot:*");
             int restored_count = 0;
             int skipped_deleted = 0;
             for (const auto& key : snapshot_keys) {
@@ -172,7 +202,7 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                auto snapshot_data = redis.get(key);
+                auto snapshot_data = backup_redis.get(key);
                 if (snapshot_data.has_value()) {
                     engine.restoreOrderBook(symbol, snapshot_data.value());
                     Logger::info("Restored orderbook:", symbol);
@@ -194,7 +224,7 @@ int main(int argc, char* argv[]) {
         const bool load_from_dynamodb = Config::get("LOAD_ORDERS_FROM_DYNAMODB", "true") == "true";
 
         if (load_from_dynamodb) {
-            Logger::info("Loading ACCEPTED orders from DynamoDB...");
+            Logger::info("Loading active orders (ACCEPTED + PARTIAL_FILL) from DynamoDB...");
             DynamoDBClient dynamodb(aws_region);
 
             if (dynamodb.initialize()) {
@@ -208,13 +238,13 @@ int main(int argc, char* argv[]) {
                     Logger::info("Loaded totalShares for", total_shares_map.size(), "symbols into RankingManager");
                 }
 
-                auto accepted_orders = dynamodb.loadAcceptedOrders(orders_table);
+                auto active_orders = dynamodb.loadActiveOrders(orders_table);
 
                 int added_count = 0;
                 int skipped_count = 0;
                 int skipped_deleted = 0;
 
-                for (const auto& order : accepted_orders) {
+                for (const auto& order : active_orders) {
                     // 삭제된 종목의 주문은 스킵
                     if (deleted_symbols.count(order->symbol()) > 0) {
                         ++skipped_deleted;
@@ -249,19 +279,29 @@ int main(int argc, char* argv[]) {
         }
         
         // === CheckpointManager 생성 ===
+        const bool clear_checkpoints_on_start = Config::get("CLEAR_CHECKPOINTS_ON_START", "true") == "true";
+
         std::unique_ptr<CheckpointManager> checkpoint_manager;
-        if (checkpoint_enabled && redis_connected) {
+        if (checkpoint_enabled && checkpoint_connected) {
             CheckpointManager::Config cp_config;
             cp_config.stream_name = stream_name;
             cp_config.flush_interval_records = checkpoint_interval_records;
             cp_config.flush_interval_seconds = checkpoint_interval_seconds;
-            cp_config.enable_background_flush = true;  // Fix 3: 비동기 체크포인팅 (consumer 스레드 블로킹 방지)
+            cp_config.enable_background_flush = true;
 
-            checkpoint_manager = std::make_unique<CheckpointManager>(&redis, cp_config);
-            checkpoint_manager->startBackgroundFlush();  // Fix 3: 백그라운드 플러시 시작
+            checkpoint_manager = std::make_unique<CheckpointManager>(&checkpoint_redis, cp_config);
+
+            // 재시작 시 stale checkpoint에서 과거 레코드를 재생하는 문제 방지
+            // 스냅샷 + DynamoDB 복원으로 주문을 복구하므로 Kinesis replay 불필요
+            if (clear_checkpoints_on_start) {
+                checkpoint_manager->clearAllCheckpoints();
+                Logger::info("Cleared stale checkpoints - all shards will start from LATEST");
+            }
+
+            checkpoint_manager->startBackgroundFlush();
             Logger::info("CheckpointManager initialized for stream:", stream_name, "(background flush enabled)");
         } else {
-            Logger::warn("CheckpointManager disabled - checkpoint_enabled:", checkpoint_enabled, "redis_connected:", redis_connected);
+            Logger::warn("CheckpointManager disabled - checkpoint_enabled:", checkpoint_enabled, "checkpoint_connected:", checkpoint_connected);
         }
 
         // Kinesis Consumer 시작
@@ -303,7 +343,7 @@ int main(int argc, char* argv[]) {
         });
         
         // gRPC 서비스 시작
-        GrpcService grpc_service(&engine, redis_connected ? &redis : nullptr);
+        GrpcService grpc_service(&engine, backup_connected ? &backup_redis : nullptr);
         grpc_service.start(grpc_port);
         
         // Consumer 시작
@@ -339,14 +379,14 @@ int main(int argc, char* argv[]) {
             }
 
             // 10초마다 스냅샷 저장
-            if (redis_connected &&
+            if (backup_connected &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_snapshot).count() >= 10) {
 
                 auto symbols = engine.getAllSymbols();
                 for (const auto& symbol : symbols) {
                     auto snapshot = engine.snapshotOrderBook(symbol);
                     if (!snapshot.empty()) {
-                        redis.saveSnapshot(symbol, snapshot);
+                        backup_redis.saveSnapshot(symbol, snapshot);
                     }
                 }
                 last_snapshot = now;
@@ -380,13 +420,13 @@ int main(int argc, char* argv[]) {
         Logger::info("KinesisConsumer stopped, records processed:", consumer.getRecordsProcessed());
 
         // 3. 최종 스냅샷 저장
-        if (redis_connected) {
+        if (backup_connected) {
             Logger::info("Saving final orderbook snapshots...");
             auto symbols = engine.getAllSymbols();
             for (const auto& symbol : symbols) {
                 auto snapshot = engine.snapshotOrderBook(symbol);
                 if (!snapshot.empty()) {
-                    redis.saveSnapshot(symbol, snapshot);
+                    backup_redis.saveSnapshot(symbol, snapshot);
                 }
             }
             Logger::info("Final snapshots saved for", symbols.size(), "symbols");

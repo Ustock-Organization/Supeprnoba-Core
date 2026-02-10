@@ -41,12 +41,15 @@ declare -A HOST_SERVICES
 HOST_SERVICES["stock-bastion"]="engine mm"
 HOST_SERVICES["stock-streamer"]="streamer"
 HOST_SERVICES["stock-aggregator"]="aggregator"
+# 현재 단일 EC2 환경 (모든 서비스가 하나의 인스턴스에서 실행)
+HOST_SERVICES["ip-172-31-10-211"]="engine streamer mm aggregator"
 
 # Private IP 기반 서비스 매핑 (호스트명 인식 실패 시 fallback)
 declare -A IP_SERVICES
 IP_SERVICES["172.31.47.97"]="engine mm"        # stock-bastion
 IP_SERVICES["172.31.57.219"]="streamer"        # stock-streamer
 IP_SERVICES["172.31.35.62"]="aggregator"       # stock-aggregator
+IP_SERVICES["172.31.10.211"]="engine streamer mm aggregator"  # 현재 단일 EC2
 
 # 서비스명 매핑 (short -> systemd name)
 declare -A SERVICE_NAMES
@@ -64,10 +67,10 @@ LOG_PATHS["aggregator"]="/var/log/supernoba/aggregator/aggregator.log"
 
 # 빌드 경로
 declare -A BUILD_PATHS
-BUILD_PATHS["engine"]="$HOME/Supeprnoba-Core/wrapper"
-BUILD_PATHS["streamer"]="$HOME/Supeprnoba-Core/streamer/node"
-BUILD_PATHS["mm"]="$HOME/Supeprnoba-Core/mm-service"
-BUILD_PATHS["aggregator"]="$HOME/Supeprnoba-Core/aggregator"
+BUILD_PATHS["engine"]="$HOME/Supernoba-Core_Old/wrapper"
+BUILD_PATHS["streamer"]="$HOME/Supernoba-Core_Old/streamer/node"
+BUILD_PATHS["mm"]="$HOME/Supernoba-Core_Old/mm-service"
+BUILD_PATHS["aggregator"]="$HOME/Supernoba-Core_Old/aggregator"
 
 # 서비스 설명
 declare -A SERVICE_DESC
@@ -232,6 +235,37 @@ kill_all_processes() {
     log_success "All Supernoba processes terminated"
 }
 
+# MM 일시 정지 (엔진 재시작 전)
+pause_mm_if_running() {
+    local mm_running=$(redis-cli -h 127.0.0.1 -p 6382 GET mm:running 2>/dev/null)
+    if [ "$mm_running" != "1" ]; then
+        return 0
+    fi
+    log_info "Pausing Market Maker before engine restart..."
+    redis-cli -h 127.0.0.1 -p 6382 PUBLISH mm:control \
+      '{"action":"stopAll","source":"supernoba-ctl"}' > /dev/null 2>&1
+    for i in $(seq 1 10); do
+        local still=$(redis-cli -h 127.0.0.1 -p 6382 SCARD mm:running:symbols 2>/dev/null)
+        if [ "$still" = "0" ] || [ -z "$still" ]; then
+            log_success "Market Maker paused"
+            return 0
+        fi
+        sleep 0.5
+    done
+    log_warn "Market Maker did not fully stop within 5s, proceeding anyway"
+}
+
+# MM 재개 (엔진 재시작 후)
+resume_mm_if_was_running() {
+    if ! systemctl is-active --quiet supernoba-mm 2>/dev/null; then
+        return 0
+    fi
+    log_info "Resuming Market Maker..."
+    redis-cli -h 127.0.0.1 -p 6382 PUBLISH mm:control \
+      '{"action":"startAll","source":"supernoba-ctl"}' > /dev/null 2>&1
+    log_success "Market Maker resumed"
+}
+
 # 헬스체크
 health_check() {
     local service=$1
@@ -312,10 +346,26 @@ case "$ACTION" in
                 exit 1
             fi
             for svc in $local_services; do
-                service_action "$ACTION" "$svc" || true
+                # 엔진 재시작 시 MM 일시정지/재개
+                if [ "$ACTION" == "restart" ] && [ "$svc" == "engine" ]; then
+                    pause_mm_if_running
+                    service_action "$ACTION" "$svc" || true
+                    sleep 3
+                    resume_mm_if_was_running
+                else
+                    service_action "$ACTION" "$svc" || true
+                fi
             done
         else
-            service_action "$ACTION" "$SERVICE"
+            # 엔진 재시작 시 MM 일시정지/재개
+            if [ "$ACTION" == "restart" ] && [ "$SERVICE" == "engine" ]; then
+                pause_mm_if_running
+                service_action "$ACTION" "$SERVICE"
+                sleep 3
+                resume_mm_if_was_running
+            else
+                service_action "$ACTION" "$SERVICE"
+            fi
         fi
         ;;
 
@@ -362,6 +412,15 @@ case "$ACTION" in
         echo "============================================"
         echo ""
 
+        log_warn "deploy 명령은 git pull을 포함합니다."
+        log_warn "EC2에서는 SCP 기반 배포를 사용하세요: deploy-4cache.sh"
+        echo ""
+        read -p "계속하시겠습니까? (y/N) " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            log_info "Aborted."
+            exit 0
+        fi
+
         local_services=$(get_local_services)
         if [ -z "$local_services" ]; then
             log_error "Cannot determine local services for host: $HOSTNAME"
@@ -370,7 +429,7 @@ case "$ACTION" in
 
         # Git pull
         log_info "Pulling latest code..."
-        cd "$HOME/Supeprnoba-Core" && git pull
+        cd "$HOME/Supernoba-Core_Old" && git pull
 
         # 빌드 및 재시작
         for svc in $local_services; do

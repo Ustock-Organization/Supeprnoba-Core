@@ -124,6 +124,48 @@ bool RdsClient::put_candle(const std::string& symbol, const std::string& interva
     return true;
 }
 
+bool RdsClient::put_candle_replace(const std::string& symbol, const std::string& interval,
+                                    const Candle& candle) {
+    if (!connected_ || !conn_) return false;
+
+    std::string lower_symbol = symbol;
+    for (auto& c : lower_symbol) c = std::tolower(c);
+
+    std::string sql = R"(
+        INSERT INTO candle_history (symbol, interval, time_epoch, time_ymdhm, open, high, low, close, volume)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (symbol, interval, time_epoch)
+        DO UPDATE SET open = EXCLUDED.open,
+                      high = EXCLUDED.high,
+                      low = EXCLUDED.low,
+                      close = EXCLUDED.close,
+                      volume = EXCLUDED.volume
+    )";
+
+    std::string epoch_str = std::to_string(candle.epoch());
+    std::string open_str = std::to_string(candle.open);
+    std::string high_str = std::to_string(candle.high);
+    std::string low_str = std::to_string(candle.low);
+    std::string close_str = std::to_string(candle.close);
+    std::string volume_str = std::to_string(candle.volume);
+
+    const char* params[9] = {
+        lower_symbol.c_str(), interval.c_str(), epoch_str.c_str(), candle.time.c_str(),
+        open_str.c_str(), high_str.c_str(), low_str.c_str(), close_str.c_str(), volume_str.c_str()
+    };
+
+    PGresult* res = PQexecParams(conn_, sql.c_str(), 9, nullptr, params, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        Logger::error("RDS put_candle_replace failed:", PQerrorMessage(conn_));
+        PQclear(res);
+        return false;
+    }
+
+    PQclear(res);
+    return true;
+}
+
 int RdsClient::batch_put_candles(const std::string& symbol, const std::string& interval,
                                  const std::vector<Candle>& candles) {
     if (!connected_ || !conn_ || candles.empty()) return 0;

@@ -81,3 +81,11 @@ admin_config.json
 credentials
 *.pem
 *.key
+
+# Build artifacts
+aggregator/build/
+wrapper/build_local/
+
+# Package locks (Lambda)
+lambda/**/package-lock.json
+mm-service/package-lock.json

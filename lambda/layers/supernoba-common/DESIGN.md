@@ -30,10 +30,11 @@ This document outlines the design for a shared Lambda Layer (`supernoba-common`)
 | Supernoba-admin-monitoring | env or hardcoded | varies | varies | varies | |
 
 **Key Findings:**
-- **3 different Redis hosts** are used:
-  1. Depth Cache: `supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com`
-  2. Backup Cache (MM): `master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com`
-  3. Depth Cache (Clustered): `master.supernoba-depth-cache.5vrxzz.apn2.cache.amazonaws.com`
+- **4 Valkey cache instances** are used (EC2: localhost ports, Lambda: ElastiCache endpoints):
+  1. Depth Cache (포트 6379): 실시간 호가, 티커, OHLC, 전일종가
+  2. Candle Cache (포트 6380): 1분봉 활성/마감 데이터
+  3. Backup Cache (포트 6381): 오더북 스냅샷, Kinesis 체크포인트, 랭킹
+  4. Operating Cache (포트 6382): WebSocket 연결, 구독, MM, 종목 관리
 
 - **Inconsistent TLS handling**: Some functions use conditional TLS based on env var, others always enable TLS
 

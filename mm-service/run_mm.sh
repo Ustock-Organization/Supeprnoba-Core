@@ -15,8 +15,8 @@ cd "$SCRIPT_DIR"
 
 # 환경 변수 설정
 export AWS_REGION="${AWS_REGION:-ap-northeast-2}"
-export BACKUP_CACHE_HOST="${BACKUP_CACHE_HOST:-master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com}"
-export BACKUP_CACHE_PORT="${BACKUP_CACHE_PORT:-6379}"
+export OPERATING_CACHE_HOST="${OPERATING_CACHE_HOST:-${BACKUP_CACHE_HOST:-master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com}}"
+export OPERATING_CACHE_PORT="${OPERATING_CACHE_PORT:-${BACKUP_CACHE_PORT:-6379}}"
 export KINESIS_STREAM="${KINESIS_STREAM:-supernoba-orders}"
 
 # 로그 디렉토리 설정
@@ -28,7 +28,7 @@ echo "=== Supernoba Market Maker Service ==="
 echo "Working Directory: $SCRIPT_DIR"
 echo "Log File: $LOG_FILE"
 echo "AWS Region: $AWS_REGION"
-echo "Backup Cache: $BACKUP_CACHE_HOST:$BACKUP_CACHE_PORT"
+echo "Operating Cache: $OPERATING_CACHE_HOST:$OPERATING_CACHE_PORT"
 echo "Kinesis Stream: $KINESIS_STREAM"
 echo ""
 

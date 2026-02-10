@@ -46,6 +46,9 @@ Market Maker Service는 Admin 패널에서 설정한 종목에 대해 자동으�
 
 ## Valkey 키 구조
 
+> **참고**: 모든 MM 키는 **Operating Cache (포트 6382)** 에 저장됩니다.
+> 환경변수: `OPERATING_CACHE_HOST` / `OPERATING_CACHE_PORT`
+
 | 키 | 타입 | 설명 |
 |----|------|------|
 | `mm:control` | Pub/Sub | 제어 명령 채널 (start, stop, reload 등) |

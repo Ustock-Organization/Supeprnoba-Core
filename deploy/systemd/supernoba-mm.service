@@ -1,6 +1,6 @@
 [Unit]
 Description=Supernoba Market Maker Service
-Documentation=https://github.com/user/Supeprnoba-Core
+Documentation=https://github.com/user/Supernoba-Core_Old
 After=network-online.target supernoba-engine.service
 Wants=network-online.target
 
@@ -8,11 +8,11 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/Supeprnoba-Core/mm-service
+WorkingDirectory=/home/ec2-user/Supernoba-Core_Old/mm-service
 
 # 환경변수
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/common.env
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/mm-service.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/mm-service.env
 
 # Node.js 메모리 제한
 Environment="NODE_OPTIONS=--max-old-space-size=512"

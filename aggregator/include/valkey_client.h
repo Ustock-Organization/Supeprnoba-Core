@@ -76,6 +76,9 @@ public:
     // 급등/급락 랭킹 업데이트 (ranking:gainers, ranking:losers)
     bool update_ranking(const std::string& symbol, double change_pct);
 
+    // ticker:{symbol}에서 현재 가격 조회
+    double get_ticker_price(const std::string& symbol);
+
 private:
     std::string host_;
     int port_;

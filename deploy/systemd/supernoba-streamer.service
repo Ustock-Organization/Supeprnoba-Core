@@ -1,6 +1,6 @@
 [Unit]
 Description=Supernoba Streaming Server
-Documentation=https://github.com/user/Supeprnoba-Core
+Documentation=https://github.com/user/Supernoba-Core_Old
 After=network-online.target
 Wants=network-online.target
 
@@ -8,11 +8,11 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/Supeprnoba-Core/streamer/node
+WorkingDirectory=/home/ec2-user/Supernoba-Core_Old/streamer/node
 
 # 환경변수
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/common.env
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/streamer.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/streamer.env
 
 # Node.js 메모리 제한
 Environment="NODE_OPTIONS=--max-old-space-size=1024"

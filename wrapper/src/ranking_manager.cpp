@@ -25,8 +25,8 @@ static const int SNAPSHOT_TTL_SEC = 15;
 // 브로드캐스트 주기 (초)
 static const int BROADCAST_INTERVAL_SEC = 10;
 
-RankingManager::RankingManager(RedisClient* backup_redis)
-    : backup_redis_(backup_redis) {
+RankingManager::RankingManager(RedisClient* write_redis, RedisClient* read_redis)
+    : write_redis_(write_redis), read_redis_(read_redis) {
     Logger::info("RankingManager created");
 }
 
@@ -54,8 +54,8 @@ void RankingManager::updateOnFill(const std::string& symbol,
                                    uint64_t fill_qty,
                                    double change_pct,
                                    uint64_t total_shares) {
-    if (!backup_redis_) {
-        Logger::warn("RankingManager: backup_redis is null, skipping update");
+    if (!write_redis_) {
+        Logger::warn("RankingManager: write_redis is null, skipping update");
         return;
     }
 
@@ -70,20 +70,20 @@ void RankingManager::updateOnFill(const std::string& symbol,
         Logger::debug("RankingManager: totalShares not cached for", symbol, ", skipping marketcap update");
     } else {
         double market_cap = static_cast<double>(price) * static_cast<double>(cached_shares);
-        backup_redis_->zadd(KEY_MARKETCAP, market_cap, symbol);
+        write_redis_->zadd(KEY_MARKETCAP, market_cap, symbol);
     }
 
     // 거래량 증가 (누적)
-    backup_redis_->zincrby(KEY_VOLUME, static_cast<double>(fill_qty), symbol);
+    write_redis_->zincrby(KEY_VOLUME, static_cast<double>(fill_qty), symbol);
 
     // 급등/급락: Aggregator가 prev_close 기반으로 관리
     // change_pct가 0.0이면 (= 엔진에서 prev_close 없이 호출) Aggregator 데이터 보존을 위해 스킵
     if (change_pct != 0.0) {
         int64_t change_score = static_cast<int64_t>(change_pct * 1000000.0);
-        backup_redis_->zadd(KEY_GAINERS, static_cast<double>(change_score), symbol);
-        backup_redis_->zadd(KEY_LOSERS, static_cast<double>(-change_score), symbol);
-        backup_redis_->zremrangebyrank(KEY_GAINERS, 0, -MAX_GAINERS_LOSERS - 1);
-        backup_redis_->zremrangebyrank(KEY_LOSERS, 0, -MAX_GAINERS_LOSERS - 1);
+        write_redis_->zadd(KEY_GAINERS, static_cast<double>(change_score), symbol);
+        write_redis_->zadd(KEY_LOSERS, static_cast<double>(-change_score), symbol);
+        write_redis_->zremrangebyrank(KEY_GAINERS, 0, -MAX_GAINERS_LOSERS - 1);
+        write_redis_->zremrangebyrank(KEY_LOSERS, 0, -MAX_GAINERS_LOSERS - 1);
     }
 
     Logger::debug("RankingManager: updated ranking for", symbol,
@@ -130,16 +130,41 @@ void RankingManager::snapshotLoop() {
     }
 }
 
+int RankingManager::getCurrentKSTDay() const {
+    auto now = std::chrono::system_clock::now();
+    auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count();
+    // KST = UTC + 9h
+    time_t kst_time = static_cast<time_t>(epoch + 9 * 3600);
+    std::tm tm;
+    gmtime_r(&kst_time, &tm);
+    return (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
+}
+
+void RankingManager::resetDailyVolumeIfNeeded() {
+    if (!read_redis_) return;
+
+    int today_kst = getCurrentKSTDay();
+    if (last_volume_reset_kst_day_ == today_kst) return;
+
+    // KST 날짜가 변경됨 → 거래량 sorted set 초기화
+    read_redis_->del(KEY_VOLUME);
+    last_volume_reset_kst_day_ = today_kst;
+    Logger::info("RankingManager: daily volume reset (KST day:", today_kst, ")");
+}
+
 void RankingManager::computeAndBroadcastSnapshot() {
-    if (!backup_redis_) return;
+    if (!read_redis_) return;
+
+    resetDailyVolumeIfNeeded();
 
     std::string snapshot_json = buildSnapshotJson();
 
     // 캐시 저장 (TTL 15초)
-    backup_redis_->setEx(KEY_SNAPSHOT, snapshot_json, SNAPSHOT_TTL_SEC);
+    read_redis_->setEx(KEY_SNAPSHOT, snapshot_json, SNAPSHOT_TTL_SEC);
 
     // Pub/Sub 브로드캐스트
-    long long subscribers = backup_redis_->publish(CHANNEL_BROADCAST, snapshot_json);
+    long long subscribers = read_redis_->publish(CHANNEL_BROADCAST, snapshot_json);
     Logger::debug("RankingManager: snapshot broadcast to", subscribers, "subscribers");
 }
 
@@ -148,7 +173,7 @@ std::string RankingManager::buildSnapshotJson() {
     snapshot["timestamp"] = getCurrentISOTime();
 
     // 시가총액 TOP 100 (내림차순)
-    auto top_marketcap = backup_redis_->zrevrange(KEY_MARKETCAP, 0, 99, true);
+    auto top_marketcap = read_redis_->zrevrange(KEY_MARKETCAP, 0, 99, true);
     nlohmann::json marketcap_arr = nlohmann::json::array();
     int rank = 1;
     for (const auto& [symbol, score] : top_marketcap) {
@@ -161,7 +186,7 @@ std::string RankingManager::buildSnapshotJson() {
     snapshot["marketcap"] = marketcap_arr;
 
     // 거래량 TOP 100 (내림차순)
-    auto top_volume = backup_redis_->zrevrange(KEY_VOLUME, 0, 99, true);
+    auto top_volume = read_redis_->zrevrange(KEY_VOLUME, 0, 99, true);
     nlohmann::json volume_arr = nlohmann::json::array();
     rank = 1;
     for (const auto& [symbol, score] : top_volume) {
@@ -174,7 +199,7 @@ std::string RankingManager::buildSnapshotJson() {
     snapshot["volume"] = volume_arr;
 
     // 급등 TOP 100 (내림차순 = 등락률 높은 순)
-    auto top_gainers = backup_redis_->zrevrange(KEY_GAINERS, 0, 99, true);
+    auto top_gainers = read_redis_->zrevrange(KEY_GAINERS, 0, 99, true);
     nlohmann::json gainers_arr = nlohmann::json::array();
     rank = 1;
     for (const auto& [symbol, score] : top_gainers) {
@@ -189,7 +214,7 @@ std::string RankingManager::buildSnapshotJson() {
 
     // 급락 TOP 100 (오름차순 = 등락률 낮은 순)
     // losers는 음수 점수로 저장되어 있으므로 zrange 사용
-    auto top_losers = backup_redis_->zrange(KEY_LOSERS, 0, 99, true);
+    auto top_losers = read_redis_->zrange(KEY_LOSERS, 0, 99, true);
     nlohmann::json losers_arr = nlohmann::json::array();
     rank = 1;
     for (const auto& [symbol, score] : top_losers) {

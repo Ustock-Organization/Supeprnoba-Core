@@ -26,12 +26,31 @@ SecretsManager::~SecretsManager() = default;
 std::optional<DbCredentials> SecretsManager::getDbCredentials() {
     std::lock_guard<std::mutex> lock(db_creds_mutex_);
 
+    // 1. 환경변수 우선 확인 (로컬 개발/테스트용)
+    const char* env_host = std::getenv("RDS_HOST");
+    const char* env_user = std::getenv("RDS_USERNAME");
+    const char* env_pass = std::getenv("RDS_PASSWORD");
+    const char* env_db = std::getenv("RDS_DATABASE");
+    
+    if (env_host && env_user && env_pass) {
+        DbCredentials creds;
+        creds.host = env_host;
+        creds.port = std::getenv("RDS_PORT") ? std::atoi(std::getenv("RDS_PORT")) : 5432;
+        creds.database = env_db ? env_db : "supernoba";
+        creds.username = env_user;
+        creds.password = env_pass;
+        
+        Logger::info("DB credentials loaded from environment variables");
+        return creds;
+    }
+
+    // 2. 캐시된 credentials 확인
     auto now = std::chrono::steady_clock::now();
     if (db_credentials_.has_value() && now < db_creds_expiry_) {
         return db_credentials_;
     }
 
-    // Refresh credentials
+    // 3. Secrets Manager에서 갱신
     if (refreshDbCredentials()) {
         return db_credentials_;
     }

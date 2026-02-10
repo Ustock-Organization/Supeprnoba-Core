@@ -212,8 +212,8 @@ void KinesisProducer::publishOrderStatus(const std::string& symbol,
     if (!reason.empty()) {
         j["reason"] = reason;
     }
-    // ACCEPTED 상태일 때 주문 정보 포함 (order-status-processor에서 DynamoDB에 저장)
-    if (status == "ACCEPTED" && quantity > 0) {
+    // 모든 상태에서 주문 정보 포함 (프론트엔드 알림에 필요)
+    if (quantity > 0) {
         j["price"] = price;
         j["quantity"] = quantity;
         j["side"] = is_buy ? "BUY" : "SELL";

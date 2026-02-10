@@ -455,4 +455,30 @@ bool ValkeyClient::update_ranking(const std::string& symbol, double change_pct) 
     return true;
 }
 
+double ValkeyClient::get_ticker_price(const std::string& symbol) {
+    if (!ctx_) return 0.0;
+
+    std::string key = "ticker:" + symbol;
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "GET %s", key.c_str());
+    if (!reply) return 0.0;
+
+    double price = 0.0;
+    if (reply->type == REDIS_REPLY_STRING && reply->str) {
+        try {
+            json j = json::parse(reply->str);
+            if (j.contains("p")) {
+                if (j["p"].is_number()) {
+                    price = j["p"].get<double>();
+                } else if (j["p"].is_string()) {
+                    price = std::stod(j["p"].get<std::string>());
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to parse ticker price for", symbol, ":", e.what());
+        }
+    }
+    freeReplyObject(reply);
+    return price;
+}
+
 } // namespace aggregator

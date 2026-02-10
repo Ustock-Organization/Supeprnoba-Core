@@ -20,9 +20,13 @@ public:
     bool connect();
     void disconnect();
     
-    // 캔들 저장
-    bool put_candle(const std::string& symbol, const std::string& interval, 
+    // 캔들 저장 (ON CONFLICT: high/low/close 병합, volume 누적)
+    bool put_candle(const std::string& symbol, const std::string& interval,
                    const Candle& candle);
+
+    // 캔들 전체 교체 (ON CONFLICT: 모든 필드 덮어쓰기 — progressive 재집계용)
+    bool put_candle_replace(const std::string& symbol, const std::string& interval,
+                            const Candle& candle);
     
     // 배치 저장 (INSERT ... ON CONFLICT)
     int batch_put_candles(const std::string& symbol, const std::string& interval,

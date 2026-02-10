@@ -38,6 +38,8 @@ declare -A HOST_SERVICES
 HOST_SERVICES["stock-bastion"]="supernoba-engine supernoba-mm"
 HOST_SERVICES["stock-streamer"]="supernoba-streamer"
 HOST_SERVICES["stock-aggregator"]="supernoba-aggregator"
+# 현재 단일 EC2 환경
+HOST_SERVICES["ip-172-31-10-211"]="supernoba-engine supernoba-mm supernoba-streamer supernoba-aggregator"
 
 # 서비스별 메모리 비율 (총 메모리의 %)
 # 동일 호스트에서 여러 서비스 실행 시 합이 90% 이하가 되도록 설정

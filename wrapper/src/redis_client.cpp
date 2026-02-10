@@ -427,6 +427,22 @@ std::vector<std::string> RedisClient::smembers(const std::string& key) {
     return result;
 }
 
+bool RedisClient::sismember(const std::string& key, const std::string& member) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "SISMEMBER %s %s", key.c_str(), member.c_str()));
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
+    bool result = (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
+    freeReplyObject(reply);
+    return result;
+}
+
 // === Sorted Set 연산 (랭킹용) ===
 
 bool RedisClient::zadd(const std::string& key, double score, const std::string& member) {

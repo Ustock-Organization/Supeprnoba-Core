@@ -40,9 +40,11 @@ class MarketDataHandler
     , public liquibook::book::BboListener<OrderBook>
 {
 public:
-    explicit MarketDataHandler(IProducer* producer, RedisClient* redis = nullptr,
-                                NotificationClient* notifier = nullptr,
-                                RankingManager* ranking_manager = nullptr);
+    explicit MarketDataHandler(IProducer* producer,
+                               RedisClient* depth_redis = nullptr,
+                               RedisClient* candle_redis = nullptr,
+                               NotificationClient* notifier = nullptr,
+                               RankingManager* ranking_manager = nullptr);
     
     // === OrderListener ===
     void on_accept(const OrderPtr& order) override;
@@ -81,7 +83,8 @@ public:
 
 private:
     IProducer* producer_;
-    RedisClient* redis_;
+    RedisClient* depth_redis_;
+    RedisClient* candle_redis_;
     NotificationClient* notifier_;
     RankingManager* ranking_manager_;
     EngineCore* engine_ = nullptr;

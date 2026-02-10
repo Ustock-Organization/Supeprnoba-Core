@@ -68,33 +68,14 @@ Candle Aggregator::aggregate_candles(const std::vector<Candle>& candles,
 }
 
 // 타임프레임 종료 시간 계산 (aligned_time + minutes)
+// [FIX] epoch 변환으로 월/년 경계 오버플로 방지
 std::string Aggregator::get_timeframe_end(const std::string& aligned_time, int minutes) {
-    int year = std::stoi(aligned_time.substr(0, 4));
-    int month = std::stoi(aligned_time.substr(4, 2));
-    int day = std::stoi(aligned_time.substr(6, 2));
-    int hour = std::stoi(aligned_time.substr(8, 2));
-    int min = std::stoi(aligned_time.substr(10, 2));
+    // KST 시간 문자열 → UTC epoch → 분 추가 → KST 시간 문자열
+    int64_t utc_epoch = Candle::ymdhm_to_utc_epoch(aligned_time);
+    if (utc_epoch == 0) return aligned_time;  // 파싱 실패 시 원본 반환
 
-    // minutes 추가
-    int total_min = hour * 60 + min + minutes;
-
-    // 일자 넘김 처리 (간단히)
-    int new_day = day;
-    if (total_min >= 24 * 60) {
-        total_min -= 24 * 60;
-        new_day++;
-    }
-
-    int new_hour = total_min / 60;
-    int new_min = total_min % 60;
-
-    std::ostringstream oss;
-    oss << std::setfill('0') << std::setw(4) << year
-        << std::setw(2) << month
-        << std::setw(2) << new_day
-        << std::setw(2) << new_hour
-        << std::setw(2) << new_min;
-    return oss.str();
+    utc_epoch += static_cast<int64_t>(minutes) * 60;
+    return epoch_to_ymdhm(utc_epoch);
 }
 
 std::map<std::string, std::vector<Candle>> Aggregator::aggregate(

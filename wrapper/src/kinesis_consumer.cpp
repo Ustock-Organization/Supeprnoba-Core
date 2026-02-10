@@ -100,31 +100,62 @@ std::string KinesisConsumer::getShardIteratorWithCheckpoint(const std::string& s
 void KinesisConsumer::start() {
     if (running_) return;
 
-    // 스트림 정보 가져오기
-    Aws::Kinesis::Model::DescribeStreamRequest desc_request;
-    desc_request.SetStreamName(stream_name_);
+    // 스트림의 모든 shard 수집 (페이지네이션 처리)
+    std::vector<Aws::Kinesis::Model::Shard> all_shards;
+    std::string exclusive_start_shard_id;
 
-    auto desc_outcome = client_->DescribeStream(desc_request);
-    if (!desc_outcome.IsSuccess()) {
-        Logger::error("Failed to describe stream:", desc_outcome.GetError().GetMessage());
-        return;
-    }
+    do {
+        Aws::Kinesis::Model::DescribeStreamRequest desc_request;
+        desc_request.SetStreamName(stream_name_);
+        if (!exclusive_start_shard_id.empty()) {
+            desc_request.SetExclusiveStartShardId(exclusive_start_shard_id);
+        }
 
-    // 모든 샤드의 iterator 가져오기
-    const auto& shards = desc_outcome.GetResult().GetStreamDescription().GetShards();
-    if (shards.empty()) {
+        auto desc_outcome = client_->DescribeStream(desc_request);
+        if (!desc_outcome.IsSuccess()) {
+            Logger::error("Failed to describe stream:", desc_outcome.GetError().GetMessage());
+            return;
+        }
+
+        const auto& desc = desc_outcome.GetResult().GetStreamDescription();
+        const auto& shards = desc.GetShards();
+
+        for (const auto& shard : shards) {
+            all_shards.push_back(shard);
+        }
+
+        if (desc.GetHasMoreShards() && !shards.empty()) {
+            exclusive_start_shard_id = shards.back().GetShardId();
+            Logger::info("DescribeStream has more shards, continuing from:", exclusive_start_shard_id);
+        } else {
+            break;
+        }
+    } while (true);
+
+    if (all_shards.empty()) {
         Logger::error("No shards found in stream:", stream_name_);
         return;
     }
 
-    Logger::info("Found", shards.size(), "shard(s) in stream:", stream_name_);
+    Logger::info("Found", all_shards.size(), "shard(s) in stream:", stream_name_);
     Logger::info("Checkpoint enabled:", checkpoint_enabled_ ? "YES" : "NO");
 
-    for (const auto& shard : shards) {
-        std::string it = getShardIterator(shard.GetShardId());
+    for (const auto& shard : all_shards) {
+        std::string shard_id = shard.GetShardId();
+
+        // 닫힌 shard는 건너뛰기 (ending sequence number가 있으면 닫힘)
+        if (!shard.GetSequenceNumberRange().GetEndingSequenceNumber().empty()) {
+            Logger::info("Skipping closed shard:", shard_id);
+            continue;
+        }
+
+        std::string it = getShardIterator(shard_id);
         if (!it.empty()) {
-            shard_iterators_[shard.GetShardId()] = it;
-            shard_iterator_created_[shard.GetShardId()] = std::chrono::steady_clock::now();
+            shard_iterators_[shard_id] = it;
+            shard_iterator_created_[shard_id] = std::chrono::steady_clock::now();
+            Logger::info("Shard iterator acquired:", shard_id);
+        } else {
+            Logger::error("Failed to get iterator for shard:", shard_id);
         }
     }
 
@@ -132,6 +163,8 @@ void KinesisConsumer::start() {
         Logger::error("Failed to get any shard iterators");
         return;
     }
+
+    Logger::info("Active shard iterators:", shard_iterators_.size());
 
     running_ = true;
     draining_ = false;
@@ -397,8 +430,8 @@ void KinesisConsumer::consumeLoop() {
                 std::string partition_key = record.GetPartitionKey();
                 std::string sequence_number = record.GetSequenceNumber();
 
-                Logger::info(">>> Received Kinesis record, shard:", shard_id,
-                             "key:", partition_key, "len:", data.GetLength());
+                Logger::debug(">>> Received Kinesis record, shard:", shard_id,
+                              "key:", partition_key, "len:", data.GetLength());
 
                 if (callback_) {
                     try {

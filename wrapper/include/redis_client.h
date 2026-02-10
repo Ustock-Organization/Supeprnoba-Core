@@ -43,6 +43,7 @@ public:
 
     // Set 연산 (연결 관리용)
     std::vector<std::string> smembers(const std::string& key);
+    bool sismember(const std::string& key, const std::string& member);
 
     // 해시 연산 (캔들용)
     bool hset(const std::string& key, const std::string& field, const std::string& value);

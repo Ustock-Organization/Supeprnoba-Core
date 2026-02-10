@@ -30,6 +30,14 @@ public:
                               const Empty* request,
                               HealthResponse* response) override;
 
+    grpc::Status CancelAllOrders(grpc::ServerContext* context,
+                                  const CancelAllRequest* request,
+                                  CancelAllResponse* response) override;
+
+    grpc::Status CancelOrder(grpc::ServerContext* context,
+                              const CancelOrderRequest* request,
+                              CancelOrderResponse* response) override;
+
 private:
     EngineCore* engine_;
     RedisClient* redis_;

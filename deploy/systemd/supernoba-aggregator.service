@@ -1,6 +1,6 @@
 [Unit]
 Description=Supernoba Candle Aggregator
-Documentation=https://github.com/user/Supeprnoba-Core
+Documentation=https://github.com/user/Supernoba-Core_Old
 After=network-online.target
 Wants=network-online.target
 
@@ -8,15 +8,15 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/Supeprnoba-Core/aggregator/build
+WorkingDirectory=/home/ec2-user/Supernoba-Core_Old/aggregator/build
 
 # 환경변수
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/common.env
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/aggregator.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/aggregator.env
 # RDS 비밀번호는 AWS Secrets Manager에서 가져옴 (supernoba/db-credentials)
 
 # 실행
-ExecStart=/home/ec2-user/Supeprnoba-Core/aggregator/build/candle_aggregator
+ExecStart=/home/ec2-user/Supernoba-Core_Old/aggregator/build/candle_aggregator
 
 # 재시작 정책
 Restart=on-failure

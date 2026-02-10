@@ -44,6 +44,9 @@ public:
     // 강제 플러시 (종료 시 호출)
     void flush();
 
+    // 모든 체크포인트 삭제 (재시작 시 LATEST부터 시작하도록)
+    void clearAllCheckpoints();
+
     // 즉시 저장 (flush + persist)
     void checkpointImmediate(const std::string& shard_id, const std::string& sequence_number);
 

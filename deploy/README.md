@@ -44,7 +44,7 @@ deploy/
 ### 1. 서비스 설치 (최초 1회, root 필요)
 
 ```bash
-cd ~/Supeprnoba-Core/deploy
+cd ~/Supernoba-Core_Old/deploy
 sudo ./install-services.sh
 ```
 
@@ -178,9 +178,15 @@ Node.js 서비스(mm, streamer)는 서비스 메모리의 70%를 V8 힙으로 �
 AWS_REGION=ap-northeast-2
 AWS_DEFAULT_REGION=ap-northeast-2
 
-# Valkey (Redis)
-BACKUP_CACHE_HOST=master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com
-DEPTH_CACHE_HOST=supernoba-depth-cache.5vrxzz.ng.0001.apn2.cache.amazonaws.com
+# Valkey 4-Cache (EC2: localhost, Lambda: ElastiCache 엔드포인트)
+DEPTH_CACHE_HOST=127.0.0.1
+DEPTH_CACHE_PORT=6379
+CANDLE_CACHE_HOST=127.0.0.1
+CANDLE_CACHE_PORT=6380
+BACKUP_CACHE_HOST=127.0.0.1
+BACKUP_CACHE_PORT=6381
+OPERATING_CACHE_HOST=127.0.0.1
+OPERATING_CACHE_PORT=6382
 
 # Kinesis
 ORDERS_STREAM=supernoba-orders
@@ -218,7 +224,7 @@ journalctl -u supernoba-engine -f
 tail -f /var/log/supernoba/engine/engine.log
 
 # 3. 환경변수 확인
-cat /home/ec2-user/Supeprnoba-Core/deploy/env/engine.env
+cat /home/ec2-user/Supernoba-Core_Old/deploy/env/engine.env
 ```
 
 ### 메모리 부족으로 종료됨

@@ -1,6 +1,6 @@
 [Unit]
 Description=Supernoba Matching Engine
-Documentation=https://github.com/user/Supeprnoba-Core
+Documentation=https://github.com/user/Supernoba-Core_Old
 After=network-online.target
 Wants=network-online.target
 
@@ -8,14 +8,14 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/Supeprnoba-Core/wrapper/build
+WorkingDirectory=/home/ec2-user/Supernoba-Core_Old/wrapper/build
 
 # 환경변수
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/common.env
-EnvironmentFile=/home/ec2-user/Supeprnoba-Core/deploy/env/engine.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/engine.env
 
 # 실행
-ExecStart=/home/ec2-user/Supeprnoba-Core/wrapper/build/matching_engine
+ExecStart=/home/ec2-user/Supernoba-Core_Old/wrapper/build/matching_engine
 
 # 재시작 정책
 Restart=on-failure
