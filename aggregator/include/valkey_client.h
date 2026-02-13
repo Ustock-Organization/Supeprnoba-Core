@@ -79,6 +79,9 @@ public:
     // ticker:{symbol}에서 현재 가격 조회
     double get_ticker_price(const std::string& symbol);
 
+    // 스테일 1m 캔들 마감 (current_minute_kst보다 이전 분의 캔들을 closed 리스트로 이동)
+    int close_stale_candles(const std::string& current_minute_kst);
+
 private:
     std::string host_;
     int port_;

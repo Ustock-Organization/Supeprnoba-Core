@@ -304,7 +304,8 @@ show_help() {
     echo "  logs <service>      Tail service logs"
     echo "  enable [service]    Enable service(s) at boot"
     echo "  disable [service]   Disable service(s) at boot"
-    echo "  deploy              Full deployment (git pull + build + restart)"
+    echo "  build [service]     Build only (SCP 후 증분 빌드 — EC2 권장)"
+    echo "  deploy              Full deployment (git pull + build + restart) — EC2 비권장"
     echo "  health              Health check all local services"
     echo "  kill [service]      Force kill process (pkill -9)"
     echo "  kill-all            Force kill ALL Supernoba processes"
@@ -402,6 +403,22 @@ case "$ACTION" in
         else
             log_error "Unknown service: $SERVICE"
             exit 1
+        fi
+        ;;
+
+    build)
+        # SCP 후 증분 빌드만 수행 (EC2 배포 시 권장)
+        if [ "$SERVICE" == "all" ] || [ -z "$SERVICE" ]; then
+            local_services=$(get_local_services)
+            if [ -z "$local_services" ]; then
+                log_error "Cannot determine local services for host: $HOSTNAME"
+                exit 1
+            fi
+            for svc in $local_services; do
+                build_service "$svc"
+            done
+        else
+            build_service "$SERVICE"
         fi
         ;;
 

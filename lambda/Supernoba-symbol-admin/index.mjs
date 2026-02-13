@@ -393,15 +393,25 @@ export const handler = async (event) => {
         const sym = (b.symbol || '').toUpperCase().trim();
         if (!sym) return err(400, 'symbol is required');
 
-        const wasDeleted = await operatingCache.sismember('deleted:symbols', sym);
-        if (!wasDeleted) return err(400, `Symbol ${sym} is not in deleted list`);
+        const [wasDeleted, wasBlocked] = await Promise.all([
+          operatingCache.sismember('deleted:symbols', sym),
+          operatingCache.sismember('blocked:symbols', sym),
+        ]);
+        if (!wasDeleted && !wasBlocked) return err(400, `Symbol ${sym} is not in deleted or blocked list`);
 
         const restoreResults = {};
 
-        // 1. deleted:symbols에서 제거
-        await operatingCache.srem('deleted:symbols', sym);
-        restoreResults.deleted_symbols = { success: true };
-        console.log(`[RESTORE] Symbol ${sym} removed from deleted list`);
+        // 1. deleted:symbols / blocked:symbols에서 제거
+        if (wasDeleted) {
+          await operatingCache.srem('deleted:symbols', sym);
+          restoreResults.deleted_symbols = { success: true };
+          console.log(`[RESTORE] Symbol ${sym} removed from deleted:symbols`);
+        }
+        if (wasBlocked) {
+          await operatingCache.srem('blocked:symbols', sym);
+          restoreResults.blocked_symbols = { success: true };
+          console.log(`[RESTORE] Symbol ${sym} removed from blocked:symbols`);
+        }
 
         // 2. DynamoDB 종목 존재 확인 및 상태 복원
         try {
@@ -470,11 +480,17 @@ export const handler = async (event) => {
         const sym = symbol.toUpperCase().trim();
         const now = new Date().toISOString();
 
-        // 삭제된 종목이면 자동으로 복원 (재상장 허용)
-        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
-        if (isDeleted) {
-          await operatingCache.srem('deleted:symbols', sym);
-          console.log(`[LISTING] Auto-restored deleted symbol: ${sym}`);
+        // 삭제/차단된 종목이면 자동으로 복원 (재상장 허용)
+        const [isDeleted, isBlocked] = await Promise.all([
+          operatingCache.sismember('deleted:symbols', sym),
+          operatingCache.sismember('blocked:symbols', sym),
+        ]);
+        if (isDeleted || isBlocked) {
+          await Promise.all([
+            isDeleted ? operatingCache.srem('deleted:symbols', sym) : null,
+            isBlocked ? operatingCache.srem('blocked:symbols', sym) : null,
+          ]);
+          console.log(`[LISTING] Auto-cleared delist state for ${sym}: deleted=${isDeleted}, blocked=${isBlocked}`);
         }
 
         const { Item: existing } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
@@ -633,11 +649,17 @@ export const handler = async (event) => {
 
         const sym = symbol.toUpperCase().trim();
 
-        // 삭제된 종목이면 자동으로 복원 (재활성화 허용)
-        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
-        if (isDeleted) {
-          await operatingCache.srem('deleted:symbols', sym);
-          console.log(`[ACTIVATE] Auto-restored deleted symbol: ${sym}`);
+        // 삭제/차단된 종목이면 자동으로 복원 (재활성화 허용)
+        const [isDeletedAct, isBlockedAct] = await Promise.all([
+          operatingCache.sismember('deleted:symbols', sym),
+          operatingCache.sismember('blocked:symbols', sym),
+        ]);
+        if (isDeletedAct || isBlockedAct) {
+          await Promise.all([
+            isDeletedAct ? operatingCache.srem('deleted:symbols', sym) : null,
+            isBlockedAct ? operatingCache.srem('blocked:symbols', sym) : null,
+          ]);
+          console.log(`[ACTIVATE] Auto-cleared delist state for ${sym}: deleted=${isDeletedAct}, blocked=${isBlockedAct}`);
         }
 
         const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
@@ -674,11 +696,17 @@ export const handler = async (event) => {
 
         const sym = symbol.toUpperCase().trim();
 
-        // 삭제된 종목이면 자동으로 복원 (재승인 허용)
-        const isDeleted = await operatingCache.sismember('deleted:symbols', sym);
-        if (isDeleted) {
-          await operatingCache.srem('deleted:symbols', sym);
-          console.log(`[APPROVE] Auto-restored deleted symbol: ${sym}`);
+        // 삭제/차단된 종목이면 자동으로 복원 (재승인 허용)
+        const [isDeletedApp, isBlockedApp] = await Promise.all([
+          operatingCache.sismember('deleted:symbols', sym),
+          operatingCache.sismember('blocked:symbols', sym),
+        ]);
+        if (isDeletedApp || isBlockedApp) {
+          await Promise.all([
+            isDeletedApp ? operatingCache.srem('deleted:symbols', sym) : null,
+            isBlockedApp ? operatingCache.srem('blocked:symbols', sym) : null,
+          ]);
+          console.log(`[APPROVE] Auto-cleared delist state for ${sym}: deleted=${isDeletedApp}, blocked=${isBlockedApp}`);
         }
 
         const ipoQuantity = createIpoOrder ? totalShares : 0;

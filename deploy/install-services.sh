@@ -43,6 +43,10 @@ HOST_SERVICES["ip-172-31-10-211"]="supernoba-engine supernoba-mm supernoba-strea
 
 # 서비스별 메모리 비율 (총 메모리의 %)
 # 동일 호스트에서 여러 서비스 실행 시 합이 90% 이하가 되도록 설정
+# [2026-02-12 감사] 주의: 다중 EC2 기준 설정. 단일 EC2(ip-172-31-10-211)에서는
+#   60+20+80+80=240% 오버커밋 발생. MemoryMax는 hard limit이므로 실제 사용량이
+#   낮으면 문제 없으나, 메모리 누수 시 동시에 여러 서비스 OOM 가능.
+#   단일 EC2 권장값: engine=30%, mm=10%, streamer=25%, aggregator=25% (합계 90%)
 declare -A SERVICE_MEMORY_PERCENT
 SERVICE_MEMORY_PERCENT["supernoba-engine"]=60      # server: 60%
 SERVICE_MEMORY_PERCENT["supernoba-mm"]=20          # server: 20% (engine과 함께)
@@ -141,17 +145,24 @@ create_secrets_dir() {
 
     if [ ! -f "$SECRETS_DIR/rds.env" ]; then
         log_warn "RDS password file not found: $SECRETS_DIR/rds.env"
-        log_warn "Please create it manually with: RDS_PASSWORD=your_password"
+        log_warn "stock-processor(Supernoba-back)가 POSTGRES_PASSWORD를 읽습니다."
 
         # 템플릿 생성
         cat > "$SECRETS_DIR/rds.env.template" << 'EOF'
 # RDS PostgreSQL Password
+# stock-processor(Supernoba-back)용. 코드(main.cpp)가 POSTGRES_PASSWORD를 읽음.
 # 이 파일을 rds.env로 복사하고 비밀번호를 설정하세요
-RDS_PASSWORD=your_password_here
+POSTGRES_PASSWORD=your_password_here
 EOF
         chown ec2-user:ec2-user "$SECRETS_DIR/rds.env.template"
         chmod 600 "$SECRETS_DIR/rds.env.template"
         log_info "Created template: $SECRETS_DIR/rds.env.template"
+    else
+        # 기존 rds.env에 RDS_PASSWORD가 있으면 POSTGRES_PASSWORD로 변경 안내
+        if grep -q "RDS_PASSWORD" "$SECRETS_DIR/rds.env" 2>/dev/null; then
+            log_warn "rds.env uses RDS_PASSWORD but processor reads POSTGRES_PASSWORD!"
+            log_warn "Update: sed -i 's/RDS_PASSWORD/POSTGRES_PASSWORD/' $SECRETS_DIR/rds.env"
+        fi
     fi
 }
 
@@ -375,8 +386,8 @@ main() {
     echo "Memory limits applied based on system memory (${total_mem_mb}MB)"
     echo ""
     echo "Next steps:"
-    echo "  1. Create RDS password file (if needed):"
-    echo "     echo 'RDS_PASSWORD=your_password' > ~/.secrets/rds.env"
+    echo "  1. Create RDS password file (processor용, if needed):"
+    echo "     echo 'POSTGRES_PASSWORD=your_password' > ~/.secrets/rds.env"
     echo "     chmod 600 ~/.secrets/rds.env"
     echo ""
     echo "  2. Enable services:"

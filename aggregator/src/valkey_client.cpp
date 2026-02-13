@@ -481,4 +481,46 @@ double ValkeyClient::get_ticker_price(const std::string& symbol) {
     return price;
 }
 
+int ValkeyClient::close_stale_candles(const std::string& current_minute_kst) {
+    if (!ctx_) return 0;
+
+    static const std::string lua_script = R"(
+        local current_minute = ARGV[1]
+        local keys = redis.call("KEYS", "candle:1m:*")
+        local closed = 0
+        for _, key in ipairs(keys) do
+            local t = redis.call("HGET", key, "t")
+            if t and t < current_minute then
+                local arr = redis.call("HGETALL", key)
+                if #arr > 0 then
+                    local obj = {}
+                    for i = 1, #arr, 2 do
+                        obj[arr[i]] = arr[i + 1]
+                    end
+                    local symbol = string.sub(key, 11)
+                    local closedKey = "candle:closed:1m:" .. symbol
+                    redis.call("LPUSH", closedKey, cjson.encode(obj))
+                    redis.call("LTRIM", closedKey, 0, 999)
+                    redis.call("DEL", key)
+                    redis.call("EXPIRE", closedKey, 21600)
+                    closed = closed + 1
+                end
+            end
+        end
+        return closed
+    )";
+
+    redisReply* reply = (redisReply*)redisCommand(ctx_,
+        "EVAL %s 0 %s", lua_script.c_str(), current_minute_kst.c_str());
+
+    if (!reply) return 0;
+
+    int closed = 0;
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        closed = static_cast<int>(reply->integer);
+    }
+    freeReplyObject(reply);
+    return closed;
+}
+
 } // namespace aggregator

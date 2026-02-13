@@ -35,6 +35,7 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-preview-handler"; Path = "Supernoba-preview-handler"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-favorites"; Path = "Supernoba-favorites"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-creator-requests"; Path = "Supernoba-creator-requests"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-push-tokens"; Path = "Supernoba-push-tokens"; HasPackageJson = $true; HasBuild = $false },
 
     # === WebSocket ===
     @{ Name = "Supernoba-connect-handler"; Path = "Supernoba-connect-handler"; HasPackageJson = $true; HasBuild = $false },
@@ -44,9 +45,12 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-cleanup-handler"; Path = "Supernoba-cleanup-handler"; HasPackageJson = $true; HasBuild = $false },
 
     # === Event/Batch ===
-    @{ Name = "Supernoba-user-init"; Path = "Supernoba-user-init"; HasPackageJson = $true; HasBuild = $false },
+    @{ Name = "Supernoba-push-sender"; Path = "Supernoba-push-sender"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-ipo-processor"; Path = "Supernoba-ipo-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-auth"; Path = "Supernoba-auth"; HasPackageJson = $true; HasBuild = $false },
+
+    # DEPRECATED: Supernoba-auth /auth/init 엔드포인트로 통합됨 - 2026-02-14
+    # Supernoba-user-init
 
     # === Utility ===
     @{ Name = "Supernoba-ec2-mgmt"; Path = "Supernoba-ec2-mgmt"; HasPackageJson = $true; HasBuild = $false },

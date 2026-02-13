@@ -229,6 +229,7 @@ int main(int argc, char* argv[]) {
     int64_t last_ranking_check = 0;  // 시간별 랭킹 업데이트
     int64_t last_stats_time = 0;  // 통계 로깅 시간
     int64_t last_cleanup_time = 0;  // 정리 시간
+    int64_t last_stale_check = 0;   // 스테일 캔들 체크 시간
 
     const int SECONDS_1H = 3600;
     const int SECONDS_1D = 24 * 3600;
@@ -250,6 +251,16 @@ int main(int argc, char* argv[]) {
     while (running) {
         try {
             int64_t now = get_current_epoch();
+
+            // 0. Close stale 1m candles (every 10s)
+            if (now - last_stale_check > 10) {
+                std::string current_minute_kst = Aggregator::epoch_to_ymdhm(now);
+                int closed = candle_valkey.close_stale_candles(current_minute_kst);
+                if (closed > 0) {
+                    Logger::info("[STALE] Closed", closed, "stale 1m candles");
+                }
+                last_stale_check = now;
+            }
 
             // 1. closed 캔들이 있는 심볼 목록 조회
             auto symbols = candle_valkey.get_closed_symbols();

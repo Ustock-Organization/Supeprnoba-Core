@@ -784,8 +784,8 @@ bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64
         end
         
         -- 현재 캔들과 닫힌 캔들 버퍼에 만료 시간 설정
-        redis.call("EXPIRE", key, 300) -- 현재 캔들은 5분 후 만료
-        redis.call("EXPIRE", closedKey, 3600) -- 닫힌 캔들 버퍼는 1시간 후 만료
+        redis.call("EXPIRE", key, 600) -- 현재 캔들은 10분 후 만료 (stale check 10초 × 60배 마진)
+        redis.call("EXPIRE", closedKey, 21600) -- 닫힌 캔들 버퍼는 6시간 후 만료 (aggregator 장애 대비)
         
         return "OK"
     )";

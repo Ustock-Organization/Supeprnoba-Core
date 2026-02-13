@@ -410,6 +410,7 @@ function redirectWithTokens(redirectUri, platform, tokens, xUser) {
     name: xUser.name || xUser.username,
     email: tokens.email || xUser.email || '',
     avatar_url: xUser.profile_image_url?.replace('_normal', '') || '',
+    verified: String(xUser.verified || false),
   });
 
   let finalRedirect;
@@ -478,7 +479,7 @@ async function handleInitCheck(event) {
  */
 async function handleUserInit(event) {
   const body = JSON.parse(event.body || '{}');
-  const { userId, email, displayName, avatarUrl, provider } = body;
+  const { userId, email, displayName, avatarUrl, provider, verified } = body;
 
   if (!userId) {
     return err(400, 'userId is required');
@@ -497,12 +498,26 @@ async function handleUserInit(event) {
     const user = existingUserResult.Item;
     const boltBalance = user.balances?.BOLT || { available: 0, locked: 0 };
 
+    // X 인증 상태 업데이트 (변경 시에만)
+    if (verified !== undefined && user.is_verified !== (verified === true)) {
+      await ddb.send(new UpdateCommand({
+        TableName: USERS_TABLE,
+        Key: { user_id: userId },
+        UpdateExpression: 'SET is_verified = :v, updated_at = :now',
+        ExpressionAttributeValues: {
+          ':v': verified === true,
+          ':now': new Date().toISOString(),
+        },
+      }));
+    }
+
     return ok({
       is_new_user: false,
       initialized: true,
       balance: boltBalance.available,
       is_admin: user.is_admin === true,
       is_tester: user.is_tester === true,
+      is_verified: verified === true || user.is_verified === true,
       settings: {
         maintenanceMode: settings.system?.maintenanceMode || false,
         tradingEnabled: settings.system?.tradingEnabled !== false,
@@ -532,6 +547,7 @@ async function handleUserInit(event) {
         provider: provider || 'unknown',
         is_admin: false,
         is_tester: false,
+        is_verified: verified === true,
         // Multi-currency balances
         balances: {
           BOLT: {
