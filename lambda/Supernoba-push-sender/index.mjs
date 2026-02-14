@@ -106,9 +106,11 @@ function sendApns(token, payload, jwt) {
 
     let responseData = '';
     let status;
+    let apnsId;
 
     req.on('response', (headers) => {
       status = headers[':status'];
+      apnsId = headers['apns-id'];
     });
 
     req.on('data', (chunk) => {
@@ -118,10 +120,11 @@ function sendApns(token, payload, jwt) {
     req.on('end', () => {
       client.close();
       if (status === 200) {
-        resolve({ success: true });
+        console.log(`[push-sender] APNs OK: apns-id=${apnsId} token=${token.slice(0, 8)}...`);
+        resolve({ success: true, apnsId });
       } else {
         const error = responseData ? JSON.parse(responseData) : {};
-        console.warn('[push-sender] APNs error:', status, error);
+        console.warn(`[push-sender] APNs error: status=${status} apns-id=${apnsId}`, error);
         resolve({ success: false, status, error });
       }
     });
@@ -254,7 +257,7 @@ export const handler = async (event) => {
       const result = await sendApns(pushToken, apnsPayload, jwt);
 
       if (result.success) {
-        console.log(`[push-sender] Sent: ${userId} ${symbol} ${sideText} ${quantity}주`);
+        console.log(`[push-sender] Sent: ${userId} ${symbol} ${sideText} ${quantity}주 apns-id=${result.apnsId} token=${pushToken.slice(0, 8)}...${pushToken.slice(-4)} host=${APNS_HOST}`);
         sent++;
       } else {
         // 410 Gone = 토큰 만료 (앱 삭제 등)
