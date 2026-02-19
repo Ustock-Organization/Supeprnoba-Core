@@ -49,12 +49,8 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-ipo-processor"; Path = "Supernoba-ipo-processor"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-auth"; Path = "Supernoba-auth"; HasPackageJson = $true; HasBuild = $false },
 
-    # DEPRECATED: Supernoba-auth /auth/init 엔드포인트로 통합됨 - 2026-02-14
-    # Supernoba-user-init
-
     # === Utility ===
     @{ Name = "Supernoba-ec2-mgmt"; Path = "Supernoba-ec2-mgmt"; HasPackageJson = $true; HasBuild = $false },
-    @{ Name = "Supernoba-x-auth"; Path = "Supernoba-x-auth"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-symbol-cleanup"; Path = "Supernoba-symbol-cleanup"; HasPackageJson = $true; HasBuild = $false },
 
     # === Step Functions (delisting) ===
@@ -140,9 +136,10 @@ foreach ($func in $LAMBDA_FUNCTIONS) {
         Write-Host "Creating ZIP file..." -ForegroundColor Gray
         
         if (Test-Path "dist") {
-            # esbuild build output
+            # esbuild build output (index.js or index.mjs)
             Set-Location dist
-            Compress-Archive -Path "index.js" -DestinationPath "..\function.zip" -Force -CompressionLevel Fastest
+            $builtFile = if (Test-Path "index.mjs") { "index.mjs" } else { "index.js" }
+            Compress-Archive -Path $builtFile -DestinationPath "..\function.zip" -Force -CompressionLevel Fastest
             Set-Location ..
         }
         elseif ($func.HasPackageJson) {

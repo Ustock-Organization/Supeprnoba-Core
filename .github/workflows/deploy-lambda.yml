@@ -93,10 +93,7 @@ jobs:
             path: lambda/Supernoba-cleanup-handler
             has_build: false
 
-          # === Event/Batch (3) ===
-          - name: Supernoba-user-init
-            path: lambda/Supernoba-user-init
-            has_build: false
+          # === Event/Batch (2) ===
           - name: Supernoba-ipo-processor
             path: lambda/Supernoba-ipo-processor
             has_build: false
@@ -104,12 +101,9 @@ jobs:
             path: lambda/Supernoba-auth
             has_build: false
 
-          # === Utility (3) ===
+          # === Utility (2) ===
           - name: Supernoba-ec2-mgmt
             path: lambda/Supernoba-ec2-mgmt
-            has_build: false
-          - name: Supernoba-x-auth
-            path: lambda/Supernoba-x-auth
             has_build: false
           - name: Supernoba-symbol-cleanup
             path: lambda/Supernoba-symbol-cleanup

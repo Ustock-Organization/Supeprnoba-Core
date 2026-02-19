@@ -164,15 +164,22 @@ async function getDbCredentials() {
 export const handler = async (event) => {
   const handlerStart = Date.now();
   logger.debug(` ===== HANDLER START =====`);
-  
+
   const params = event.queryStringParameters || {};
   const symbol = (params.symbol || 'TEST').toLowerCase();
   const interval = params.interval || '1m';
   const limit = Math.min(parseInt(params.limit || '100'), 500);
-  
-  logger.debug(` Chart request: ${symbol} ${interval} limit=${limit}`);
-  
+
+  logger.debug(` Chart request: ${symbol} ${interval} limit=${limit} type=${params.type || 'candle'}`);
+
   try {
+    // type=prevClose: symbol_prev_close 테이블에서 직접 조회
+    if (params.type === 'prevClose') {
+      const result = await getPrevCloseFromRDS(symbol);
+      logger.debug(` prevClose result: ${JSON.stringify(result)} (${elapsed(handlerStart)})`);
+      return { statusCode: 200, headers, body: JSON.stringify(result) };
+    }
+
     const intervalSeconds = INTERVAL_SECONDS[interval];
     if (!intervalSeconds) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: `Invalid interval: ${interval}` }) };
@@ -202,6 +209,73 @@ export const handler = async (event) => {
     return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
   }
 };
+
+// symbol_prev_close 테이블에서 전일종가 조회 (Aggregator가 일 경계에서 관리)
+// Fallback: symbol_prev_close가 비어있으면 candle_history에서 오늘 자정(KST) 이전 마지막 캔들 사용
+async function getPrevCloseFromRDS(symbol) {
+  const funcStart = Date.now();
+  const upperSymbol = symbol.toUpperCase();
+  logger.debug(` getPrevCloseFromRDS START: ${upperSymbol}`);
+
+  const creds = await getDbCredentials();
+  const client = new Client({
+    host: RDS_HOST, port: RDS_PORT, database: DB_NAME,
+    user: creds.username, password: creds.password,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000
+  });
+
+  try {
+    await client.connect();
+
+    // 1차: symbol_prev_close 테이블 (Aggregator 관리, 가장 정확)
+    const query1 = `
+      SELECT prev_close, prev_trading_date, last_close, last_trading_date
+      FROM symbol_prev_close
+      WHERE symbol = $1
+    `;
+    const result1 = await client.query(query1, [upperSymbol]);
+
+    if (result1.rows.length > 0) {
+      const row = result1.rows[0];
+      logger.debug(` getPrevCloseFromRDS: ${upperSymbol} from symbol_prev_close=${row.prev_close} (${elapsed(funcStart)})`);
+      return {
+        symbol: upperSymbol,
+        prevClose: parseFloat(row.prev_close),
+        prevTradingDate: row.prev_trading_date,
+        lastClose: parseFloat(row.last_close),
+        lastTradingDate: row.last_trading_date
+      };
+    }
+
+    // 2차 fallback: candle_history에서 KST 자정 이전 마지막 단봉(30m 이하)의 close
+    // 1h/4h/1d 캔들은 자정을 넘을 수 있어 prevClose가 부정확함
+    const query2 = `
+      SELECT close, time_epoch, interval
+      FROM candle_history
+      WHERE symbol = $1
+        AND interval IN ('1m', '5m', '10m', '15m', '30m')
+        AND time_epoch < EXTRACT(EPOCH FROM (date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'Asia/Seoul'))
+      ORDER BY time_epoch DESC
+      LIMIT 1
+    `;
+    const result2 = await client.query(query2, [symbol.toLowerCase()]);
+
+    if (result2.rows.length > 0) {
+      const row = result2.rows[0];
+      logger.debug(` getPrevCloseFromRDS: ${upperSymbol} from candle_history=${row.close} (${elapsed(funcStart)})`);
+      return {
+        symbol: upperSymbol,
+        prevClose: parseFloat(row.close)
+      };
+    }
+
+    logger.debug(` getPrevCloseFromRDS: ${upperSymbol} not found (${elapsed(funcStart)})`);
+    return { symbol: upperSymbol, prevClose: 0 };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
 
 // RDS에서 캔들 조회
 async function getCandles(symbol, interval, limit) {

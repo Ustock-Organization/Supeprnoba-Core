@@ -63,6 +63,17 @@ bool EngineCore::addOrder(OrderPtr order) {
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
+        // Dedup Layer 1: reject recently processed orders (Kinesis at-least-once defense)
+        auto dedup_it = processed_orders_.find(order_id);
+        if (dedup_it != processed_orders_.end()) {
+            auto age_s = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - dedup_it->second).count();
+            Logger::warn("DUPLICATE order rejected:", order_id, symbol,
+                         "(processed", age_s, "s ago)");
+            ++duplicates_rejected_;
+            return false;
+        }
+
         auto book = getOrCreateBook(symbol);
 
         if (!book) {
@@ -83,6 +94,14 @@ bool EngineCore::addOrder(OrderPtr order) {
         book->perform_callbacks();
 
         ++total_orders_processed_;
+
+        // Record processed order for dedup
+        processed_orders_[order_id] = std::chrono::steady_clock::now();
+
+        // Periodic TTL cleanup (every 1000 orders)
+        if (total_orders_processed_ % 1000 == 0) {
+            cleanupProcessedOrders();
+        }
     }
 
     Logger::debug("Order added:", order_id, symbol);
@@ -363,6 +382,26 @@ std::vector<std::string> EngineCore::getAllSymbols() const {
         symbols.push_back(sym);
     }
     return symbols;
+}
+
+void EngineCore::cleanupProcessedOrders() {
+    // Called within locked section — evict entries older than DEDUP_TTL_SECONDS
+    auto now = std::chrono::steady_clock::now();
+    size_t evicted = 0;
+    for (auto it = processed_orders_.begin(); it != processed_orders_.end(); ) {
+        auto age_s = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second).count();
+        if (age_s > DEDUP_TTL_SECONDS) {
+            it = processed_orders_.erase(it);
+            ++evicted;
+        } else {
+            ++it;
+        }
+    }
+    if (evicted > 0) {
+        Logger::info("Dedup cleanup: evicted", evicted, "entries,",
+                     processed_orders_.size(), "remaining");
+    }
 }
 
 } // namespace aws_wrapper

@@ -34,7 +34,7 @@ void MarketDataHandler::on_accept(const OrderPtr& order) {
 
     // Kinesis로 ACCEPTED 이벤트 발행 (order-status 스트림) - 주문 정보 포함
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "ACCEPTED", "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
@@ -48,7 +48,7 @@ void MarketDataHandler::on_reject(const OrderPtr& order, const char* reason) {
     
     // Kinesis로 REJECTED 이벤트 발행 (order-status 스트림)
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "REJECTED", reason ? reason : "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
@@ -167,7 +167,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
         // 전량 체결된 주문은 ORDER_STATUS (FILLED)를 order-status 스트림으로 발행
         if (buyer_fully_filled) {
             const auto& buyer_order = order->is_buy() ? order : matched_order;
-            std::string buyer_type = (buyer_order->price() == 0) ? "MARKET" : "LIMIT";
+            std::string buyer_type = buyer_order->order_type();
             producer_->publishOrderStatus(symbol, bo, buyer_id, "FILLED", "",
                                           buyer_order->price(), buyer_order->order_qty(),
                                           true, buyer_type);
@@ -176,7 +176,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 
         if (seller_fully_filled) {
             const auto& seller_order = order->is_buy() ? matched_order : order;
-            std::string seller_type = (seller_order->price() == 0) ? "MARKET" : "LIMIT";
+            std::string seller_type = seller_order->order_type();
             producer_->publishOrderStatus(symbol, so, seller_id, "FILLED", "",
                                           seller_order->price(), seller_order->order_qty(),
                                           false, seller_type);
@@ -205,7 +205,7 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
     
     // Kinesis로 CANCEL 이벤트 발행 (DynamoDB 업데이트를 위해)
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "CANCELLED", "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
@@ -218,7 +218,7 @@ void MarketDataHandler::on_cancel_reject(const OrderPtr& order, const char* reas
     
     // Kinesis로 CANCEL_REJECTED 이벤트 발행
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "CANCEL_REJECTED", reason ? reason : "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
@@ -234,7 +234,7 @@ void MarketDataHandler::on_replace(const OrderPtr& order,
     
     // Kinesis로 REPLACED 이벤트 발행
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "REPLACED", "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
@@ -247,7 +247,7 @@ void MarketDataHandler::on_replace_reject(const OrderPtr& order, const char* rea
     
     // Kinesis로 REPLACE_REJECTED 이벤트 발행
     if (producer_) {
-        std::string otype = (order->price() == 0) ? "MARKET" : "LIMIT";
+        std::string otype = order->order_type();
         producer_->publishOrderStatus(order->symbol(), order->order_id(),
                                       order->user_id(), "REPLACE_REJECTED", reason ? reason : "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);

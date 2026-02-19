@@ -1004,10 +1004,8 @@ export {
 | Supernoba-asset-handler | No | Yes (WITH_API_KEY) | Medium |
 | Supernoba-order-router | No | Yes (STANDARD) | High |
 | Supernoba-auth | No | Yes (STANDARD) | Medium |
-| Supernoba-x-auth | No | Yes (STANDARD) | Medium |
 | Supernoba-creator-requests | No | Yes (FULL) | Medium |
 | Supernoba-favorites | No | Yes (FULL) | Low |
-| ~~Supernoba-user-init~~ | DEPRECATED | Supernoba-auth로 통합 | - |
 | Supernoba-chart-data-handler | No | Yes (READONLY) | Low |
 | Supernoba-preview-handler | No | Yes (READONLY) | Low |
 | Supernoba-ec2-mgmt | No | Yes (STANDARD) | Low |

@@ -645,15 +645,20 @@ async function handleSyncUser(event) {
       finalEmail = email?.endsWith('@x.supernoba.com') ? '-' : (email || '-');
     }
 
+    // displayName이 유효하면 항상 업데이트 (모지바케 자동 복구), 없으면 기존값 보존
+    const hasValidName = displayName && displayName.trim();
+    const nameExprs = hasValidName
+      ? 'username = :username, full_name = :fullName'
+      : 'username = if_not_exists(username, :username), full_name = if_not_exists(full_name, :fullName)';
+
     await ddb.send(new UpdateCommand({
       TableName: USERS_TABLE,
       Key: { user_id: userId },
-      UpdateExpression: `SET 
+      UpdateExpression: `SET
         linked_accounts = :linkedAccounts,
         cognito_subs = :cognitoSubs,
         email = :email,
-        username = if_not_exists(username, :username),
-        full_name = if_not_exists(full_name, :fullName),
+        ${nameExprs},
         avatar_url = :avatarUrl,
         primary_provider = if_not_exists(primary_provider, :provider),
         updated_at = :now`,
@@ -661,8 +666,8 @@ async function handleSyncUser(event) {
         ':linkedAccounts': linkedAccounts,
         ':cognitoSubs': cognitoSubs,
         ':email': finalEmail,
-        ':username': displayName || email?.split('@')[0] || 'User',
-        ':fullName': displayName || '',
+        ':username': hasValidName ? displayName : (email?.split('@')[0] || 'User'),
+        ':fullName': hasValidName ? displayName : '',
         ':avatarUrl': avatarUrl || user.avatar_url || null,
         ':provider': provider,
         ':now': now,

@@ -3,9 +3,11 @@
 #include <book/depth_order_book.h>
 #include "order.h"
 #include "market_data_handler.h"
+#include <chrono>
 #include <map>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace aws_wrapper {
@@ -54,19 +56,26 @@ public:
     uint64_t getTotalTradesExecuted() const { return total_trades_executed_; }
     
     void incrementTradeCount() { ++total_trades_executed_; }
-    
+    uint64_t getDuplicatesRejected() const { return duplicates_rejected_; }
+
 private:
     OrderBookPtr getOrCreateBook(const std::string& symbol);
     OrderPtr findOrder(const std::string& symbol, const std::string& order_id);
-    
+    void cleanupProcessedOrders();
+
     std::map<std::string, OrderBookPtr> books_;
     std::map<std::string, std::map<std::string, OrderPtr>> order_maps_;
     mutable std::shared_mutex rw_mutex_;  // shared_mutex for read-write locking
     MarketDataHandler* handler_;
     RedisClient* operating_redis_ = nullptr;
 
+    // Dedup Layer 1: recently processed order IDs (TTL-based eviction)
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> processed_orders_;
+    static constexpr int DEDUP_TTL_SECONDS = 120;  // 2-minute TTL
+
     uint64_t total_orders_processed_ = 0;
     uint64_t total_trades_executed_ = 0;
+    uint64_t duplicates_rejected_ = 0;
 };
 
 } // namespace aws_wrapper

@@ -162,6 +162,14 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrders(const std::string& table_
                                     order->order_id());
                         continue;
                     }
+                    // Safety: skip orders with suspiciously large remaining qty.
+                    // Caused by legacy bug (hardcoded qty=999999999 in fill_processor).
+                    if (remaining > 100000000) {
+                        Logger::warn("Suspiciously large remaining qty, skipping:",
+                                    order->order_id(), "remaining:", remaining,
+                                    "quantity:", quantity, "filled:", filled_qty);
+                        continue;
+                    }
                     order->setOrderQty(remaining);
                     ++total_partial;
                     Logger::info("PARTIAL_FILL order loaded:", order->order_id(),
@@ -302,6 +310,12 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrdersBySymbol(
                 if (status == "PARTIAL_FILL") {
                     uint64_t remaining = quantity - filled_qty;
                     if (remaining == 0) continue;
+                    // Safety: skip orders with suspiciously large remaining qty
+                    if (remaining > 100000000) {
+                        Logger::warn("Suspiciously large remaining qty in symbol scan, skipping:",
+                                    order->order_id(), "remaining:", remaining);
+                        continue;
+                    }
                     order->setOrderQty(remaining);
                 } else {
                     order->setOrderQty(quantity);

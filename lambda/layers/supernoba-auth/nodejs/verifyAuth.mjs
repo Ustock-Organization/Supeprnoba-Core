@@ -489,6 +489,32 @@ export async function verifySelf(event, resourceUserId) {
     resolvedUserId = `x_${xId}`;
   }
 
+  // Google 로그인 사용자: identities 클레임에서 Google sub 추출 → google_{sub} 형식
+  if (resolvedUserId === authResult.userId && resourceUserId?.startsWith('google_')) {
+    let googleSub = null;
+    try {
+      const identities = typeof authResult.payload?.identities === 'string'
+        ? JSON.parse(authResult.payload.identities)
+        : authResult.payload?.identities;
+      if (Array.isArray(identities)) {
+        const googleId = identities.find(id => id.providerName === 'Google');
+        if (googleId) googleSub = googleId.userId;
+      }
+    } catch { /* ignore parse errors */ }
+
+    // Fallback: cognito:username "Google_123456" 패턴
+    if (!googleSub) {
+      const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+      if (cognitoUsername.startsWith('Google_')) {
+        googleSub = cognitoUsername.replace('Google_', '');
+      }
+    }
+
+    if (googleSub) {
+      resolvedUserId = `google_${googleSub}`;
+    }
+  }
+
   if (resolvedUserId !== resourceUserId) {
     console.warn('[verifySelf] User ID mismatch:', { resolved: resolvedUserId, resource: resourceUserId, original: authResult.userId });
     return {

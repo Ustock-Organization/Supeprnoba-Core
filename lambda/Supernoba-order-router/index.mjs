@@ -12,7 +12,7 @@ let getValkeyClient;
 let valkey = null;
 try {
   ({ getValkeyClient } = await import('/opt/nodejs/index.mjs'));
-  valkey = getValkeyClient({ type: 'operating', preset: 'default' });
+  valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
 } catch (e) {
   console.warn('[order-router] Common layer not available (Valkey disabled):', e.message);
 }
@@ -186,9 +186,22 @@ async function isActiveSymbol(symbol, userId = null) {
 }
 
 // === Tester Account Verification (5분 캐시) ===
-// is_admin 또는 is_tester 컬럼 중 하나라도 true면 거래 허용
+// 베타 모드 OFF → 전체 개방, 베타 모드 ON → is_admin/is_tester만 허용
 async function isAuthorizedTester(userId) {
-  // 환경변수로 테스터 검증 비활성화 가능
+  // 1. 베타 모드 확인 — OFF면 모든 유저 허용
+  if (valkey) {
+    try {
+      const betaMode = await valkey.get('platform:beta_mode');
+      if (betaMode === 'false') {
+        return true;  // 베타 모드 OFF → 전체 개방
+      }
+    } catch (e) {
+      // Valkey 장애 시 기존 로직으로 fallback (안전)
+      console.warn('[TesterCheck] Beta mode check failed, falling back to tester check:', e.message);
+    }
+  }
+
+  // 2. 베타 모드 ON (기본) 또는 Valkey 장애 → 기존 테스터 검증
   if (process.env.DISABLE_TESTER_CHECK === 'true') {
     return true;
   }

@@ -38,7 +38,10 @@ const s3 = new S3Client({ region: 'ap-northeast-2' });
 // Layer를 통한 클라이언트 초기화
 const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
-const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
+const dynamodb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: 'ap-northeast-2' }),
+  { marshallOptions: { removeUndefinedValues: true } }
+);
 
 // Layer의 CORS.FULL 사용
 const H = CORS.FULL;
@@ -94,6 +97,44 @@ export const handler = async (event) => {
       }
       if (m === 'POST') {
         return err(410, 'Authentication moved to Cognito. Use /auth/login endpoint instead.');
+      }
+    }
+
+    // ==========================================
+    // betaMode - 베타 모드 ON/OFF (관리자 전용)
+    // ON: 테스터만 거래 가능, OFF: 전체 유저 거래 가능
+    // ==========================================
+    if (q.type === 'betaMode') {
+      if (m === 'GET') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        try {
+          const betaMode = await operatingCache.get('platform:beta_mode');
+          return ok({ betaMode: betaMode !== 'false' });  // 기본값: true (베타)
+        } catch (e) {
+          console.error('[betaMode GET] Error:', e.message);
+          return ok({ betaMode: true });  // Valkey 장애 시 기본값: 베타 ON
+        }
+      }
+
+      if (m === 'PUT') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { enabled } = JSON.parse(event.body || '{}');
+        if (typeof enabled !== 'boolean') {
+          return err(400, 'enabled (boolean) required');
+        }
+
+        try {
+          await operatingCache.set('platform:beta_mode', enabled ? 'true' : 'false');
+          console.log(`[betaMode] Beta mode set to: ${enabled} by admin ${adminCheck.userId}`);
+          return ok({ success: true, betaMode: enabled });
+        } catch (e) {
+          console.error('[betaMode PUT] Error:', e.message);
+          return err(500, 'Failed to set beta mode: ' + e.message);
+        }
       }
     }
 
@@ -436,7 +477,9 @@ export const handler = async (event) => {
             manualSymbols: manualSymbols !== undefined ? manualSymbols : currentTickerTape.manualSymbols,
             autoCount: autoCount !== undefined ? autoCount : currentTickerTape.autoCount,
             scrollSpeed: scrollSpeed !== undefined ? scrollSpeed : currentTickerTape.scrollSpeed,
-            rankingMode: rankingMode !== undefined ? { ...currentTickerTape.rankingMode, ...rankingMode } : currentTickerTape.rankingMode,
+            rankingMode: rankingMode !== undefined
+              ? { ...currentTickerTape.rankingMode, ...rankingMode }
+              : (currentTickerTape.rankingMode || undefined),
             updatedAt: Date.now()
           };
 
