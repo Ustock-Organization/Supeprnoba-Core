@@ -41,10 +41,11 @@ const DELIST_JOBS_TABLE = process.env.DELIST_JOBS_TABLE || 'supernoba-delist-job
 const STATE_MACHINE_ARN = process.env.DELISTING_STATE_MACHINE_ARN || 'arn:aws:states:ap-northeast-2:264520158196:stateMachine:supernoba-delisting';
 const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
 
-// Layer를 통한 클라이언트 초기화 (4-Cache: operating + depth + candle)
+// Layer를 통한 클라이언트 초기화 (4-Cache: operating + depth + candle + backup)
 const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
 const candleCache = getValkeyClient({ type: 'candle', preset: 'admin' });
+const backupCache = getValkeyClient({ type: 'backup', preset: 'admin' });
 const sfn = new SFNClient({ region: 'ap-northeast-2' });
 const dynamodb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 const secrets = new SecretsManagerClient({ region: 'ap-northeast-2' });
@@ -679,6 +680,19 @@ export const handler = async (event) => {
         await operatingCache.sadd('subscribed:symbols', sym);
         await operatingCache.sadd('active:symbols', sym);
 
+        // 랭킹 Sorted Set 초기 점수 (신규 종목 즉시 노출)
+        try {
+          const lp = Item.listingPrice || 0;
+          const ts = Item.totalShares || 0;
+          await Promise.all([
+            backupCache.zadd('ranking:volume', 1, sym),
+            backupCache.zadd('ranking:marketcap', lp * ts, sym),
+          ]);
+          console.log(`[ACTIVATE] Ranking scores initialized for ${sym}: vol=1, mcap=${lp * ts}`);
+        } catch (rankErr) {
+          console.warn(`[ACTIVATE] Ranking init failed (non-fatal): ${rankErr.message}`);
+        }
+
         return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
       }
 
@@ -781,6 +795,18 @@ export const handler = async (event) => {
 
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
         await operatingCache.sadd('active:symbols', symbol.toUpperCase());
+
+        // 랭킹 Sorted Set 초기 점수 (신규 종목 즉시 노출)
+        try {
+          const mcap = (listingPrice || 0) * (totalShares || 0);
+          await Promise.all([
+            backupCache.zadd('ranking:volume', 1, symbol.toUpperCase()),
+            backupCache.zadd('ranking:marketcap', mcap, symbol.toUpperCase()),
+          ]);
+          console.log(`[APPROVE] Ranking scores initialized for ${symbol.toUpperCase()}: vol=1, mcap=${mcap}`);
+        } catch (rankErr) {
+          console.warn(`[APPROVE] Ranking init failed (non-fatal): ${rankErr.message}`);
+        }
 
         // IPO 주문 처리
         let ipoError = null;
@@ -1074,6 +1100,19 @@ export const handler = async (event) => {
         console.log(`[DELETE] MM pre-stop sent + removed from mm sets for ${sym}`);
       } catch (mmErr) {
         console.warn(`[DELETE] MM pre-stop failed (continuing): ${mmErr.message}`);
+      }
+
+      // 3.8. 랭킹 Sorted Set 제거
+      try {
+        await Promise.all([
+          backupCache.zrem('ranking:volume', sym),
+          backupCache.zrem('ranking:marketcap', sym),
+          backupCache.zrem('ranking:gainers', sym),
+          backupCache.zrem('ranking:losers', sym),
+        ]);
+        console.log(`[DELETE] Ranking entries removed for ${sym}`);
+      } catch (rankErr) {
+        console.warn(`[DELETE] Ranking cleanup failed (non-fatal): ${rankErr.message}`);
       }
 
       // 4. Step Functions 실행 시작

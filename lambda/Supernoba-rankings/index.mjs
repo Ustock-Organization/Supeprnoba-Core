@@ -60,6 +60,7 @@ const isValidType = (type) => VALID_TYPES.includes(type);
 
 /**
  * 스냅샷 캐시에서 랭킹 조회
+ * O(K) where K = snapshot 크기 (최대 100). 종목 수와 무관.
  */
 async function getRankingsFromSnapshot(type, limit, offset) {
   try {
@@ -70,29 +71,18 @@ async function getRankingsFromSnapshot(type, limit, offset) {
     let rankings = snapshot[type] || [];
     const activeSymbols = await getActiveSymbols();
 
-    // 활성 종목이 없으면 fallback
     if (activeSymbols.size === 0) return null;
 
-    // 스냅샷 데이터를 score map으로 변환
-    const scoreField = type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change';
-    const scoreMap = {};
-    rankings.forEach(r => { scoreMap[r.symbol] = r[scoreField] || 0; });
-
-    // 모든 활성 종목 merge (스냅샷에 없는 종목은 score=0)
-    let merged = [];
-    for (const symbol of activeSymbols) {
-      merged.push({ symbol, [scoreField]: scoreMap[symbol] || 0 });
-    }
-
-    // 정렬 + 순위
-    merged.sort((a, b) => (b[scoreField] || 0) - (a[scoreField] || 0));
-    merged = merged.map((r, i) => ({ ...r, rank: i + 1 }));
+    // snapshot은 이미 정렬된 상위 100개 — activeSet으로 필터만 하면 됨
+    rankings = rankings
+      .filter(r => activeSymbols.has(r.symbol))
+      .map((r, i) => ({ ...r, rank: offset + i + 1 }));
 
     return {
       timestamp: snapshot.timestamp,
       type,
-      total: merged.length,
-      rankings: merged.slice(offset, offset + limit)
+      total: rankings.length,
+      rankings: rankings.slice(offset, offset + limit)
     };
   } catch (e) {
     console.warn('[rankings] Snapshot cache error:', e.message);
@@ -102,37 +92,33 @@ async function getRankingsFromSnapshot(type, limit, offset) {
 
 /**
  * 직접 Sorted Set에서 랭킹 조회 (캐시 미스 시)
+ * zrevrange로 상위만 읽음 — 종목 수와 무관하게 O(K).
  */
 async function getRankingsFromSortedSet(type, limit, offset) {
   const key = `ranking:${type}`;
   const activeSymbols = await getActiveSymbols();
+  const fetchCount = limit + offset + 50; // 필터링 여유분
 
-  // Valkey sorted set에서 전체 스코어 맵 구축
-  const scoreMap = {};
+  const scoreField = type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change';
+  let rankings = [];
+
   try {
-    const all = await backupCache.zrevrange(key, 0, -1, 'WITHSCORES');
+    const all = await backupCache.zrevrange(key, 0, fetchCount - 1, 'WITHSCORES');
     for (let i = 0; i < all.length; i += 2) {
-      scoreMap[all[i]] = parseFloat(all[i + 1]);
+      const symbol = all[i];
+      if (!activeSymbols.has(symbol)) continue;
+      let score = parseFloat(all[i + 1]);
+      if (type === 'gainers' || type === 'losers') {
+        if (type === 'losers') score = -score;
+        score = score / 1000000;
+      }
+      rankings.push({ symbol, [scoreField]: score });
     }
   } catch (e) {
     console.warn('[rankings] Sorted set read error:', e.message);
   }
 
-  // 모든 활성 종목에 대해 랭킹 항목 생성 (Valkey에 없으면 score=0)
-  const scoreField = type === 'marketcap' ? 'marketCap' : type === 'volume' ? 'volume' : 'change';
-  let rankings = [];
-  for (const symbol of activeSymbols) {
-    let score = scoreMap[symbol] || 0;
-    if (type === 'gainers' || type === 'losers') {
-      if (type === 'losers') score = -score;
-      score = score / 1000000;
-    }
-    rankings.push({ symbol, [scoreField]: score });
-  }
-
-  // 정렬 (내림차순)
-  rankings.sort((a, b) => (b[scoreField] || 0) - (a[scoreField] || 0));
-  rankings = rankings.map((r, i) => ({ ...r, rank: i + 1 }));
+  rankings = rankings.map((r, i) => ({ ...r, rank: offset + i + 1 }));
 
   return {
     timestamp: new Date().toISOString(),
