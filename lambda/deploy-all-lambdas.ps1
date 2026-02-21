@@ -63,7 +63,7 @@ $LAMBDA_FUNCTIONS = @(
     @{ Name = "Supernoba-delete-user-phase1"; Path = "Supernoba-delete-user-phase1"; HasPackageJson = $false; HasBuild = $false },
     @{ Name = "Supernoba-delete-user-phase2"; Path = "Supernoba-delete-user-phase2"; HasPackageJson = $false; HasBuild = $false },
     @{ Name = "Supernoba-delete-user-phase3"; Path = "Supernoba-delete-user-phase3"; HasPackageJson = $false; HasBuild = $false },
-    @{ Name = "Supernoba-delete-user-phase4"; Path = "Supernoba-delete-user-phase4"; HasPackageJson = $false; HasBuild = $false },
+    @{ Name = "Supernoba-delete-user-phase4"; Path = "Supernoba-delete-user-phase4"; HasPackageJson = $true; HasBuild = $false },
     @{ Name = "Supernoba-delete-user-phase5"; Path = "Supernoba-delete-user-phase5"; HasPackageJson = $false; HasBuild = $false },
     @{ Name = "Supernoba-delete-user-phase6"; Path = "Supernoba-delete-user-phase6"; HasPackageJson = $false; HasBuild = $false }
 
