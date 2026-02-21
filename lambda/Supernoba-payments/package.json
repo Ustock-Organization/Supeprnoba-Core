@@ -1,0 +1,11 @@
+{
+  "name": "supernoba-payments",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "User payment API - Stripe Checkout Sessions, Portal, status & history",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "stripe": "^17.0.0"
+  }
+}

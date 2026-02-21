@@ -94,6 +94,22 @@ export async function getYouTubeApiKey() {
 }
 
 /**
+ * Get Stripe secret key with secure fallback
+ * @returns {Promise<string>} - The Stripe secret key
+ */
+export async function getStripeSecretKey() {
+  return getSecret('supernoba/stripe-secret-key', process.env.STRIPE_SECRET_KEY);
+}
+
+/**
+ * Get Stripe webhook secret with secure fallback
+ * @returns {Promise<string>} - The Stripe webhook signing secret
+ */
+export async function getStripeWebhookSecret() {
+  return getSecret('supernoba/stripe-webhook-secret', process.env.STRIPE_WEBHOOK_SECRET);
+}
+
+/**
  * Clear the secrets cache
  */
 export function clearSecretsCache() {
@@ -108,6 +124,8 @@ export const SecretNames = {
   TWITTER_BEARER_TOKEN: 'supernoba/twitter-bearer-token',
   YOUTUBE_API_KEY: 'supernoba/youtube-api-key',
   SUPERNOBA_API_KEY: 'supernoba/api-key',
+  STRIPE_SECRET_KEY: 'supernoba/stripe-secret-key',
+  STRIPE_WEBHOOK_SECRET: 'supernoba/stripe-webhook-secret',
 };
 
 export default {

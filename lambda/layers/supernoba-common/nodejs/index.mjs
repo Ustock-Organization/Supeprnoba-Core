@@ -52,6 +52,8 @@ export {
   getAdminApiKey,
   getTwitterBearerToken,
   getYouTubeApiKey,
+  getStripeSecretKey,
+  getStripeWebhookSecret,
   clearSecretsCache,
   SecretNames,
 } from './secretsManager.mjs';
