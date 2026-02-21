@@ -419,6 +419,16 @@ export async function verifyAdmin(event) {
         userId = `x_${xId}`;
       }
 
+      // 4. Google 로그인: cognito:username "Google_{sub}" 패턴
+      if (userId === authResult.userId) {
+        const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+        if (cognitoUsername.startsWith('Google_')) {
+          userId = `google_${cognitoUsername.replace('Google_', '')}`;
+        } else if (cognitoUsername.startsWith('SignInWithApple_')) {
+          userId = `apple_${cognitoUsername.replace('SignInWithApple_', '')}`;
+        }
+      }
+
       console.log(`[verifyAdmin] Looking up user in DynamoDB:`, {
         finalUserId: userId,
         originalUserId: authResult.userId,
@@ -489,9 +499,10 @@ export async function verifySelf(event, resourceUserId) {
     resolvedUserId = `x_${xId}`;
   }
 
-  // Google 로그인 사용자: identities 클레임에서 Google sub 추출 → google_{sub} 형식
-  if (resolvedUserId === authResult.userId && resourceUserId?.startsWith('google_')) {
+  // Google/Apple 로그인 사용자: identities 클레임에서 sub 추출
+  if (resolvedUserId === authResult.userId && (resourceUserId?.startsWith('google_') || resourceUserId?.startsWith('apple_'))) {
     let googleSub = null;
+    let appleSub = null;
     try {
       const identities = typeof authResult.payload?.identities === 'string'
         ? JSON.parse(authResult.payload.identities)
@@ -499,18 +510,23 @@ export async function verifySelf(event, resourceUserId) {
       if (Array.isArray(identities)) {
         const googleId = identities.find(id => id.providerName === 'Google');
         if (googleId) googleSub = googleId.userId;
+        const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+        if (appleId) appleSub = appleId.userId;
       }
     } catch { /* ignore parse errors */ }
 
-    // Fallback: cognito:username "Google_123456" 패턴
-    if (!googleSub) {
-      const cognitoUsername = authResult.payload?.['cognito:username'] || '';
-      if (cognitoUsername.startsWith('Google_')) {
-        googleSub = cognitoUsername.replace('Google_', '');
-      }
+    // Fallback: cognito:username 패턴
+    const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+    if (!googleSub && cognitoUsername.startsWith('Google_')) {
+      googleSub = cognitoUsername.replace('Google_', '');
+    }
+    if (!appleSub && cognitoUsername.startsWith('SignInWithApple_')) {
+      appleSub = cognitoUsername.replace('SignInWithApple_', '');
     }
 
-    if (googleSub) {
+    if (appleSub && resourceUserId?.startsWith('apple_')) {
+      resolvedUserId = `apple_${appleSub}`;
+    } else if (googleSub && resourceUserId?.startsWith('google_')) {
       resolvedUserId = `google_${googleSub}`;
     }
   }
