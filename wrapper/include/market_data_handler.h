@@ -15,7 +15,6 @@
 namespace aws_wrapper {
 
 class RedisClient;          // forward declaration
-class NotificationClient;   // forward declaration
 class EngineCore;           // forward declaration
 class RankingManager;       // forward declaration
 
@@ -43,7 +42,6 @@ public:
     explicit MarketDataHandler(IProducer* producer,
                                RedisClient* depth_redis = nullptr,
                                RedisClient* candle_redis = nullptr,
-                               NotificationClient* notifier = nullptr,
                                RankingManager* ranking_manager = nullptr);
     
     // === OrderListener ===
@@ -85,7 +83,6 @@ private:
     IProducer* producer_;
     RedisClient* depth_redis_;
     RedisClient* candle_redis_;
-    NotificationClient* notifier_;
     RankingManager* ranking_manager_;
     EngineCore* engine_ = nullptr;
     std::unordered_map<std::string, DayData> symbol_day_data_;

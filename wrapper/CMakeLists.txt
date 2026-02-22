@@ -61,7 +61,6 @@ set(SOURCES
     src/logger.cpp
     src/kinesis_consumer.cpp
     src/kinesis_producer.cpp
-    src/notification_client.cpp
     src/dynamodb_client.cpp
     src/ranking_manager.cpp
     src/checkpoint_manager.cpp

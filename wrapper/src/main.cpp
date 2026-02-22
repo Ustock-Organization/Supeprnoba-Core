@@ -2,7 +2,6 @@
 #include "logger.h"
 #include "engine_core.h"
 #include "market_data_handler.h"
-#include "notification_client.h"
 #include "ranking_manager.h"
 #include "grpc_service.h"
 #include "redis_client.h"
@@ -126,31 +125,6 @@ int main(int argc, char* argv[]) {
         
         // Trade history is now saved via Lambda (Kinesis fills stream)
         
-        // NotificationClient 생성 (WebSocket 직접 알림)
-        // 중요: RedisClient는 Thread-safe하지 않으므로, 백그라운드 스레드용으로 별도 연결 생성
-        RedisClient notification_redis(operating_cache_host, operating_cache_port);
-        bool notification_redis_connected = false;
-        if (operating_connected) {
-             notification_redis_connected = notification_redis.connect();
-             if (notification_redis_connected) {
-                 Logger::info("Redis (notification) connected");
-             }
-        }
-
-        std::string ws_endpoint = Config::get("WEBSOCKET_ENDPOINT", "");
-        NotificationClient notifier(notification_redis_connected ? &notification_redis : nullptr);
-        bool notifier_enabled = false;
-        if (!ws_endpoint.empty()) {
-            notifier_enabled = notifier.initialize(ws_endpoint, aws_region);
-            if (notifier_enabled) {
-                Logger::info("NotificationClient enabled:", ws_endpoint);
-            } else {
-                Logger::warn("NotificationClient initialization failed");
-            }
-        } else {
-            Logger::warn("WEBSOCKET_ENDPOINT not set - notifications disabled");
-        }
-
         // RankingManager 생성 (백업용 Redis 2개: main thread write + bg thread read)
         // 주의: 스레드 시작은 snapshot 복원 후로 지연 (RedisClient thread-safety 문제 방지)
         RankingManager ranking_manager(
@@ -168,7 +142,6 @@ int main(int argc, char* argv[]) {
         MarketDataHandler handler(&producer,
             depth_connected ? &depth_redis : nullptr,
             candle_connected ? &candle_redis : nullptr,
-            notifier_enabled ? &notifier : nullptr,
             ranking_enabled ? &ranking_manager : nullptr);
         EngineCore engine(&handler, operating_connected ? &operating_redis : nullptr);
         

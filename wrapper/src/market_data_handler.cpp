@@ -1,7 +1,6 @@
 #include "market_data_handler.h"
 #include "engine_core.h"
 #include "redis_client.h"
-#include "notification_client.h"
 #include "ranking_manager.h"
 #include "iproducer.h"
 #include "logger.h"
@@ -16,12 +15,11 @@ namespace aws_wrapper {
 
 MarketDataHandler::MarketDataHandler(IProducer* producer, RedisClient* depth_redis,
                                      RedisClient* candle_redis,
-                                     NotificationClient* notifier, RankingManager* ranking_manager)
+                                     RankingManager* ranking_manager)
     : producer_(producer), depth_redis_(depth_redis), candle_redis_(candle_redis),
-      notifier_(notifier), ranking_manager_(ranking_manager) {
+      ranking_manager_(ranking_manager) {
     Logger::info("MarketDataHandler initialized, Depth Redis:", depth_redis_ ? "connected" : "none",
                  "Candle Redis:", candle_redis_ ? "connected" : "none",
-                 "Notifier:", notifier_ ? "enabled" : "disabled",
                  "RankingManager:", ranking_manager_ ? "enabled" : "disabled");
 }
 
