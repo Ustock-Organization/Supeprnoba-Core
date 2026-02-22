@@ -234,7 +234,7 @@ async function getSubscriptionStatus(userId) {
   const { Item: user } = await dynamodb.send(new GetCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
-    ProjectionExpression: 'subscription_status, subscription_plan, subscription_expires_at, subscription_id, stripe_customer_id',
+    ProjectionExpression: 'subscription_status, subscription_plan, subscription_expires_at, subscription_id, stripe_customer_id, subscription_source',
   }));
 
   return response.ok({
@@ -243,6 +243,7 @@ async function getSubscriptionStatus(userId) {
     subscription_expires_at: user?.subscription_expires_at || null,
     subscription_id: user?.subscription_id || null,
     has_payment_method: !!user?.stripe_customer_id,
+    subscription_source: user?.subscription_source || null,
   }, CORS.STANDARD);
 }
 
