@@ -1,16 +1,15 @@
 /**
  * Supernoba Auth Layer - JWT Verification
  *
- * Cognito (RS256) 및 Supabase (HS256) JWT 검증
+ * Cognito (RS256) JWT 검증
  *
  * 환경변수:
  * - COGNITO_USER_POOL_ID: Cognito User Pool ID (RS256)
  * - COGNITO_REGION: Cognito 리전 (기본: ap-northeast-2)
- * - SUPABASE_JWT_SECRET: Supabase JWT 시크릿 키 (HS256, 레거시)
- * - USERS_TABLE: 사용자 캐시 테이블 (기본: supernoba-user-cache)
+ * - USERS_TABLE: 사용자 테이블 (기본: supernoba-users)
  */
 
-import { createHmac, createVerify } from 'crypto';
+import { createVerify } from 'crypto';
 import https from 'https';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
@@ -42,51 +41,6 @@ function base64UrlDecode(str) {
     base64 += '=';
   }
   return Buffer.from(base64, 'base64').toString('utf8');
-}
-
-// JWT 검증 (HS256)
-function verifyHS256(token, secret) {
-  const parts = token.split('.');
-  if (parts.length !== 3) {
-    throw new Error('INVALID_TOKEN_FORMAT');
-  }
-
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  // 헤더 검증
-  const header = JSON.parse(base64UrlDecode(headerB64));
-  if (header.alg !== 'HS256') {
-    throw new Error('UNSUPPORTED_ALGORITHM');
-  }
-
-  // 서명 검증
-  const signatureInput = `${headerB64}.${payloadB64}`;
-  const expectedSignature = createHmac('sha256', secret)
-    .update(signatureInput)
-    .digest('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-
-  if (signatureB64 !== expectedSignature) {
-    throw new Error('INVALID_SIGNATURE');
-  }
-
-  // 페이로드 파싱
-  const payload = JSON.parse(base64UrlDecode(payloadB64));
-
-  // 만료 시간 검증
-  const now = Math.floor(Date.now() / 1000);
-  if (payload.exp && payload.exp < now) {
-    throw new Error('TOKEN_EXPIRED');
-  }
-
-  // 발행 시간 검증 (선택적)
-  if (payload.iat && payload.iat > now + 60) {
-    throw new Error('TOKEN_NOT_YET_VALID');
-  }
-
-  return payload;
 }
 
 // JWKS 가져오기 (Cognito)
@@ -254,8 +208,7 @@ export async function verifyAuth(event, options = {}) {
 
   try {
     // 0. 개발 모드 체크
-    const jwtSecret = process.env.SUPABASE_JWT_SECRET;
-    if (!jwtSecret && !COGNITO_USER_POOL_ID) {
+    if (!COGNITO_USER_POOL_ID) {
       console.warn('[verifyAuth] DEV MODE: No auth configured, skipping');
       return { success: true, userId: null, anonymous: true, devMode: true };
     }
@@ -279,45 +232,27 @@ export async function verifyAuth(event, options = {}) {
       return { success: false, error: 'EMPTY_TOKEN', message: '토큰이 비어있습니다' };
     }
 
-    // 2. 토큰 알고리즘 확인 및 검증
-    let payload;
-    let provider = 'unknown';
-
+    // 2. 토큰 알고리즘 확인 및 검증 (Cognito RS256 전용)
     const headerB64 = token.split('.')[0];
     const header = JSON.parse(base64UrlDecode(headerB64));
 
-    if (header.alg === 'RS256' && COGNITO_ISSUER) {
-      // Cognito JWT (RS256)
-      payload = await verifyRS256(token);
-      provider = 'cognito';
-    } else if (header.alg === 'HS256' && jwtSecret) {
-      // Supabase JWT (HS256)
-      payload = verifyHS256(token, jwtSecret);
-      provider = 'supabase';
-    } else {
+    if (header.alg !== 'RS256' || !COGNITO_ISSUER) {
       throw new Error('UNSUPPORTED_ALGORITHM');
     }
 
-    // 3. 사용자 정보 추출 (provider에 따라 다름)
-    let userId, email, role;
+    const payload = await verifyRS256(token);
 
-    if (provider === 'cognito') {
-      userId = payload.sub; // Cognito는 sub에 username (x_12345)
-      email = payload.email;
-      role = payload['custom:role'] || 'authenticated';
-      console.log('[verifyAuth] Cognito JWT decoded:', {
-        sub: payload.sub,
-        email: payload.email,
-        role: role,
-        customXUserId: payload['custom:x_user_id'],
-        username: payload['cognito:username'] || payload.username
-      });
-    } else {
-      userId = payload.sub;
-      email = payload.email;
-      role = payload.role || 'authenticated';
-      console.log('[verifyAuth] Supabase JWT decoded:', { sub: payload.sub, email, role });
-    }
+    // 3. 사용자 정보 추출
+    const userId = payload.sub;
+    const email = payload.email;
+    const role = payload['custom:role'] || 'authenticated';
+    console.log('[verifyAuth] Cognito JWT decoded:', {
+      sub: payload.sub,
+      email: payload.email,
+      role: role,
+      customXUserId: payload['custom:x_user_id'],
+      username: payload['cognito:username'] || payload.username
+    });
 
     // 5. 역할 검증 (설정된 경우)
     if (allowedRoles && !allowedRoles.includes(role)) {
@@ -335,8 +270,7 @@ export async function verifyAuth(event, options = {}) {
       userId,
       email,
       role,
-      payload,
-      provider
+      payload
     };
 
   } catch (error) {
@@ -574,32 +508,4 @@ export function authErrorResponse(authResult, headers = {}) {
   };
 }
 
-/**
- * Auth Layer 로딩 헬퍼 (Fallback 포함)
- * 각 Lambda에서 중복되는 try-catch fallback 코드를 제거
- *
- * @param {string} context - 로깅용 컨텍스트 이름
- * @returns {Object} { verifyAuth, verifyAdmin, verifySelf, authErrorResponse }
- */
-export function createFallbackAuth(context = 'lambda') {
-  console.warn(`[${context}] Auth layer not available, using fallback`);
-
-  const fallbackVerify = async () => ({ success: true, userId: null, anonymous: true });
-  const fallbackAdmin = async () => {
-    return { success: false, error: 'UNAUTHORIZED', message: '인증이 필요합니다' };
-  };
-  const fallbackErrorResponse = (result, headers = {}) => ({
-    statusCode: 401,
-    headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({ error: result.error, message: result.message })
-  });
-
-  return {
-    verifyAuth: fallbackVerify,
-    verifySelf: fallbackVerify,
-    verifyAdmin: fallbackAdmin,
-    authErrorResponse: fallbackErrorResponse
-  };
-}
-
-export default { verifyAuth, verifyAdmin, verifySelf, authErrorResponse, createFallbackAuth };
+export default { verifyAuth, verifyAdmin, verifySelf, authErrorResponse };
