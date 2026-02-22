@@ -6,8 +6,10 @@
  * - GET  /auth/x/init      - X OAuth 시작
  * - GET  /auth/x/callback  - X OAuth 콜백 + Cognito JWT 발급
  * - POST /auth/x/refresh   - 토큰 갱신
- * - GET  /auth/init        - 사용자 초기화 상태 확인
- * - POST /auth/init        - 신규 사용자 초기화
+ * - GET  /auth/init            - 사용자 초기화 상태 확인
+ * - POST /auth/init            - 신규 사용자 초기화
+ * - POST /auth/profile-upload  - 프로필 이미지 presigned URL 발급
+ * - POST /auth/sync-user       - 유저 정보 동기화
  */
 
 import {
@@ -20,10 +22,14 @@ import {
 } from '@aws-sdk/client-cognito-identity-provider';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import crypto from 'crypto';
 
 const cognito = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION || 'ap-northeast-2' });
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' }));
+const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'supernoba-announcements-media';
 
 // 환경변수
 const X_CLIENT_ID = process.env.X_CLIENT_ID;
@@ -113,6 +119,11 @@ export const handler = async (event) => {
     // POST /auth/init - 신규 사용자 초기화
     if (path.endsWith('/init') && method === 'POST') {
       return await handleUserInit(event);
+    }
+
+    // POST /auth/profile-upload - 프로필 이미지 업로드용 presigned URL
+    if (path.endsWith('/profile-upload') && method === 'POST') {
+      return await handleProfileUpload(event);
     }
 
     // POST /auth/sync-user - 유저 정보 동기화 (멀티 소셜 로그인 지원)
@@ -586,6 +597,43 @@ async function handleUserInit(event) {
       newRegistrationEnabled: settings.system?.newRegistrationEnabled !== false,
     }
   });
+}
+
+/**
+ * POST /auth/profile-upload - 프로필 이미지 업로드용 presigned URL 발급
+ *
+ * 요청 바디:
+ * - userId: 사용자 ID
+ * - contentType: 이미지 MIME 타입 (image/jpeg, image/png, image/webp)
+ *
+ * 응답:
+ * - uploadUrl: S3 presigned PUT URL (5분 유효)
+ * - publicUrl: 업로드 후 공개 접근 가능한 URL
+ */
+async function handleProfileUpload(event) {
+  const body = JSON.parse(event.body || '{}');
+  const { userId, contentType = 'image/jpeg' } = body;
+
+  if (!userId) return err(400, 'userId is required');
+
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+  if (!allowedTypes.includes(contentType)) {
+    return err(400, 'INVALID_CONTENT_TYPE');
+  }
+
+  const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
+  const key = `profiles/${userId}/avatar.${ext}`;
+
+  const command = new PutObjectCommand({
+    Bucket: MEDIA_BUCKET,
+    Key: key,
+    ContentType: contentType,
+  });
+
+  const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+  const publicUrl = `https://${MEDIA_BUCKET}.s3.ap-northeast-2.amazonaws.com/${key}`;
+
+  return ok({ uploadUrl, publicUrl });
 }
 
 /**
