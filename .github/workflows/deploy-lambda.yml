@@ -75,6 +75,9 @@ jobs:
           - name: Supernoba-creator-requests
             path: lambda/Supernoba-creator-requests
             has_build: false
+          - name: Supernoba-point-claim
+            path: lambda/Supernoba-point-claim
+            has_build: false
 
           # === WebSocket (5) ===
           - name: Supernoba-connect-handler
