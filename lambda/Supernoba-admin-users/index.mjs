@@ -30,7 +30,8 @@ const DEFAULT_SETTINGS = {
     maintenanceMode: false,
     tradingEnabled: true,
     newRegistrationEnabled: true,
-  }
+  },
+  rewards: { premiumDailyPoints: 5000, adRewardPoints: 1000 },
 };
 
 // 설정 캐시
@@ -652,6 +653,50 @@ export const handler = async (event) => {
         }
 
         return ok({ success: true, message: `User ${userId} tester status set to ${isTester}` });
+      }
+
+      // 구독 상태 설정
+      if (action === 'setSubscription') {
+        const { isSubscribed } = b;
+        if (typeof isSubscribed !== 'boolean') return err(400, 'isSubscribed must be a boolean');
+
+        const updateExpr = isSubscribed
+          ? 'SET subscription_status = :status, subscription_source = :source, updated_at = :updatedAt'
+          : 'SET subscription_status = :status, updated_at = :updatedAt REMOVE subscription_source, subscription_plan, subscription_expires_at, subscription_id';
+
+        const exprValues = {
+          ':status': isSubscribed ? 'active' : 'none',
+          ':updatedAt': new Date().toISOString(),
+          ...(isSubscribed ? { ':source': 'admin' } : {}),
+        };
+
+        try {
+          await dynamodb.send(new UpdateCommand({
+            TableName: USER_CACHE_TABLE,
+            Key: { user_id: userId },
+            UpdateExpression: updateExpr,
+            ExpressionAttributeValues: exprValues,
+          }));
+        } catch (e) {
+          return err(500, 'Failed to update subscription: ' + e.message);
+        }
+
+        try {
+          await dynamodb.send(new PutCommand({
+            TableName: AUDIT_LOGS_TABLE,
+            Item: {
+              log_id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              action: 'set_subscription',
+              target_user_id: userId,
+              details: { isSubscribed },
+              created_at: new Date().toISOString()
+            }
+          }));
+        } catch (e) {
+          console.log('Audit log error (ignored):', e.message);
+        }
+
+        return ok({ success: true, message: `User ${userId} subscription set to ${isSubscribed ? 'active' : 'none'}` });
       }
 
       // 잔고 설정 (값 직접 변경)

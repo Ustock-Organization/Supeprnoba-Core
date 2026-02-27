@@ -109,13 +109,34 @@ export const handler = async (event) => {
         const adminCheck = await checkAdmin(event);
         if (!adminCheck.authorized) return adminCheck.response;
 
+        // Valkey 먼저 → 없으면 DynamoDB fallback → 없으면 false(OFF)
+        let betaMode;
         try {
-          const betaMode = await operatingCache.get('platform:beta_mode');
-          return ok({ betaMode: betaMode !== 'false' });  // 기본값: true (베타)
+          betaMode = await operatingCache.get('platform:beta_mode');
         } catch (e) {
-          console.error('[betaMode GET] Error:', e.message);
-          return ok({ betaMode: true });  // Valkey 장애 시 기본값: 베타 ON
+          console.error('[betaMode GET] Valkey error:', e.message);
         }
+
+        if (betaMode === null || betaMode === undefined) {
+          // DynamoDB fallback — Valkey 키 소실 대응
+          try {
+            const { Item } = await dynamodb.send(new GetCommand({
+              TableName: SETTINGS_TABLE,
+              Key: { setting_id: 'SYSTEM_SETTINGS' },
+              ProjectionExpression: 'settings.platform',
+            }));
+            const dbValue = Item?.settings?.platform?.beta_mode;
+            betaMode = dbValue === true ? 'true' : 'false';
+            // Valkey에 워밍업 캐시
+            await operatingCache.set('platform:beta_mode', betaMode).catch(() => {});
+            console.log(`[betaMode GET] DynamoDB fallback: ${betaMode}`);
+          } catch (dbErr) {
+            console.error('[betaMode GET] DynamoDB fallback error:', dbErr.message);
+            // 양쪽 다 실패 → 안전한 기본값: false (전체 개방)
+          }
+        }
+
+        return ok({ betaMode: betaMode === 'true' });
       }
 
       if (m === 'PUT') {
@@ -128,7 +149,19 @@ export const handler = async (event) => {
         }
 
         try {
-          await operatingCache.set('platform:beta_mode', enabled ? 'true' : 'false');
+          // Valkey + DynamoDB 이중 쓰기
+          await Promise.all([
+            operatingCache.set('platform:beta_mode', enabled ? 'true' : 'false'),
+            dynamodb.send(new UpdateCommand({
+              TableName: SETTINGS_TABLE,
+              Key: { setting_id: 'SYSTEM_SETTINGS' },
+              UpdateExpression: 'SET settings.platform.beta_mode = :v, updated_at = :now',
+              ExpressionAttributeValues: {
+                ':v': enabled,
+                ':now': new Date().toISOString(),
+              },
+            })),
+          ]);
           console.log(`[betaMode] Beta mode set to: ${enabled} by admin ${adminCheck.userId}`);
           return ok({ success: true, betaMode: enabled });
         } catch (e) {

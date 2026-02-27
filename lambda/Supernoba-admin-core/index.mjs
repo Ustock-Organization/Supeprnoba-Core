@@ -57,7 +57,8 @@ const DEFAULT_SETTINGS = {
     maintenanceMode: false,
     tradingEnabled: true,
     newRegistrationEnabled: true,
-  }
+  },
+  rewards: { premiumDailyPoints: 5000, adRewardPoints: 1000 },
 };
 
 // 기본 티커테이프 설정
