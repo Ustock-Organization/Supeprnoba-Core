@@ -529,6 +529,9 @@ async function handleUserInit(event) {
       is_admin: user.is_admin === true,
       is_tester: user.is_tester === true,
       is_verified: verified === true || user.is_verified === true,
+      full_name: user.full_name || user.username || '',
+      avatar_url: user.avatar_url || null,
+      email: user.email || null,
       settings: {
         maintenanceMode: settings.system?.maintenanceMode || false,
         tradingEnabled: settings.system?.tradingEnabled !== false,
@@ -552,7 +555,7 @@ async function handleUserInit(event) {
       Item: {
         user_id: userId,
         email: email || null,
-        username: displayName || email?.split('@')[0] || 'User',
+        username: displayName || '',
         full_name: displayName || '',
         avatar_url: avatarUrl || null,
         provider: provider || 'unknown',
@@ -714,7 +717,7 @@ async function handleSyncUser(event) {
         ':linkedAccounts': linkedAccounts,
         ':cognitoSubs': cognitoSubs,
         ':email': finalEmail,
-        ':username': hasValidName ? displayName : (email?.split('@')[0] || 'User'),
+        ':username': hasValidName ? displayName : '',
         ':fullName': hasValidName ? displayName : '',
         ':avatarUrl': avatarUrl || user.avatar_url || null,
         ':provider': provider,
@@ -724,10 +727,14 @@ async function handleSyncUser(event) {
 
     console.log(`[auth] User synced: ${userId}, provider: ${provider}`);
 
+    // 기존 DB에 저장된 이름 반환 (프론트엔드가 Redux에 반영)
+    const storedName = hasValidName ? displayName : (user.full_name || user.username || '');
+
     return ok({
       synced: true,
       is_new_user: false,
       user_id: userId,
+      full_name: storedName,
     });
   }
 
@@ -756,7 +763,7 @@ async function handleSyncUser(event) {
     Item: {
       user_id: userId,
       email: finalEmail,
-      username: displayName || email?.split('@')[0] || 'User',
+      username: displayName || '',
       full_name: displayName || '',
       avatar_url: avatarUrl || null,
       provider: provider,

@@ -49,12 +49,42 @@ async function getStripe() {
  * JWT payload에서 실제 user_id를 추출
  */
 function resolveUserId(authResult) {
+  let userId = authResult.userId;
+
+  // 1. X 로그인: custom:x_user_id 클레임
   const xUserId = authResult.payload?.['custom:x_user_id'];
-  if (xUserId) return `x_${xUserId}`;
+  if (xUserId) {
+    return `x_${xUserId}`;
+  }
+
+  // 2. X 로그인: email 패턴 fallback
   if (authResult.email?.includes('@x.supernoba.com')) {
     return `x_${authResult.email.split('@')[0]}`;
   }
-  return authResult.userId;
+
+  // 3. Google/Apple 로그인: cognito:username 패턴
+  const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+  if (cognitoUsername.startsWith('Google_')) {
+    return `google_${cognitoUsername.replace('Google_', '')}`;
+  }
+  if (cognitoUsername.startsWith('SignInWithApple_')) {
+    return `apple_${cognitoUsername.replace('SignInWithApple_', '')}`;
+  }
+
+  // 4. Google/Apple: identities 배열에서 추출
+  try {
+    const identities = typeof authResult.payload?.identities === 'string'
+      ? JSON.parse(authResult.payload.identities)
+      : authResult.payload?.identities;
+    if (Array.isArray(identities)) {
+      const googleId = identities.find(id => id.providerName === 'Google');
+      if (googleId) return `google_${googleId.userId}`;
+      const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+      if (appleId) return `apple_${appleId.userId}`;
+    }
+  } catch { /* ignore */ }
+
+  return userId;
 }
 
 export const handler = async (event) => {
@@ -117,18 +147,29 @@ async function getOrCreateStripeCustomer(userId, email) {
     ProjectionExpression: 'stripe_customer_id',
   }));
 
+  // 2. 기존 customer_id가 있으면 Stripe에서 유효성 검증
   if (user?.stripe_customer_id) {
-    return user.stripe_customer_id;
+    try {
+      const stripe = await getStripe();
+      const existing = await stripe.customers.retrieve(user.stripe_customer_id);
+      if (!existing.deleted) {
+        return user.stripe_customer_id;
+      }
+      console.warn(`[payments] Customer ${user.stripe_customer_id} is deleted, recreating for ${userId}`);
+    } catch (err) {
+      // 테스트/라이브 모드 불일치 또는 존재하지 않는 customer → 새로 생성
+      console.warn(`[payments] Stale customer ${user.stripe_customer_id} for ${userId}: ${err.message}`);
+    }
   }
 
-  // 2. Stripe Customer 생성
+  // 3. Stripe Customer 생성
   const stripe = await getStripe();
   const customer = await stripe.customers.create({
     metadata: { user_id: userId },
     email: email || undefined,
   });
 
-  // 3. supernoba-users에 stripe_customer_id 저장
+  // 4. supernoba-users에 stripe_customer_id 저장
   await dynamodb.send(new UpdateCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
@@ -168,7 +209,6 @@ async function createCheckoutSession(userId, email, event) {
 
   const sessionParams = {
     customer: customerId,
-    payment_method_types: ['card'],
     line_items: [{ price: price_id, quantity: 1 }],
     mode,
     success_url: `${successBase}?session_id={CHECKOUT_SESSION_ID}`,

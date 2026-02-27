@@ -192,12 +192,13 @@ async function isAuthorizedTester(userId) {
   if (valkey) {
     try {
       const betaMode = await valkey.get('platform:beta_mode');
-      if (betaMode === 'false') {
-        return true;  // 베타 모드 OFF → 전체 개방
+      if (betaMode !== 'true') {
+        return true;  // 베타 모드 OFF 또는 키 소실 → 전체 개방
       }
     } catch (e) {
-      // Valkey 장애 시 기존 로직으로 fallback (안전)
-      console.warn('[TesterCheck] Beta mode check failed, falling back to tester check:', e.message);
+      // Valkey 장애 시 전체 개방 (안전한 기본값)
+      console.warn('[TesterCheck] Beta mode check failed, allowing all users:', e.message);
+      return true;
     }
   }
 

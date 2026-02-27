@@ -480,10 +480,40 @@ async function findUserByAppleTransactionId(originalTransactionId) {
  * JWT payload에서 실제 user_id를 추출
  */
 function resolveUserId(authResult) {
+  let userId = authResult.userId;
+
+  // 1. X 로그인: custom:x_user_id 클레임
   const xUserId = authResult.payload?.['custom:x_user_id'];
-  if (xUserId) return `x_${xUserId}`;
+  if (xUserId) {
+    return `x_${xUserId}`;
+  }
+
+  // 2. X 로그인: email 패턴 fallback
   if (authResult.email?.includes('@x.supernoba.com')) {
     return `x_${authResult.email.split('@')[0]}`;
   }
-  return authResult.userId;
+
+  // 3. Google/Apple 로그인: cognito:username 패턴
+  const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+  if (cognitoUsername.startsWith('Google_')) {
+    return `google_${cognitoUsername.replace('Google_', '')}`;
+  }
+  if (cognitoUsername.startsWith('SignInWithApple_')) {
+    return `apple_${cognitoUsername.replace('SignInWithApple_', '')}`;
+  }
+
+  // 4. Google/Apple: identities 배열에서 추출
+  try {
+    const identities = typeof authResult.payload?.identities === 'string'
+      ? JSON.parse(authResult.payload.identities)
+      : authResult.payload?.identities;
+    if (Array.isArray(identities)) {
+      const googleId = identities.find(id => id.providerName === 'Google');
+      if (googleId) return `google_${googleId.userId}`;
+      const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+      if (appleId) return `apple_${appleId.userId}`;
+    }
+  } catch { /* ignore */ }
+
+  return userId;
 }

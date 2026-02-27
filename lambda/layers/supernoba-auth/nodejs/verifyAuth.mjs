@@ -54,11 +54,21 @@ async function getCognitoJwks() {
 
   return new Promise((resolve, reject) => {
     https.get(jwksUrl, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`JWKS fetch failed: ${res.statusCode}`));
+        res.resume(); // 응답 소비하여 소켓 해제
+        return;
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          cognitoJwksCache = JSON.parse(data);
+          const jwks = JSON.parse(data);
+          if (!jwks?.keys?.length) {
+            reject(new Error('JWKS response missing keys'));
+            return;
+          }
+          cognitoJwksCache = jwks;
           cognitoJwksCacheTime = now;
           resolve(cognitoJwksCache);
         } catch (e) {
@@ -421,6 +431,19 @@ export async function verifySelf(event, resourceUserId) {
   // 개발 모드 (devMode: true 또는 anonymous: true)면 userId 검증 스킵
   if (authResult.devMode || authResult.anonymous) {
     return { ...authResult, userId: resourceUserId };
+  }
+
+  // Apple/Google 사용자 디버깅: JWT 클레임 로깅
+  if (resourceUserId?.startsWith('apple_') || resourceUserId?.startsWith('google_')) {
+    console.log('[verifySelf] Provider ID resolution attempt:', JSON.stringify({
+      resolvedUserId: authResult.userId,
+      resourceUserId,
+      tokenUse: authResult.payload?.token_use,
+      cognitoUsername: authResult.payload?.['cognito:username'],
+      identitiesType: typeof authResult.payload?.identities,
+      identitiesValue: authResult.payload?.identities,
+      email: authResult.email,
+    }));
   }
 
   // X 로그인 사용자: Cognito sub(UUID)와 요청의 x_ user_id 매핑
