@@ -126,6 +126,8 @@ export const handler = async (event) => {
         // lastSeen 갱신 실패해도 pong은 반환
         console.warn(`[subscribe-handler] lastSeen update failed:`, e.message);
       }
+      // WebSocket 클라이언트에 pong 전송 (HTTP return은 클라이언트에 도달하지 않음)
+      await sendToClient(connectionId, { action: 'pong' }, event);
     }
     return { statusCode: 200, body: JSON.stringify({ action: 'pong' }) };
   }
