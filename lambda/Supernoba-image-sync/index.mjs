@@ -66,7 +66,7 @@ async function handleImageSync(symbol) {
   if (item.logoSyncedAt) {
     const lastSync = new Date(item.logoSyncedAt).getTime();
     if (Date.now() - lastSync < COOLDOWN_MS) {
-      return ok({ status: 'COOLDOWN', logoUrl: item.logo_url || item.logoUrl || null });
+      return ok({ status: 'COOLDOWN', logoUrl: item.logoUrl || null });
     }
   }
 
@@ -85,7 +85,7 @@ async function handleImageSync(symbol) {
     }));
   } catch (lockErr) {
     if (lockErr.name === 'ConditionalCheckFailedException') {
-      return ok({ status: 'LOCKED', logoUrl: item.logo_url || item.logoUrl || null });
+      return ok({ status: 'LOCKED', logoUrl: item.logoUrl || null });
     }
     throw lockErr;
   }
@@ -97,7 +97,7 @@ async function handleImageSync(symbol) {
 
     if (!newImageUrl) {
       await releaseLock(symbol);
-      return ok({ status: 'NO_IMAGE', logoUrl: item.logo_url || item.logoUrl || null });
+      return ok({ status: 'NO_IMAGE', logoUrl: item.logoUrl || null });
     }
 
     // 5. 이미지 변경 여부 확인
@@ -109,7 +109,7 @@ async function handleImageSync(symbol) {
         UpdateExpression: 'SET logoSyncedAt = :now REMOVE logoSyncLock',
         ExpressionAttributeValues: { ':now': new Date().toISOString() },
       }));
-      return ok({ status: 'UNCHANGED', logoUrl: item.logo_url || item.logoUrl || null });
+      return ok({ status: 'UNCHANGED', logoUrl: item.logoUrl || null });
     }
 
     // 6. 이미지 다운로드 → S3 업로드
@@ -118,7 +118,7 @@ async function handleImageSync(symbol) {
 
     if (!imageBuffer) {
       await releaseLock(symbol);
-      return ok({ status: 'DOWNLOAD_FAILED', logoUrl: item.logo_url || item.logoUrl || null });
+      return ok({ status: 'DOWNLOAD_FAILED', logoUrl: item.logoUrl || null });
     }
 
     await s3.send(new PutObjectCommand({
@@ -135,7 +135,7 @@ async function handleImageSync(symbol) {
     await ddb.send(new UpdateCommand({
       TableName: SYMBOLS_TABLE,
       Key: { symbol },
-      UpdateExpression: 'SET logo_url = :logoUrl, logoSourceUrl = :sourceUrl, logoSyncedAt = :now REMOVE logoSyncLock',
+      UpdateExpression: 'SET logoUrl = :logoUrl, logoSourceUrl = :sourceUrl, logoSyncedAt = :now REMOVE logoSyncLock',
       ExpressionAttributeValues: {
         ':logoUrl': s3Url,
         ':sourceUrl': newImageUrl,
@@ -181,14 +181,15 @@ async function fetchTwitterProfileImage(item) {
   const token = await getTwitterBearerToken();
   if (!token) return null;
 
-  // creator_url에서 username 추출, 또는 name 사용
+  // creatorUrl에서 username 추출 (camelCase/snake_case 호환)
   let username = null;
-  if (item.creator_url) {
-    const match = item.creator_url.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
+  const creatorUrl = item.creatorUrl || item.creator_url;
+  if (creatorUrl) {
+    const match = creatorUrl.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
     if (match) username = match[1];
   }
-  if (!username && item.creator_username) {
-    username = item.creator_username;
+  if (!username && (item.creator_username || item.creatorUsername)) {
+    username = item.creator_username || item.creatorUsername;
   }
   if (!username) return null;
 
@@ -209,24 +210,44 @@ async function fetchYouTubeProfileImage(item) {
   const apiKey = await getYouTubeApiKey();
   if (!apiKey) return null;
 
-  // creator_url에서 channel ID 추출
-  let channelId = null;
-  if (item.creator_url) {
-    const match = item.creator_url.match(/(?:youtube\.com\/channel\/)([^/?]+)/);
-    if (match) channelId = match[1];
-  }
-  if (!channelId && item.youtube_channel_id) {
-    channelId = item.youtube_channel_id;
-  }
-  if (!channelId) return null;
+  const creatorUrl = item.creatorUrl || item.creator_url;
 
-  const res = await fetch(
-    `https://www.googleapis.com/youtube/v3/channels?id=${channelId}&part=snippet&key=${apiKey}`
-  );
-  if (!res.ok) return null;
-  const data = await res.json();
-  const thumb = data.items?.[0]?.snippet?.thumbnails;
-  return thumb?.high?.url || thumb?.medium?.url || thumb?.default?.url || null;
+  // 1. /channel/{id} 형식
+  let channelId = null;
+  if (creatorUrl) {
+    const chMatch = creatorUrl.match(/youtube\.com\/channel\/([^/?]+)/);
+    if (chMatch) channelId = chMatch[1];
+  }
+  if (!channelId) channelId = item.youtube_channel_id || item.youtubeChannelId || null;
+
+  if (channelId) {
+    const res = await fetch(
+      `https://www.googleapis.com/youtube/v3/channels?id=${channelId}&part=snippet&key=${apiKey}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const thumb = data.items?.[0]?.snippet?.thumbnails;
+      if (thumb) return thumb.high?.url || thumb.medium?.url || thumb.default?.url || null;
+    }
+  }
+
+  // 2. /@handle 형식 → forHandle API
+  if (creatorUrl) {
+    const handleMatch = creatorUrl.match(/youtube\.com\/@([^/?]+)/);
+    if (handleMatch) {
+      const handle = handleMatch[1];
+      const res = await fetch(
+        `https://www.googleapis.com/youtube/v3/channels?forHandle=${handle}&part=snippet&key=${apiKey}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const thumb = data.items?.[0]?.snippet?.thumbnails;
+        if (thumb) return thumb.high?.url || thumb.medium?.url || thumb.default?.url || null;
+      }
+    }
+  }
+
+  return null;
 }
 
 async function downloadImage(url) {
@@ -275,11 +296,12 @@ async function handleMigrate() {
       for (let i = 0; i < twitterSymbols.length; i += 100) {
         const batch = twitterSymbols.slice(i, i + 100);
         const usernames = batch.map(s => {
-          if (s.creator_url) {
-            const match = s.creator_url.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
+          const url = s.creatorUrl || s.creator_url;
+          if (url) {
+            const match = url.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
             if (match) return match[1];
           }
-          return s.creator_username || null;
+          return s.creator_username || s.creatorUsername || null;
         }).filter(Boolean);
 
         if (usernames.length === 0) continue;
@@ -298,11 +320,12 @@ async function handleMigrate() {
 
           for (const sym of batch) {
             let un = null;
-            if (sym.creator_url) {
-              const match = sym.creator_url.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
+            const symUrl = sym.creatorUrl || sym.creator_url;
+            if (symUrl) {
+              const match = symUrl.match(/(?:twitter\.com|x\.com)\/([^/?]+)/);
               if (match) un = match[1].toLowerCase();
             }
-            if (!un) un = sym.creator_username?.toLowerCase();
+            if (!un) un = (sym.creator_username || sym.creatorUsername)?.toLowerCase();
             const imgUrl = un ? usernameToImage[un] : null;
             if (!imgUrl) { results.skipped++; continue; }
 
@@ -317,10 +340,11 @@ async function handleMigrate() {
               const s3Url = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${s3Key}`;
               await ddb.send(new UpdateCommand({
                 TableName: SYMBOLS_TABLE, Key: { symbol: sym.symbol },
-                UpdateExpression: 'SET logo_url = :url, logoSourceUrl = :src, logoSyncedAt = :now',
+                UpdateExpression: 'SET logoUrl = :url, logoSourceUrl = :src, logoSyncedAt = :now',
                 ExpressionAttributeValues: { ':url': s3Url, ':src': imgUrl, ':now': new Date().toISOString() },
               }));
               results.updated++;
+              console.log(`[migrate] Twitter ${sym.symbol}: → ${s3Url}`);
             } catch { results.failed++; }
           }
         } catch (batchErr) {
@@ -330,63 +354,64 @@ async function handleMigrate() {
     }
   }
 
-  // YouTube 배치
+  // YouTube — @handle 개별 조회 (배치 API가 handle을 지원하지 않으므로)
   if (youtubeSymbols.length > 0) {
     const apiKey = await getYouTubeApiKey();
     if (apiKey) {
-      for (let i = 0; i < youtubeSymbols.length; i += 50) {
-        const batch = youtubeSymbols.slice(i, i + 50);
-        const channelIds = batch.map(s => {
-          if (s.creator_url) {
-            const match = s.creator_url.match(/(?:youtube\.com\/channel\/)([^/?]+)/);
-            if (match) return match[1];
-          }
-          return s.youtube_channel_id || null;
-        }).filter(Boolean);
-
-        if (channelIds.length === 0) continue;
-
+      for (const sym of youtubeSymbols) {
+        const url = sym.creatorUrl || sym.creator_url;
         try {
-          const res = await fetch(
-            `https://www.googleapis.com/youtube/v3/channels?id=${channelIds.join(',')}&part=snippet&key=${apiKey}`
-          );
-          if (!res.ok) continue;
-          const data = await res.json();
-          const idToImage = {};
-          (data.items || []).forEach(ch => {
-            const thumb = ch.snippet?.thumbnails;
-            idToImage[ch.id] = thumb?.high?.url || thumb?.medium?.url || thumb?.default?.url;
-          });
+          let imgUrl = null;
 
-          for (const sym of batch) {
-            let chId = null;
-            if (sym.creator_url) {
-              const match = sym.creator_url.match(/(?:youtube\.com\/channel\/)([^/?]+)/);
-              if (match) chId = match[1];
+          // 1. /channel/{id} 형식
+          const chMatch = url?.match(/youtube\.com\/channel\/([^/?]+)/);
+          const channelId = chMatch?.[1] || sym.youtube_channel_id || sym.youtubeChannelId;
+          if (channelId) {
+            const res = await fetch(
+              `https://www.googleapis.com/youtube/v3/channels?id=${channelId}&part=snippet&key=${apiKey}`
+            );
+            if (res.ok) {
+              const data = await res.json();
+              const thumb = data.items?.[0]?.snippet?.thumbnails;
+              imgUrl = thumb?.high?.url || thumb?.medium?.url || thumb?.default?.url || null;
             }
-            if (!chId) chId = sym.youtube_channel_id;
-            const imgUrl = chId ? idToImage[chId] : null;
-            if (!imgUrl) { results.skipped++; continue; }
-
-            try {
-              const buf = await downloadImage(imgUrl);
-              if (!buf) { results.skipped++; continue; }
-              const s3Key = `symbols/${sym.symbol}/logo.jpg`;
-              await s3.send(new PutObjectCommand({
-                Bucket: S3_BUCKET, Key: s3Key, Body: buf,
-                ContentType: 'image/jpeg', CacheControl: 'public, max-age=86400',
-              }));
-              const s3Url = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${s3Key}`;
-              await ddb.send(new UpdateCommand({
-                TableName: SYMBOLS_TABLE, Key: { symbol: sym.symbol },
-                UpdateExpression: 'SET logo_url = :url, logoSourceUrl = :src, logoSyncedAt = :now',
-                ExpressionAttributeValues: { ':url': s3Url, ':src': imgUrl, ':now': new Date().toISOString() },
-              }));
-              results.updated++;
-            } catch { results.failed++; }
           }
-        } catch (batchErr) {
-          console.error('[migrate] YouTube batch error:', batchErr.message);
+
+          // 2. /@handle 형식
+          if (!imgUrl && url) {
+            const handleMatch = url.match(/youtube\.com\/@([^/?]+)/);
+            if (handleMatch) {
+              const res = await fetch(
+                `https://www.googleapis.com/youtube/v3/channels?forHandle=${handleMatch[1]}&part=snippet&key=${apiKey}`
+              );
+              if (res.ok) {
+                const data = await res.json();
+                const thumb = data.items?.[0]?.snippet?.thumbnails;
+                imgUrl = thumb?.high?.url || thumb?.medium?.url || thumb?.default?.url || null;
+              }
+            }
+          }
+
+          if (!imgUrl) { results.skipped++; continue; }
+
+          const buf = await downloadImage(imgUrl);
+          if (!buf) { results.skipped++; continue; }
+          const s3Key = `symbols/${sym.symbol}/logo.jpg`;
+          await s3.send(new PutObjectCommand({
+            Bucket: S3_BUCKET, Key: s3Key, Body: buf,
+            ContentType: 'image/jpeg', CacheControl: 'public, max-age=86400',
+          }));
+          const s3Url = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${s3Key}`;
+          await ddb.send(new UpdateCommand({
+            TableName: SYMBOLS_TABLE, Key: { symbol: sym.symbol },
+            UpdateExpression: 'SET logoUrl = :url, logoSourceUrl = :src, logoSyncedAt = :now',
+            ExpressionAttributeValues: { ':url': s3Url, ':src': imgUrl, ':now': new Date().toISOString() },
+          }));
+          results.updated++;
+          console.log(`[migrate] YouTube ${sym.symbol}: → ${s3Url}`);
+        } catch (e) {
+          console.error(`[migrate] YouTube ${sym.symbol} error:`, e.message);
+          results.failed++;
         }
       }
     }
