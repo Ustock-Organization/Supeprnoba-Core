@@ -212,7 +212,7 @@ jobs:
         run: |
           if [ -f package.json ]; then
             echo "Installing dependencies for ${{ matrix.function.name }}..."
-            npm ci
+            npm install --no-audit --no-fund
           fi
 
       - name: Build (if needed)
