@@ -264,8 +264,8 @@ async function handleNotification(event) {
     ? new Date(transactionInfo.expiresDate).toISOString()
     : null;
 
-  const updateExpression = [
-    'SET subscription_status = :status',
+  const setParts = [
+    'subscription_status = :status',
     'subscription_updated_at = :now',
   ];
   const expressionValues = {
@@ -273,20 +273,25 @@ async function handleNotification(event) {
     ':now': now,
   };
 
-  if (expiresAt) {
-    updateExpression.push('subscription_expires_at = :exp');
+  const isCancelledOrExpired = (subscriptionStatus === 'cancelled' || subscriptionStatus === 'expired');
+
+  // cancelled/expired가 아닐 때만 만료일 SET (REMOVE와 충돌 방지)
+  if (expiresAt && !isCancelledOrExpired) {
+    setParts.push('subscription_expires_at = :exp');
     expressionValues[':exp'] = expiresAt;
   }
 
-  // cancelled/expired일 때 plan 제거
-  if (subscriptionStatus === 'cancelled' || subscriptionStatus === 'expired') {
-    updateExpression.push('REMOVE subscription_plan, subscription_expires_at');
+  // SET과 REMOVE는 별도 clause로 조합 (쉼표가 아닌 공백 구분)
+  let updateExpression = `SET ${setParts.join(', ')}`;
+
+  if (isCancelledOrExpired) {
+    updateExpression += ' REMOVE subscription_plan, subscription_expires_at';
   }
 
   await dynamodb.send(new UpdateCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
-    UpdateExpression: updateExpression.join(', '),
+    UpdateExpression: updateExpression,
     ExpressionAttributeValues: expressionValues,
   }));
 
@@ -449,29 +454,31 @@ function mapNotificationToStatus(notificationType, subtype) {
 async function findUserByAppleTransactionId(originalTransactionId) {
   if (!originalTransactionId) return null;
 
-  // supernoba-payments에서 apple_original_transaction_id로 조회
-  // GSI가 없으므로 간단한 Scan 대신 이전 verify에서 저장한 데이터 활용
-  // → payments 테이블의 payment_id 패턴: apple_{transactionId}
-  // → 하지만 user_id를 모르므로 supernoba-users를 Scan해야 함
-  // 비효율적이지만 알림 빈도가 매우 낮으므로 (일 수~십건) 충분함
+  // supernoba-users에서 apple_original_transaction_id로 Scan 조회
+  // GSI가 없으므로 전체 순회 필요 — 알림 빈도가 매우 낮으므로 (일 수~십건) 충분
+  // Limit 없이 페이지네이션으로 전체 테이블 순회 보장
 
   const { DynamoDBClient: DC, ScanCommand } = await import('@aws-sdk/client-dynamodb');
   const { unmarshall } = await import('@aws-sdk/util-dynamodb');
 
   const client = new DC({ region: process.env.AWS_REGION || 'ap-northeast-2' });
-  const result = await client.send(new ScanCommand({
-    TableName: USER_TABLE,
-    FilterExpression: 'apple_original_transaction_id = :otxn',
-    ExpressionAttributeValues: {
-      ':otxn': { S: originalTransactionId },
-    },
-    ProjectionExpression: 'user_id',
-    Limit: 1,
-  }));
 
-  if (result.Items && result.Items.length > 0) {
-    return unmarshall(result.Items[0]).user_id;
-  }
+  let lastEvaluatedKey = undefined;
+  do {
+    const params = {
+      TableName: USER_TABLE,
+      FilterExpression: 'apple_original_transaction_id = :otxn',
+      ExpressionAttributeValues: { ':otxn': { S: originalTransactionId } },
+      ProjectionExpression: 'user_id',
+    };
+    if (lastEvaluatedKey) params.ExclusiveStartKey = lastEvaluatedKey;
+
+    const result = await client.send(new ScanCommand(params));
+    if (result.Items && result.Items.length > 0) {
+      return unmarshall(result.Items[0]).user_id;
+    }
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
 
   return null;
 }
