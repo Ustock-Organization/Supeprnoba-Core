@@ -522,6 +522,26 @@ async function handleUserInit(event) {
       }));
     }
 
+    // X/Google 사용자: 외부 프사 변경 감지 시 자동 갱신
+    const isExternalProvider = (provider === 'x' || provider === 'google');
+    if (isExternalProvider && avatarUrl && avatarUrl !== user.avatar_url) {
+      // 단, S3에 직접 업로드한 프사가 있으면 보호 (덮어쓰기 방지)
+      const existingIsS3 = user.avatar_url?.includes('supernoba');
+      if (!existingIsS3) {
+        await ddb.send(new UpdateCommand({
+          TableName: USERS_TABLE,
+          Key: { user_id: userId },
+          UpdateExpression: 'SET avatar_url = :avatar, updated_at = :now',
+          ExpressionAttributeValues: {
+            ':avatar': avatarUrl,
+            ':now': new Date().toISOString(),
+          },
+        }));
+        // 갱신된 avatar_url을 응답에 반영
+        user.avatar_url = avatarUrl;
+      }
+    }
+
     return ok({
       is_new_user: false,
       initialized: true,
@@ -702,6 +722,13 @@ async function handleSyncUser(event) {
       ? 'username = :username, full_name = :fullName'
       : 'username = if_not_exists(username, :username), full_name = if_not_exists(full_name, :fullName)';
 
+    // S3 프사 보호 — 외부 OAuth URL로 덮어쓰지 않음
+    const existingIsS3 = user.avatar_url?.includes('supernoba');
+    const incomingIsExternal = avatarUrl && !avatarUrl.includes('supernoba') && !avatarUrl.startsWith('data:');
+    const resolvedAvatar = (existingIsS3 && incomingIsExternal)
+      ? user.avatar_url
+      : (avatarUrl || user.avatar_url || null);
+
     await ddb.send(new UpdateCommand({
       TableName: USERS_TABLE,
       Key: { user_id: userId },
@@ -719,7 +746,7 @@ async function handleSyncUser(event) {
         ':email': finalEmail,
         ':username': hasValidName ? displayName : '',
         ':fullName': hasValidName ? displayName : '',
-        ':avatarUrl': avatarUrl || user.avatar_url || null,
+        ':avatarUrl': resolvedAvatar,
         ':provider': provider,
         ':now': now,
       },
@@ -735,6 +762,7 @@ async function handleSyncUser(event) {
       is_new_user: false,
       user_id: userId,
       full_name: storedName,
+      avatar_url: resolvedAvatar,
     });
   }
 
