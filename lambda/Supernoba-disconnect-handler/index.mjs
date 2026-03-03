@@ -57,19 +57,38 @@ export const handler = async (event) => {
       console.log(`[disconnect] Removed main subscription: ${mainSymbol}`);
     }
     
-    // === 3. Sub 구독 정리 (SCAN) ===
-    let cursor = '0';
-    do {
-      const [newCursor, keys] = await valkey.scan(cursor, 'MATCH', 'symbol:*:*', 'COUNT', 100);
-      cursor = newCursor;
-      
-      for (const key of keys) {
-        if (key.endsWith(':subscribers') || key.endsWith(':main') || key.endsWith(':sub')) {
-          const removed = await valkey.srem(key, connectionId);
-          if (removed > 0) console.log(`[disconnect] Removed from ${key}`);
-        }
+    // === 3. Sub 구독 정리 (추적 키 기반 O(1) — SCAN 제거) ===
+    const subSymbols = await valkey.smembers(`conn:${connectionId}:subs`);
+    if (subSymbols && subSymbols.length > 0) {
+      // pipeline으로 일괄 처리 (네트워크 라운드트립 최소화)
+      const pipeline = valkey.pipeline();
+      for (const symbol of subSymbols) {
+        pipeline.srem(`symbol:${symbol}:subscribers`, connectionId);
+        pipeline.srem(`symbol:${symbol}:sub`, connectionId);
       }
-    } while (cursor !== '0');
+      pipeline.del(`conn:${connectionId}:subs`);
+      await pipeline.exec();
+      console.log(`[disconnect] Removed sub subscriptions via tracking key: ${subSymbols.join(', ')}`);
+    } else {
+      // Fallback: 추적 키 없으면 (마이그레이션 과도기) 기존 SCAN 유지
+      let cursor = '0';
+      let scanCount = 0;
+      do {
+        const [newCursor, keys] = await valkey.scan(cursor, 'MATCH', 'symbol:*:*', 'COUNT', 100);
+        cursor = newCursor;
+
+        for (const key of keys) {
+          if (key.endsWith(':subscribers') || key.endsWith(':main') || key.endsWith(':sub')) {
+            const removed = await valkey.srem(key, connectionId);
+            if (removed > 0) {
+              console.log(`[disconnect] Removed from ${key} (fallback SCAN)`);
+              scanCount++;
+            }
+          }
+        }
+      } while (cursor !== '0');
+      if (scanCount > 0) console.log(`[disconnect] Fallback SCAN cleaned ${scanCount} entries`);
+    }
     
     // === 4. user:userId:connections에서 제거 ===
     if (userId) {

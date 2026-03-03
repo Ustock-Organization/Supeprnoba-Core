@@ -306,6 +306,11 @@ export const handler = async (event) => {
       await valkey.sadd('subscribed:symbols', main);
     }
 
+    // Sub 구독 추적 키 초기화 (이전 sub 구독 정리 후 재구성)
+    if (sub && sub.length > 0 && connectionId) {
+      await valkey.del(`conn:${connectionId}:subs`);
+    }
+
     for (const symbol of sub || []) {
       // 삭제된 종목은 구독 불가
       if (deletedSet.has(symbol.toUpperCase())) {
@@ -315,6 +320,13 @@ export const handler = async (event) => {
       await valkey.sadd(`symbol:${symbol}:subscribers`, connectionId);
       await valkey.sadd(`symbol:${symbol}:sub`, connectionId);
       await valkey.sadd('subscribed:symbols', symbol);
+      // disconnect-handler에서 SCAN 없이 O(1) 정리용 추적 키
+      await valkey.sadd(`conn:${connectionId}:subs`, symbol);
+    }
+
+    // conn:subs TTL 설정 (ws 키와 동일 수명)
+    if (sub && sub.length > 0 && connectionId) {
+      await valkey.expire(`conn:${connectionId}:subs`, 86400);
     }
     
     // Send subscribed notification back to client
