@@ -107,6 +107,33 @@ jobs:
             path: lambda/Supernoba-auth
             has_build: false
 
+          # === Payment (4) ===
+          - name: Supernoba-payments
+            path: lambda/Supernoba-payments
+            has_build: false
+          - name: Supernoba-stripe-webhook
+            path: lambda/Supernoba-stripe-webhook
+            has_build: false
+          - name: Supernoba-admin-payments
+            path: lambda/Supernoba-admin-payments
+            has_build: false
+          - name: Supernoba-apple-iap
+            path: lambda/Supernoba-apple-iap
+            has_build: false
+
+          # === Push Notification (2) ===
+          - name: Supernoba-push-tokens
+            path: lambda/Supernoba-push-tokens
+            has_build: false
+          - name: Supernoba-push-sender
+            path: lambda/Supernoba-push-sender
+            has_build: false
+
+          # === User Account (1) ===
+          - name: Supernoba-delete-account
+            path: lambda/Supernoba-delete-account
+            has_build: false
+
           # === Utility (2) ===
           - name: Supernoba-ec2-mgmt
             path: lambda/Supernoba-ec2-mgmt
