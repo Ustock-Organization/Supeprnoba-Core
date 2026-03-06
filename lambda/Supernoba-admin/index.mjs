@@ -150,17 +150,23 @@ export const handler = async (event) => {
 
         try {
           // Valkey + DynamoDB 이중 쓰기
+          // 중첩 맵(settings.platform)이 없을 수 있으므로 if_not_exists로 초기화
           await Promise.all([
             operatingCache.set('platform:beta_mode', enabled ? 'true' : 'false'),
             dynamodb.send(new UpdateCommand({
               TableName: SETTINGS_TABLE,
               Key: { setting_id: 'SYSTEM_SETTINGS' },
-              UpdateExpression: 'SET settings.platform.beta_mode = :v, updated_at = :now',
+              UpdateExpression: 'SET settings.platform = if_not_exists(settings.platform, :empty_map), updated_at = :now',
               ExpressionAttributeValues: {
-                ':v': enabled,
+                ':empty_map': {},
                 ':now': new Date().toISOString(),
               },
-            })),
+            })).then(() => dynamodb.send(new UpdateCommand({
+              TableName: SETTINGS_TABLE,
+              Key: { setting_id: 'SYSTEM_SETTINGS' },
+              UpdateExpression: 'SET settings.platform.beta_mode = :v',
+              ExpressionAttributeValues: { ':v': enabled },
+            }))),
           ]);
           console.log(`[betaMode] Beta mode set to: ${enabled} by admin ${adminCheck.userId}`);
           return ok({ success: true, betaMode: enabled });

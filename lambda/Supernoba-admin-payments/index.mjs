@@ -20,7 +20,11 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import Stripe from 'stripe';
-import { CORS, response, handleOptions, getStripeSecretKey } from '/opt/nodejs/index.mjs';
+import {
+  CORS, response, handleOptions,
+  getStripeSecretKey, getStripeTestSecretKey,
+  getValkeyClient,
+} from '/opt/nodejs/index.mjs';
 import { verifyAuth, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 const PAYMENTS_TABLE = process.env.PAYMENTS_TABLE || 'supernoba-payments';
@@ -35,14 +39,28 @@ const dynamodb = DynamoDBDocumentClient.from(
   { marshallOptions: { removeUndefinedValues: true } }
 );
 
-// Stripe client — lazy init
-let stripeClient = null;
-async function getStripe() {
-  if (!stripeClient) {
-    const secretKey = await getStripeSecretKey();
-    stripeClient = new Stripe(secretKey, { apiVersion: '2024-12-18.acacia' });
+// Stripe clients — 모드별 캐싱
+const stripeClients = {};
+
+async function isTestMode() {
+  try {
+    const cache = getValkeyClient({ type: 'operating', preset: 'admin' });
+    const val = await cache.get('platform:beta_mode');
+    return val === 'true';
+  } catch (err) {
+    console.warn('[admin-payments] Failed to check beta_mode:', err.message);
+    return false;
   }
-  return stripeClient;
+}
+
+async function getStripe() {
+  const testMode = await isTestMode();
+  const mode = testMode ? 'test' : 'live';
+  if (!stripeClients[mode]) {
+    const key = testMode ? await getStripeTestSecretKey() : await getStripeSecretKey();
+    stripeClients[mode] = new Stripe(key, { apiVersion: '2024-12-18.acacia' });
+  }
+  return stripeClients[mode];
 }
 
 export const handler = async (event) => {
