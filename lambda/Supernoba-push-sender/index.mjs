@@ -235,7 +235,7 @@ export const handler = async (event) => {
       } catch {}
 
       // APNs 페이로드 구성
-      const sideText = side?.toUpperCase() === 'BUY' ? '매수' : '매도';
+      const sideText = side?.toUpperCase() === 'BUY' ? '🔴 매수' : '🔵 매도';
       const apnsPayload = {
         aps: {
           alert: {
