@@ -54,6 +54,8 @@ export {
   getYouTubeApiKey,
   getStripeSecretKey,
   getStripeWebhookSecret,
+  getStripeTestSecretKey,
+  getStripeTestWebhookSecret,
   clearSecretsCache,
   SecretNames,
 } from './secretsManager.mjs';

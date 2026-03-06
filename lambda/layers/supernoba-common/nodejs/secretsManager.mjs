@@ -110,6 +110,22 @@ export async function getStripeWebhookSecret() {
 }
 
 /**
+ * Get Stripe TEST secret key with secure fallback
+ * @returns {Promise<string>} - The Stripe test secret key
+ */
+export async function getStripeTestSecretKey() {
+  return getSecret('supernoba/stripe-secret-key-test', process.env.STRIPE_TEST_SECRET_KEY);
+}
+
+/**
+ * Get Stripe TEST webhook secret with secure fallback
+ * @returns {Promise<string>} - The Stripe test webhook signing secret
+ */
+export async function getStripeTestWebhookSecret() {
+  return getSecret('supernoba/stripe-webhook-secret-test', process.env.STRIPE_TEST_WEBHOOK_SECRET);
+}
+
+/**
  * Clear the secrets cache
  */
 export function clearSecretsCache() {
@@ -126,6 +142,8 @@ export const SecretNames = {
   SUPERNOBA_API_KEY: 'supernoba/api-key',
   STRIPE_SECRET_KEY: 'supernoba/stripe-secret-key',
   STRIPE_WEBHOOK_SECRET: 'supernoba/stripe-webhook-secret',
+  STRIPE_TEST_SECRET_KEY: 'supernoba/stripe-secret-key-test',
+  STRIPE_TEST_WEBHOOK_SECRET: 'supernoba/stripe-webhook-secret-test',
 };
 
 export default {
@@ -134,6 +152,10 @@ export default {
   getAdminApiKey,
   getTwitterBearerToken,
   getYouTubeApiKey,
+  getStripeSecretKey,
+  getStripeWebhookSecret,
+  getStripeTestSecretKey,
+  getStripeTestWebhookSecret,
   clearSecretsCache,
   SecretNames,
 };
