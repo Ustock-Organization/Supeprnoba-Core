@@ -255,15 +255,39 @@ async function listProducts() {
  * supernoba-users에서 stripe_customer_id 조회 → 없으면 Stripe Customer 생성 후 저장
  * 테스트/라이브 모드에 따라 별도 필드 사용
  */
+/**
+ * Resolve the best available email for Stripe:
+ * 1. user_email from DynamoDB (user-entered, always real)
+ * 2. auth email from JWT (filter out synthetic emails like @x.supernoba.com)
+ * 3. null if no real email available
+ */
+function resolveRealEmail(userRecord, authEmail) {
+  // Priority 1: User-entered email from DynamoDB
+  if (userRecord?.user_email) {
+    return userRecord.user_email;
+  }
+
+  // Priority 2: Auth email from JWT (skip synthetic/relay emails)
+  if (authEmail && !authEmail.endsWith('@x.supernoba.com')) {
+    return authEmail;
+  }
+
+  // No real email available
+  return null;
+}
+
 async function getOrCreateStripeCustomer(userId, email, testMode) {
   const customerIdField = testMode ? 'stripe_customer_id_test' : 'stripe_customer_id';
 
-  // 1. DynamoDB에서 기존 customer_id 확인
+  // 1. DynamoDB에서 기존 customer_id + user_email 확인
   const { Item: user } = await dynamodb.send(new GetCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
-    ProjectionExpression: customerIdField,
+    ProjectionExpression: `${customerIdField}, user_email`,
   }));
+
+  // Resolve best available real email
+  const realEmail = resolveRealEmail(user, email);
 
   // 2. 기존 customer_id가 있으면 Stripe에서 유효성 검증
   if (user?.[customerIdField]) {
@@ -271,6 +295,11 @@ async function getOrCreateStripeCustomer(userId, email, testMode) {
       const stripe = await getStripe(testMode);
       const existing = await stripe.customers.retrieve(user[customerIdField]);
       if (!existing.deleted) {
+        // Update email on existing Stripe customer if we have a new/better email
+        if (realEmail && existing.email !== realEmail) {
+          await stripe.customers.update(user[customerIdField], { email: realEmail });
+          console.log(`[payments] Updated Stripe customer ${user[customerIdField]} email to ${realEmail}`);
+        }
         return user[customerIdField];
       }
       console.warn(`[payments] Customer ${user[customerIdField]} is deleted, recreating for ${userId}`);
@@ -279,11 +308,11 @@ async function getOrCreateStripeCustomer(userId, email, testMode) {
     }
   }
 
-  // 3. Stripe Customer 생성
+  // 3. Stripe Customer 생성 (only set real emails)
   const stripe = await getStripe(testMode);
   const customer = await stripe.customers.create({
     metadata: { user_id: userId },
-    email: email || undefined,
+    email: realEmail || undefined,
   });
 
   // 4. supernoba-users에 stripe_customer_id 저장
@@ -295,7 +324,7 @@ async function getOrCreateStripeCustomer(userId, email, testMode) {
     ConditionExpression: 'attribute_exists(user_id)',
   }));
 
-  console.log(`[payments] Created Stripe ${testMode ? 'TEST ' : ''}customer ${customer.id} for ${userId}`);
+  console.log(`[payments] Created Stripe ${testMode ? 'TEST ' : ''}customer ${customer.id} for ${userId} (email: ${realEmail || 'none'})`);
   return customer.id;
 }
 

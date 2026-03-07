@@ -163,6 +163,10 @@ async function getPaymentStats() {
   const subscriptionPayments = payments.filter(p => p.type === 'subscription');
   const oneTimePayments = payments.filter(p => p.type === 'one_time');
 
+  // source별 분류 (apple vs stripe)
+  const applePayments = payments.filter(p => p.source === 'apple');
+  const stripePayments = payments.filter(p => p.source !== 'apple');
+
   // 활성 구독 수 (supernoba-users에서 scan — 소규모 테이블이므로 OK)
   const activeSubsResult = await dynamodb.send(new ScanCommand({
     TableName: USER_TABLE,
@@ -178,6 +182,11 @@ async function getPaymentStats() {
     one_time_revenue: oneTimePayments.reduce((sum, p) => sum + (p.amount || 0), 0),
     subscription_count: subscriptionPayments.length,
     one_time_count: oneTimePayments.length,
+    // source별 매출 분류
+    apple_count: applePayments.length,
+    apple_revenue: applePayments.reduce((sum, p) => sum + (p.amount || 0), 0),
+    stripe_count: stripePayments.length,
+    stripe_revenue: stripePayments.reduce((sum, p) => sum + (p.amount || 0), 0),
     active_subscriptions: activeSubsResult.Count || 0,
     currency: 'KRW',
   });
@@ -209,6 +218,11 @@ async function processRefund(event) {
 
   if (payment.status === 'refunded') {
     return err(409, 'Already refunded');
+  }
+
+  // Apple 결제는 App Store Connect에서만 환불 가능
+  if (payment.source === 'apple') {
+    return err(400, 'Apple 결제는 App Store Connect에서만 환불 가능합니다.');
   }
 
   // Stripe 환불 요청 (invoice_id 또는 payment_intent에서)
@@ -261,7 +275,7 @@ async function getActiveSubscriptions(query) {
     TableName: USER_TABLE,
     FilterExpression: 'attribute_exists(subscription_status) AND subscription_status <> :none',
     ExpressionAttributeValues: { ':none': 'none' },
-    ProjectionExpression: 'user_id, subscription_status, subscription_plan, subscription_expires_at, subscription_id, stripe_customer_id',
+    ProjectionExpression: 'user_id, subscription_status, subscription_plan, subscription_expires_at, subscription_id, stripe_customer_id, subscription_source, apple_original_transaction_id, subscription_cancel_at_period_end',
     Limit: limit,
   }));
 

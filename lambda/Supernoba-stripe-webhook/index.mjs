@@ -237,13 +237,14 @@ async function handleSubscriptionUpdate(subscription, suffix, modeLabel) {
   await dynamodb.send(new UpdateCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
-    UpdateExpression: `SET subscription_status${suffix} = :status, subscription_plan${suffix} = :plan, subscription_expires_at${suffix} = :exp, subscription_id${suffix} = :sid, subscription_cancel_at_period_end${suffix} = :cancelEnd, subscription_updated_at${suffix} = :now`,
+    UpdateExpression: `SET subscription_status${suffix} = :status, subscription_plan${suffix} = :plan, subscription_expires_at${suffix} = :exp, subscription_id${suffix} = :sid, subscription_cancel_at_period_end${suffix} = :cancelEnd, subscription_source${suffix} = :source, subscription_updated_at${suffix} = :now`,
     ExpressionAttributeValues: {
       ':status': subscription.status, // active, past_due, trialing, etc.
       ':plan': planName,
       ':exp': expiresAt,
       ':sid': subscription.id,
       ':cancelEnd': subscription.cancel_at_period_end || false,
+      ':source': 'stripe',
       ':now': now,
     },
   }));
