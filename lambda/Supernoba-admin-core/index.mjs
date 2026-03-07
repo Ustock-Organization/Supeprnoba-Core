@@ -43,7 +43,7 @@ const loadAuth = async () => {
 const { verifyAdmin, authErrorResponse } = await loadAuth();
 
 // 환경변수
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 // WALLETS_TABLE 제거됨 — supernoba-users.balances.BOLT로 통합
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
@@ -117,7 +117,7 @@ export const handler = async (event) => {
       }
       if (userId && !admin) {
         try {
-          const { Item } = await dynamodb.send(new GetCommand({ TableName: USER_CACHE_TABLE, Key: { user_id: userId } }));
+          const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
           if (Item) admin = Item.is_admin === true;
         } catch (e) {
           console.error('[auth] User cache lookup error:', e.message);
@@ -447,7 +447,7 @@ export const handler = async (event) => {
         let profile = null;
         try {
           const { Item } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           profile = Item || null;
@@ -516,7 +516,7 @@ export const handler = async (event) => {
       // 사용자 목록
       try {
         const { Items: allUsers } = await dynamodb.send(new ScanCommand({
-          TableName: USER_CACHE_TABLE
+          TableName: USERS_TABLE
         }));
 
         let users = allUsers || [];
@@ -635,7 +635,7 @@ export const handler = async (event) => {
         const userPromises = userIds.slice(0, 100).map(async (uid) => {
           try {
             const { Item } = await dynamodb.send(new GetCommand({
-              TableName: USER_CACHE_TABLE,
+              TableName: USERS_TABLE,
               Key: { user_id: uid }
             }));
             if (Item) {
@@ -669,7 +669,7 @@ export const handler = async (event) => {
       if (action === 'suspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended, suspended_at = :suspended_at, suspended_reason = :reason',
             ExpressionAttributeValues: {
@@ -710,7 +710,7 @@ export const handler = async (event) => {
       if (action === 'unsuspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended REMOVE suspended_at, suspended_reason',
             ExpressionAttributeValues: {
@@ -738,7 +738,7 @@ export const handler = async (event) => {
         let currentBalance = 0;
         try {
           const { Item: user } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             ProjectionExpression: 'balances'
           }));
@@ -749,7 +749,7 @@ export const handler = async (event) => {
 
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now',
             ExpressionAttributeValues: {

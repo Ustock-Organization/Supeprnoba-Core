@@ -37,7 +37,7 @@ const DEFAULT_SETTINGS = {
 // 설정 캐시
 let cachedSettings = null;
 
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
 
 // Layer를 통한 클라이언트 초기화
@@ -75,11 +75,11 @@ export const handler = async (event) => {
 
       // 개별 사용자 상세 조회
       if (userId) {
-        // DynamoDB user-cache에서 사용자 프로필 조회
+        // DynamoDB supernoba-users에서 사용자 프로필 조회
         let profile = null;
         try {
           const { Item } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           profile = Item || null;
@@ -147,11 +147,11 @@ export const handler = async (event) => {
         });
       }
 
-      // 사용자 목록 조회 (DynamoDB user-cache에서)
+      // 사용자 목록 조회 (DynamoDB supernoba-users에서)
       try {
         // DynamoDB Scan으로 전체 사용자 조회 (필터링은 메모리에서 수행)
         const { Items: allUsers } = await dynamodb.send(new ScanCommand({
-          TableName: USER_CACHE_TABLE
+          TableName: USERS_TABLE
         }));
 
         let users = allUsers || [];
@@ -298,7 +298,7 @@ export const handler = async (event) => {
         const result = await dynamodb.send(new ScanCommand(scanParams));
         const holdings = result.Items || [];
 
-        // 사용자 정보 추가 (DynamoDB user-cache에서)
+        // 사용자 정보 추가 (DynamoDB supernoba-users에서)
         const userIds = [...new Set(holdings.map(h => h.user_id))];
         const userMap = {};
 
@@ -306,7 +306,7 @@ export const handler = async (event) => {
         const userPromises = userIds.slice(0, 100).map(async (uid) => {
           try {
             const { Item } = await dynamodb.send(new GetCommand({
-              TableName: USER_CACHE_TABLE,
+              TableName: USERS_TABLE,
               Key: { user_id: uid }
             }));
             if (Item) {
@@ -386,7 +386,7 @@ export const handler = async (event) => {
           const targetUserId = job.user_id;
           if (targetUserId) {
             await dynamodb.send(new UpdateCommand({
-              TableName: USER_CACHE_TABLE,
+              TableName: USERS_TABLE,
               Key: { user_id: targetUserId },
               UpdateExpression: 'REMOVE is_deleting SET updated_at = :now',
               ExpressionAttributeValues: { ':now': new Date().toISOString() }
@@ -410,7 +410,7 @@ export const handler = async (event) => {
       if (action === 'suspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended, suspended_at = :suspended_at, suspended_reason = :reason',
             ExpressionAttributeValues: {
@@ -449,7 +449,7 @@ export const handler = async (event) => {
         // Cognito 사용자 비활성화 (모든 cognito_subs에 대해)
         try {
           const { Item: userInfo } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           const cognitoSubs = userInfo?.cognito_subs || [];
@@ -538,7 +538,7 @@ export const handler = async (event) => {
       if (action === 'unsuspend') {
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_suspended = :suspended REMOVE suspended_at, suspended_reason',
             ExpressionAttributeValues: {
@@ -552,7 +552,7 @@ export const handler = async (event) => {
         // Cognito 사용자 재활성화
         try {
           const { Item: userInfo } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           const cognitoSubs = userInfo?.cognito_subs || [];
@@ -587,7 +587,7 @@ export const handler = async (event) => {
 
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_admin = :isAdmin, updated_at = :updatedAt',
             ExpressionAttributeValues: {
@@ -625,7 +625,7 @@ export const handler = async (event) => {
 
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_tester = :isTester, updated_at = :updatedAt',
             ExpressionAttributeValues: {
@@ -672,7 +672,7 @@ export const handler = async (event) => {
 
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: updateExpr,
             ExpressionAttributeValues: exprValues,
@@ -708,7 +708,7 @@ export const handler = async (event) => {
         let currentBalance = 0;
         try {
           const { Item: user } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             ProjectionExpression: 'balances'
           }));
@@ -720,7 +720,7 @@ export const handler = async (event) => {
         // users 테이블의 balances.BOLT.available 직접 업데이트
         try {
           await dynamodb.send(new UpdateCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now',
             ExpressionAttributeValues: {
@@ -841,7 +841,7 @@ export const handler = async (event) => {
         // Pre-check: 사용자 존재 확인
         try {
           const { Item: targetUser } = await dynamodb.send(new GetCommand({
-            TableName: USER_CACHE_TABLE,
+            TableName: USERS_TABLE,
             Key: { user_id: userId }
           }));
           if (!targetUser) return err(404, 'User not found');

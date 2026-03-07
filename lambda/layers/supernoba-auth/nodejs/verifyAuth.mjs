@@ -327,7 +327,7 @@ export async function verifyAdmin(event) {
   }
 
   // 3. 관리자 권한 확인
-  // JWT 클레임 또는 DynamoDB user-cache에서 is_admin 확인
+  // JWT 클레임 또는 DynamoDB supernoba-users에서 is_admin 확인
 
   // 부트스트랩 관리자: Cognito sub로 직접 인식 (DynamoDB 설정 전 임시)
   const BOOTSTRAP_ADMINS = [
@@ -341,7 +341,7 @@ export async function verifyAdmin(event) {
     authResult.payload?.user_metadata?.is_admin === true ||
     BOOTSTRAP_ADMINS.includes(authResult.userId);
 
-  // JWT 클레임에 admin이 없으면 DynamoDB user-cache 조회
+  // JWT 클레임에 admin이 없으면 DynamoDB supernoba-users 조회
   if (!isAdmin && authResult.userId) {
     try {
       // X 로그인 사용자의 경우 email 또는 custom:x_user_id에서 user_id 추출
@@ -388,7 +388,7 @@ export async function verifyAdmin(event) {
 
       if (Item?.is_admin === true) {
         isAdmin = true;
-        console.log(`[verifyAdmin] Admin confirmed from user-cache: ${userId}`);
+        console.log(`[verifyAdmin] Admin confirmed from supernoba-users: ${userId}`);
       } else {
         console.log(`[verifyAdmin] Not admin or not found: ${userId}, is_admin=${Item?.is_admin}`);
       }

@@ -12,7 +12,7 @@ import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 const { Client: PgClient } = pg;
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const RDS_HOST = process.env.RDS_ENDPOINT || 'supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 
@@ -154,13 +154,13 @@ export const handler = async (event) => {
       if (status === 'FILLED') ordersBySymbol[symbol].filled++;
     });
 
-    // 사용자 통계 (DynamoDB user-cache에서)
+    // 사용자 통계 (DynamoDB supernoba-users에서)
     let totalUsers = 0;
     let suspendedUsers = 0;
     let newUsersWeek = 0;
     try {
       const { Items: allUsers } = await dynamodb.send(new ScanCommand({
-        TableName: USER_CACHE_TABLE,
+        TableName: USERS_TABLE,
         ProjectionExpression: 'user_id, is_suspended, created_at'
       }));
       const users = allUsers || [];

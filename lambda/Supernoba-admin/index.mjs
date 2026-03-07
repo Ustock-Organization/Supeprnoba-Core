@@ -30,7 +30,7 @@ import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
-const USER_CACHE_TABLE = process.env.USER_CACHE_TABLE || 'supernoba-users';
+const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const ANNOUNCEMENTS_TABLE = process.env.ANNOUNCEMENTS_TABLE || 'supernoba-announcements';
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'supernoba-announcements-media';
 const s3 = new S3Client({ region: 'ap-northeast-2' });
@@ -81,10 +81,10 @@ export const handler = async (event) => {
         const { userId } = q;
         let admin = false;
 
-        // DynamoDB user-cache에서 is_admin 확인 (SSoT)
+        // DynamoDB supernoba-users에서 is_admin 확인 (SSoT)
         if (userId) {
           try {
-            const { Item } = await dynamodb.send(new GetCommand({ TableName: USER_CACHE_TABLE, Key: { user_id: userId } }));
+            const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
             if (Item?.is_admin === true) {
               admin = true;
               console.log(`[auth] Admin confirmed: ${userId}`);
