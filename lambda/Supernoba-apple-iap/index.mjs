@@ -44,6 +44,16 @@ const dynamodb = DynamoDBDocumentClient.from(
 // 30일 TTL (초 단위)
 const TTL_30_DAYS = 30 * 24 * 60 * 60;
 
+/**
+ * Apple JWS environment 기반 test/live suffix 결정
+ * Stripe의 event.livemode와 동일한 패턴:
+ * - Production → '' (라이브 필드)
+ * - 그 외 (Sandbox, Xcode, LocalTesting 등) → '_test'
+ */
+function determineSuffix(environment) {
+  return environment === 'Production' ? '' : '_test';
+}
+
 export const handler = async (event) => {
   // CORS preflight
   const optionsResponse = handleOptions(event, CORS.STANDARD);
@@ -117,6 +127,9 @@ async function handleVerify(event) {
     return response.ok({ verified: true, duplicate: true }, CORS.STANDARD);
   }
 
+  // environment 기반 test/live suffix 결정
+  const suffix = determineSuffix(payload.environment);
+
   // 구독 상태 결정
   const now = new Date().toISOString();
   const isSubscription = payload.type === 'Auto-Renewable Subscription';
@@ -125,12 +138,12 @@ async function handleVerify(event) {
     ? new Date(payload.expiresDate).toISOString()
     : null;
 
-  // supernoba-users 업데이트
+  // supernoba-users 업데이트 (suffix 적용)
   const updateExpression = [
-    'SET subscription_status = :status',
-    'subscription_source = :source',
-    'subscription_updated_at = :now',
-    'apple_original_transaction_id = :otxn',
+    `SET subscription_status${suffix} = :status`,
+    `subscription_source${suffix} = :source`,
+    `subscription_updated_at${suffix} = :now`,
+    `apple_original_transaction_id${suffix} = :otxn`,
   ];
   const expressionValues = {
     ':status': subscriptionStatus,
@@ -140,11 +153,11 @@ async function handleVerify(event) {
   };
 
   if (isSubscription) {
-    updateExpression.push('subscription_plan = :plan');
+    updateExpression.push(`subscription_plan${suffix} = :plan`);
     expressionValues[':plan'] = productId || payload.productId || 'apple_subscription';
 
     if (expiresAt) {
-      updateExpression.push('subscription_expires_at = :exp');
+      updateExpression.push(`subscription_expires_at${suffix} = :exp`);
       expressionValues[':exp'] = expiresAt;
     }
   }
@@ -169,12 +182,13 @@ async function handleVerify(event) {
       product_id: productId || payload.productId,
       apple_transaction_id: transactionId,
       apple_original_transaction_id: originalTransactionId,
+      is_test: suffix === '_test',
       created_at: now,
       updated_at: now,
     },
   }));
 
-  console.log(`[apple-iap] Verified: ${paymentId} for ${userId} → ${subscriptionStatus}`);
+  console.log(`[apple-iap] Verified: ${paymentId} for ${userId} → ${subscriptionStatus} (env=${payload.environment})`);
 
   return response.ok({
     verified: true,
@@ -229,10 +243,11 @@ async function handleNotification(event) {
     }
   }
 
-  // 갱신 정보 추출 (현재 미사용이나 향후 갱신 분석에 활용 가능)
+  // 갱신 정보 추출 (renewalInfo에서 autoRenewStatus 등 확인)
+  let renewalInfo = null;
   if (notificationPayload.data?.signedRenewalInfo) {
     try {
-      await verifyAppleJWS(notificationPayload.data.signedRenewalInfo);
+      renewalInfo = await verifyAppleJWS(notificationPayload.data.signedRenewalInfo);
     } catch (error) {
       console.warn('[apple-iap] Failed to verify signedRenewalInfo:', error.message);
     }
@@ -242,6 +257,10 @@ async function handleNotification(event) {
     console.warn(`[apple-iap] No transactionInfo for ${notificationType}, skipping`);
     return { statusCode: 200, body: JSON.stringify({ received: true }) };
   }
+
+  // environment 기반 test/live suffix 결정
+  const environment = notificationPayload.data?.environment || transactionInfo.environment;
+  const suffix = determineSuffix(environment);
 
   // originalTransactionId로 사용자 조회
   const originalTransactionId = transactionInfo.originalTransactionId;
@@ -265,11 +284,13 @@ async function handleNotification(event) {
     : null;
 
   const setParts = [
-    'subscription_status = :status',
-    'subscription_updated_at = :now',
+    `subscription_status${suffix} = :status`,
+    `subscription_source${suffix} = :source`,
+    `subscription_updated_at${suffix} = :now`,
   ];
   const expressionValues = {
     ':status': subscriptionStatus,
+    ':source': 'apple',
     ':now': now,
   };
 
@@ -277,15 +298,30 @@ async function handleNotification(event) {
 
   // cancelled/expired가 아닐 때만 만료일 SET (REMOVE와 충돌 방지)
   if (expiresAt && !isCancelledOrExpired) {
-    setParts.push('subscription_expires_at = :exp');
+    setParts.push(`subscription_expires_at${suffix} = :exp`);
     expressionValues[':exp'] = expiresAt;
+  }
+
+  // DID_CHANGE_RENEWAL_STATUS — cancel_at_period_end 추적
+  if (notificationType === 'DID_CHANGE_RENEWAL_STATUS') {
+    setParts.push(`subscription_cancel_at_period_end${suffix} = :cancelEnd`);
+    expressionValues[':cancelEnd'] = subtype === 'AUTO_RENEW_DISABLED';
+  }
+
+  // plan 업데이트 — 갱신/구독/플랜변경 시 productId 반영
+  if (['DID_CHANGE_RENEWAL_PREF', 'DID_RENEW', 'SUBSCRIBED'].includes(notificationType)) {
+    const planProductId = renewalInfo?.autoRenewProductId || transactionInfo.productId;
+    if (planProductId) {
+      setParts.push(`subscription_plan${suffix} = :plan`);
+      expressionValues[':plan'] = planProductId;
+    }
   }
 
   // SET과 REMOVE는 별도 clause로 조합 (쉼표가 아닌 공백 구분)
   let updateExpression = `SET ${setParts.join(', ')}`;
 
   if (isCancelledOrExpired) {
-    updateExpression += ' REMOVE subscription_plan, subscription_expires_at';
+    updateExpression += ` REMOVE subscription_plan${suffix}, subscription_expires_at${suffix}, subscription_cancel_at_period_end${suffix}`;
   }
 
   await dynamodb.send(new UpdateCommand({
@@ -295,7 +331,10 @@ async function handleNotification(event) {
     ExpressionAttributeValues: expressionValues,
   }));
 
-  console.log(`[apple-iap] Notification processed: ${notificationType}/${subtype} → ${userId} = ${subscriptionStatus}`);
+  // 결제 기록 생성 (갱신, 구독, 환불, 실패)
+  await createApplePaymentRecord(userId, transactionInfo, notificationType, suffix);
+
+  console.log(`[apple-iap] Notification processed: ${notificationType}/${subtype} → ${userId} = ${subscriptionStatus} (env=${environment})`);
 
   return { statusCode: 200, body: JSON.stringify({ received: true }) };
 }
@@ -308,6 +347,12 @@ async function handleNotification(event) {
  * StoreKit 2 / App Store Server Notifications v2는 JWS 토큰을 사용.
  * x5c 헤더에 Apple 인증서 체인이 포함되어 있어 Apple Root CA로 검증 가능.
  *
+ * 보안 검증 4단계:
+ * 1. x5c 체인 최소 3개 인증서 (리프, 중간, 루트) 필수
+ * 2. 루트 인증서 = Apple Root CA G3 fingerprint 매칭
+ * 3. 체인-오브-트러스트: 각 인증서가 상위 인증서에 의해 서명되었는지 확인
+ * 4. JWS 서명을 리프 인증서 공개키로 검증
+ *
  * @param {string} jwsToken - JWS compact serialization
  * @returns {Object} verified payload
  */
@@ -316,26 +361,37 @@ async function verifyAppleJWS(jwsToken) {
   const header = jose.decodeProtectedHeader(jwsToken);
   const x5c = header.x5c;
 
-  if (!x5c || x5c.length === 0) {
-    throw new Error('Missing x5c certificate chain in JWS header');
+  if (!x5c || x5c.length < 3) {
+    throw new Error('Invalid x5c chain: Apple JWS requires at least 3 certificates (leaf, intermediate, root)');
   }
 
-  // 2. 리프 인증서에서 공개키 추출
-  const leafCertPem = `-----BEGIN CERTIFICATE-----\n${x5c[0]}\n-----END CERTIFICATE-----`;
-  const leafCert = await jose.importX509(leafCertPem, header.alg || 'ES256');
+  // 2. 루트 인증서 fingerprint 검증 (필수)
+  const rootDer = Buffer.from(x5c[x5c.length - 1], 'base64');
+  const rootFingerprint = await computeSHA1(rootDer);
+  if (rootFingerprint !== APPLE_ROOT_CA_G3_FINGERPRINT) {
+    throw new Error(`Root certificate fingerprint mismatch: ${rootFingerprint}`);
+  }
 
-  // 3. 인증서 체인 검증 — 루트가 Apple Root CA인지 확인
-  if (x5c.length >= 2) {
-    const rootCert = x5c[x5c.length - 1];
-    const rootDer = Buffer.from(rootCert, 'base64');
-    const rootFingerprint = await computeSHA1(rootDer);
+  // 3. 체인-오브-트러스트 검증 — 각 인증서가 상위 인증서에 의해 서명되었는지 확인
+  const { X509Certificate } = await import('node:crypto');
+  const certs = x5c.map(c => new X509Certificate(Buffer.from(c, 'base64')));
 
-    if (rootFingerprint !== APPLE_ROOT_CA_G3_FINGERPRINT) {
-      throw new Error(`Root certificate fingerprint mismatch: ${rootFingerprint}`);
+  for (let i = 0; i < certs.length - 1; i++) {
+    if (!certs[i].verify(certs[i + 1].publicKey)) {
+      throw new Error(`Certificate chain broken at index ${i}: cert[${i}] not signed by cert[${i + 1}]`);
+    }
+    // 인증서 만료 확인
+    const now = new Date();
+    if (now < new Date(certs[i].validFrom) || now > new Date(certs[i].validTo)) {
+      throw new Error(`Certificate at index ${i} is expired or not yet valid`);
     }
   }
 
-  // 4. JWS 서명 검증
+  // 4. 리프 인증서에서 공개키 추출
+  const leafCertPem = `-----BEGIN CERTIFICATE-----\n${x5c[0]}\n-----END CERTIFICATE-----`;
+  const leafCert = await jose.importX509(leafCertPem, header.alg || 'ES256');
+
+  // 5. JWS 서명 검증
   const { payload } = await jose.jwtVerify(jwsToken, leafCert, {
     algorithms: ['ES256'],
     // Apple JWS는 iss/aud claim이 없을 수 있으므로 검증 스킵
@@ -418,8 +474,13 @@ function mapNotificationToStatus(notificationType, subtype) {
       return 'active';
 
     case 'DID_CHANGE_RENEWAL_STATUS':
-      // subtype 'AUTO_RENEW_DISABLED' = 다음 갱신 안 함 (현재는 아직 active)
-      return subtype === 'AUTO_RENEW_DISABLED' ? 'active' : 'active';
+      // AUTO_RENEW_DISABLED = 다음 갱신 안 함 (현재는 아직 active)
+      // cancel_at_period_end는 별도 필드로 추적
+      return 'active';
+
+    case 'DID_CHANGE_RENEWAL_PREF':
+      // 플랜 변경 (업/다운그레이드 예약) — 구독은 여전히 active
+      return 'active';
 
     case 'DID_FAIL_TO_RENEW':
       return 'past_due';
@@ -432,7 +493,6 @@ function mapNotificationToStatus(notificationType, subtype) {
       return 'cancelled';
 
     case 'CONSUMPTION_REQUEST':
-    case 'DID_CHANGE_RENEWAL_PREF':
     case 'OFFER_REDEEMED':
     case 'PRICE_INCREASE':
     case 'RENEWAL_EXTENDED':
@@ -442,6 +502,55 @@ function mapNotificationToStatus(notificationType, subtype) {
 
     default:
       return null;
+  }
+}
+
+/**
+ * S2S 알림 시 결제 기록 생성
+ * 갱신, 구독, 환불, 실패 알림에 대해 supernoba-payments에 기록
+ */
+async function createApplePaymentRecord(userId, transactionInfo, notificationType, suffix) {
+  // 결제 기록이 필요한 알림 타입만 처리
+  const recordableTypes = {
+    SUBSCRIBED: 'completed',
+    DID_RENEW: 'completed',
+    REFUND: 'refunded',
+    REVOKE: 'refunded',
+    DID_FAIL_TO_RENEW: 'failed',
+  };
+
+  const paymentStatus = recordableTypes[notificationType];
+  if (!paymentStatus) return;
+
+  // 결제 기록 ID: 알림 타입 + transactionId로 구분
+  const paymentId = `apple_notif_${transactionInfo.transactionId}`;
+
+  try {
+    await dynamodb.send(new PutCommand({
+      TableName: PAYMENTS_TABLE,
+      Item: {
+        user_id: userId,
+        payment_id: paymentId,
+        type: 'subscription',
+        status: paymentStatus,
+        source: 'apple',
+        product_id: transactionInfo.productId,
+        apple_transaction_id: transactionInfo.transactionId,
+        apple_original_transaction_id: transactionInfo.originalTransactionId,
+        notification_type: notificationType,
+        is_test: suffix === '_test',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      ConditionExpression: 'attribute_not_exists(payment_id)',
+    }));
+    console.log(`[apple-iap] Payment record created: ${paymentId} (${notificationType} → ${paymentStatus})`);
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') {
+      console.log(`[apple-iap] Payment record already exists: ${paymentId}`);
+    } else {
+      console.error(`[apple-iap] Failed to create payment record: ${paymentId}`, error.message);
+    }
   }
 }
 
@@ -467,7 +576,7 @@ async function findUserByAppleTransactionId(originalTransactionId) {
   do {
     const params = {
       TableName: USER_TABLE,
-      FilterExpression: 'apple_original_transaction_id = :otxn',
+      FilterExpression: 'apple_original_transaction_id = :otxn OR apple_original_transaction_id_test = :otxn',
       ExpressionAttributeValues: { ':otxn': { S: originalTransactionId } },
       ProjectionExpression: 'user_id',
     };
