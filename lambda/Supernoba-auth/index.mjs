@@ -40,7 +40,7 @@ const CALLBACK_URL = process.env.CALLBACK_URL;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://supernoba.io';
 const STATE_TABLE = process.env.STATE_TABLE || 'supernoba-oauth-state';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
-// 통합된 users 테이블 (user-cache + wallets 통합)
+// 통합된 users 테이블 (supernoba-users)
 const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const SETTINGS_KEY = 'SYSTEM_SETTINGS';
 
@@ -370,13 +370,15 @@ async function authenticateWithCognito(xUser) {
       MessageAction: 'SUPPRESS',
     }));
   } else {
-    // 기존 사용자 - 프로필 업데이트
+    // 기존 사용자 - 프로필 업데이트 (custom:x_user_id 포함 — 초기 미설정 계정 복구)
     await cognito.send(new AdminUpdateUserAttributesCommand({
       UserPoolId: COGNITO_USER_POOL_ID,
       Username: email,
       UserAttributes: [
         { Name: 'name', Value: xUser.name || xUser.username },
         { Name: 'picture', Value: xUser.profile_image_url?.replace('_normal', '') || '' },
+        { Name: 'custom:x_user_id', Value: xUser.id },
+        { Name: 'custom:x_username', Value: xUser.username },
       ],
     }));
   }
@@ -551,7 +553,9 @@ async function handleUserInit(event) {
       is_verified: verified === true || user.is_verified === true,
       full_name: user.full_name || user.username || '',
       avatar_url: user.avatar_url || null,
+      avatar_emoji: user.avatar_emoji ?? null,
       email: user.email || null,
+      user_email: user.user_email || null,
       settings: {
         maintenanceMode: settings.system?.maintenanceMode || false,
         tradingEnabled: settings.system?.tradingEnabled !== false,
@@ -578,6 +582,7 @@ async function handleUserInit(event) {
         username: displayName || '',
         full_name: displayName || '',
         avatar_url: avatarUrl || null,
+        avatar_emoji: null,
         provider: provider || 'unknown',
         is_admin: false,
         is_tester: false,
@@ -673,7 +678,11 @@ async function handleProfileUpload(event) {
  */
 async function handleSyncUser(event) {
   const body = JSON.parse(event.body || '{}');
-  const { userId, email, displayName, avatarUrl, provider, cognitoSub, providerUserId } = body;
+  const { userId, email, displayName, avatarUrl, avatarEmoji, provider, cognitoSub, providerUserId, userEmail } = body;
+
+  // 사용자 입력 이메일 유효성 검사 (결제 영수증용)
+  const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const validatedUserEmail = (userEmail && EMAIL_REGEX.test(userEmail)) ? userEmail.trim() : null;
 
   if (!userId || !provider) {
     return err(400, 'userId and provider are required');
@@ -729,6 +738,15 @@ async function handleSyncUser(event) {
       ? user.avatar_url
       : (avatarUrl || user.avatar_url || null);
 
+    // avatar_emoji 결정: 명시적 전달 시 업데이트, 아니면 기존값 유지
+    const resolvedEmoji = (avatarEmoji !== undefined && avatarEmoji !== null)
+      ? avatarEmoji
+      : (user.avatar_emoji ?? null);
+
+    // user_email이 유효하면 UpdateExpression에 포함
+    const userEmailExpr = validatedUserEmail ? ', user_email = :userEmail' : '';
+    const userEmailAttr = validatedUserEmail ? { ':userEmail': validatedUserEmail } : {};
+
     await ddb.send(new UpdateCommand({
       TableName: USERS_TABLE,
       Key: { user_id: userId },
@@ -738,8 +756,9 @@ async function handleSyncUser(event) {
         email = :email,
         ${nameExprs},
         avatar_url = :avatarUrl,
+        avatar_emoji = :avatarEmoji,
         primary_provider = if_not_exists(primary_provider, :provider),
-        updated_at = :now`,
+        updated_at = :now${userEmailExpr}`,
       ExpressionAttributeValues: {
         ':linkedAccounts': linkedAccounts,
         ':cognitoSubs': cognitoSubs,
@@ -747,15 +766,19 @@ async function handleSyncUser(event) {
         ':username': hasValidName ? displayName : '',
         ':fullName': hasValidName ? displayName : '',
         ':avatarUrl': resolvedAvatar,
+        ':avatarEmoji': resolvedEmoji,
         ':provider': provider,
         ':now': now,
+        ...userEmailAttr,
       },
     }));
 
-    console.log(`[auth] User synced: ${userId}, provider: ${provider}`);
+    console.log(`[auth] User synced: ${userId}, provider: ${provider}${validatedUserEmail ? `, user_email: ${validatedUserEmail}` : ''}`);
 
     // 기존 DB에 저장된 이름 반환 (프론트엔드가 Redux에 반영)
     const storedName = hasValidName ? displayName : (user.full_name || user.username || '');
+    // user_email: 이번에 저장한 값 또는 기존 DB 값
+    const resolvedUserEmail = validatedUserEmail || user.user_email || null;
 
     return ok({
       synced: true,
@@ -763,6 +786,8 @@ async function handleSyncUser(event) {
       user_id: userId,
       full_name: storedName,
       avatar_url: resolvedAvatar,
+      avatar_emoji: resolvedEmoji,
+      user_email: resolvedUserEmail,
     });
   }
 
@@ -794,6 +819,7 @@ async function handleSyncUser(event) {
       username: displayName || '',
       full_name: displayName || '',
       avatar_url: avatarUrl || null,
+      avatar_emoji: (avatarEmoji !== undefined && avatarEmoji !== null) ? avatarEmoji : null,
       provider: provider,
       primary_provider: provider,
       linked_accounts: linkedAccounts,
@@ -806,6 +832,7 @@ async function handleSyncUser(event) {
           locked: 0
         }
       },
+      ...(validatedUserEmail ? { user_email: validatedUserEmail } : {}),
       version: 1,
       created_at: now,
       updated_at: now
