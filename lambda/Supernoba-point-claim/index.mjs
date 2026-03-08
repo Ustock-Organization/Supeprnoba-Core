@@ -101,7 +101,8 @@ async function claimPremiumReward(userId) {
   }
 
   const status = user.subscription_status;
-  if (status !== 'active' && status !== 'trialing') {
+  if (status !== 'active' && status !== 'trialing' && status !== 'test_active') {
+    console.log(`[point-claim] Subscription check failed: user=${userId}, status=${status}`);
     return response.error(403, 'Premium subscription required', CORS.STANDARD);
   }
 
@@ -194,7 +195,7 @@ async function getRewardStatus(userId) {
 
   const today = getTodayKST();
   const status = user.subscription_status;
-  const isSubscribed = status === 'active' || status === 'trialing';
+  const isSubscribed = status === 'active' || status === 'trialing' || status === 'test_active';
 
   return response.ok({
     is_subscribed: isSubscribed,
