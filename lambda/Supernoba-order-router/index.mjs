@@ -65,8 +65,6 @@ const IDEMPOTENCY_TABLE = process.env.IDEMPOTENCY_TABLE || 'supernoba-idempotenc
 const IDEMPOTENCY_TTL_SECONDS = 60 * 60; // 1시간 동안 같은 idempotency key 사용 불가
 
 // === Singletons ===
-const testerCache = new Map(); // userId -> { isTester: boolean, expiry: timestamp }
-const TESTER_CACHE_TTL = 5 * 60 * 1000; // 5분
 
 // === Idempotency Check (Conditional Write to DynamoDB) ===
 async function checkIdempotency(idempotencyKey, userId) {
@@ -185,7 +183,7 @@ async function isActiveSymbol(symbol, userId = null) {
   }
 }
 
-// === Tester Account Verification (5분 캐시) ===
+// === Tester Account Verification (캐시 없음 — DynamoDB 직접 조회) ===
 // 베타 모드 OFF → 전체 개방, 베타 모드 ON → is_admin/is_tester만 허용
 async function isAuthorizedTester(userId) {
   // 1. 베타 모드 확인 — OFF면 모든 유저 허용
@@ -202,28 +200,18 @@ async function isAuthorizedTester(userId) {
     }
   }
 
-  // 2. 베타 모드 ON (기본) 또는 Valkey 장애 → 기존 테스터 검증
   if (process.env.DISABLE_TESTER_CHECK === 'true') {
     return true;
   }
 
-  // 캐시 확인
-  const cached = testerCache.get(userId);
-  if (cached && cached.expiry > Date.now()) {
-    return cached.isTester;
-  }
-
-  // DynamoDB users 테이블에서 조회
+  // DynamoDB users 테이블에서 직접 조회 (캐시 제거 — 일관성 보장)
   try {
     const { Item } = await ddb.send(new GetCommand({
       TableName: USERS_TABLE,
       Key: { user_id: userId }
     }));
 
-    // is_admin 또는 is_tester 중 하나라도 true면 허용
-    const isTester = Item && (Item.is_admin === true || Item.is_tester === true);
-    testerCache.set(userId, { isTester, expiry: Date.now() + TESTER_CACHE_TTL });
-    return isTester;
+    return !!(Item && (Item.is_admin === true || Item.is_tester === true));
   } catch (e) {
     console.error('[TesterCheck] Error:', e.message);
     return false;
