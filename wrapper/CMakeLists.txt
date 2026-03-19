@@ -57,13 +57,13 @@ set(SOURCES
     src/market_data_handler.cpp
     src/grpc_service.cpp
     src/redis_client.cpp
-    src/metrics.cpp
     src/logger.cpp
     src/kinesis_consumer.cpp
     src/kinesis_producer.cpp
     src/dynamodb_client.cpp
     src/ranking_manager.cpp
     src/checkpoint_manager.cpp
+    src/notification_client.cpp
 )
 
 # 메인 실행파일

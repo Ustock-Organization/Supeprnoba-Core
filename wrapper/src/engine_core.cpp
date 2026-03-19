@@ -204,12 +204,6 @@ CancelAllResult EngineCore::cancelAllOrders(const std::string& symbol) {
     return result;
 }
 
-void EngineCore::removeFilledOrder(const std::string& symbol,
-                                    const std::string& order_id) {
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    removeFilledOrderUnsafe(symbol, order_id);
-}
-
 void EngineCore::removeFilledOrderUnsafe(const std::string& symbol,
                                           const std::string& order_id) {
     // 락이 이미 보유된 상태에서 호출됨 (콜백 컨텍스트)
@@ -364,14 +358,6 @@ bool EngineCore::hasOrder(const std::string& symbol,
 size_t EngineCore::getSymbolCount() const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     return books_.size();
-}
-
-size_t EngineCore::getOrderCount(const std::string& symbol) const {
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-
-    auto it = order_maps_.find(symbol);
-    if (it == order_maps_.end()) return 0;
-    return it->second.size();
 }
 
 std::vector<std::string> EngineCore::getAllSymbols() const {

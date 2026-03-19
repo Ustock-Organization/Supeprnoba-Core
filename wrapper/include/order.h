@@ -61,6 +61,8 @@ public:
     void setOrderQty(liquibook::book::Quantity q) { order_qty_ = q; }
     void setStopPrice(liquibook::book::Price p) { stop_price_ = p; }
     void setConditions(liquibook::book::OrderConditions c) { conditions_ = c; }
+    void setFilledQty(liquibook::book::Quantity q) { filled_qty_ = q; }
+    void setFilledCost(liquibook::book::Cost c) { filled_cost_ = c; }
     void setTimestamp(int64_t ts) { timestamp_ = ts; }
 
     // 주문 유형 (MARKET / LIMIT) — Kinesis order_type 필드에서 직접 읽음

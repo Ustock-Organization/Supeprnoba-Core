@@ -12,14 +12,6 @@ namespace aws_wrapper {
 
 class RedisClient;  // forward declaration
 
-// 랭킹 항목 정보
-struct RankingEntry {
-    std::string symbol;
-    double score;
-    uint64_t price;
-    double change_pct;
-};
-
 /**
  * RankingManager: 시장 랭킹 관리
  *
