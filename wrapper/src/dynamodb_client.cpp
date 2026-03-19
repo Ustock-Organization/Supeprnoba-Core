@@ -53,8 +53,12 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrders(const std::string& table_
         Aws::DynamoDB::Model::ScanRequest request;
         request.SetTableName(table_name);
 
-        // status IN ('ACCEPTED', 'PARTIAL_FILL') 필터
-        request.SetFilterExpression("#s = :accepted OR #s = :partial_fill");
+        // status IN ('ACCEPTED', 'PARTIAL_FILL') + cancel_processed/PENDING_CANCEL 가드
+        // 고스트 주문 방지: cancel_processed=true 또는 PENDING_CANCEL 상태인 주문 제외
+        request.SetFilterExpression(
+            "(#s = :accepted OR #s = :partial_fill) AND "
+            "(attribute_not_exists(cancel_processed) OR cancel_processed = :false)"
+        );
         request.AddExpressionAttributeNames("#s", "status");
 
         Aws::DynamoDB::Model::AttributeValue acceptedVal;
@@ -64,6 +68,10 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrders(const std::string& table_
         Aws::DynamoDB::Model::AttributeValue partialFillVal;
         partialFillVal.SetS("PARTIAL_FILL");
         request.AddExpressionAttributeValues(":partial_fill", partialFillVal);
+
+        Aws::DynamoDB::Model::AttributeValue falseVal;
+        falseVal.SetBool(false);
+        request.AddExpressionAttributeValues(":false", falseVal);
 
         // 필요한 속성만 가져오기 (프로젝션)
         request.SetProjectionExpression(
@@ -227,7 +235,11 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrdersBySymbol(
         request.SetTableName(table_name);
 
         // symbol = :sym AND (status = 'ACCEPTED' OR status = 'PARTIAL_FILL')
-        request.SetFilterExpression("symbol = :sym AND (#s = :accepted OR #s = :partial_fill)");
+        // 고스트 주문 방지: cancel_processed=true인 주문 제외
+        request.SetFilterExpression(
+            "symbol = :sym AND (#s = :accepted OR #s = :partial_fill) AND "
+            "(attribute_not_exists(cancel_processed) OR cancel_processed = :false)"
+        );
         request.AddExpressionAttributeNames("#s", "status");
 
         Aws::DynamoDB::Model::AttributeValue symbolVal;
@@ -241,6 +253,10 @@ std::vector<OrderPtr> DynamoDBClient::loadActiveOrdersBySymbol(
         Aws::DynamoDB::Model::AttributeValue partialFillVal;
         partialFillVal.SetS("PARTIAL_FILL");
         request.AddExpressionAttributeValues(":partial_fill", partialFillVal);
+
+        Aws::DynamoDB::Model::AttributeValue falseVal;
+        falseVal.SetBool(false);
+        request.AddExpressionAttributeValues(":false", falseVal);
 
         request.SetProjectionExpression(
             "order_id, user_id, symbol, side, price, quantity, filled_qty, #s"
