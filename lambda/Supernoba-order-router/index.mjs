@@ -711,12 +711,26 @@ export const handler = async (event) => {
           })};
         }
 
-        if (['CANCELLED', 'FILLED', 'REJECTED'].includes(order.status)) {
+        if (['CANCELLED', 'FILLED', 'REJECTED', 'PENDING_CANCEL'].includes(order.status)) {
           return { statusCode: 400, headers: HEADERS, body: JSON.stringify({
             error: 'ORDER_NOT_CANCELLABLE',
             message: `주문 상태가 ${order.status}입니다`
           })};
         }
+
+        // PENDING_CANCEL 즉시 마킹 — 고스트 주문 방지
+        // Engine이 CANCEL 처리하기 전에 DynamoDB에 중간 상태를 기록하여
+        // loadActiveOrders()에서 이 주문이 재로딩되지 않도록 함
+        await ddb.send(new UpdateCommand({
+          TableName: ORDERS_TABLE,
+          Key: { user_id, order_id },
+          UpdateExpression: 'SET #s = :pending_cancel, updated_at = :now',
+          ExpressionAttributeNames: { '#s': 'status' },
+          ExpressionAttributeValues: {
+            ':pending_cancel': 'PENDING_CANCEL',
+            ':now': new Date().toISOString()
+          }
+        }));
 
         await kinesis.send(new PutRecordCommand({
           StreamName: KINESIS_STREAM,
