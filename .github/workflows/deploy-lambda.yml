@@ -129,6 +129,11 @@ jobs:
             path: lambda/Supernoba-push-sender
             has_build: false
 
+          # === User Preferences (1) ===
+          - name: Supernoba-user-preferences
+            path: lambda/Supernoba-user-preferences
+            has_build: false
+
           # === User Account (1) ===
           - name: Supernoba-delete-account
             path: lambda/Supernoba-delete-account
@@ -185,7 +190,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
