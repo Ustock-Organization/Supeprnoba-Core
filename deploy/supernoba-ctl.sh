@@ -23,26 +23,12 @@
 
 set -e
 
-# 색상 정의
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# 공통 라이브러리 로드 (색상, 로깅 함수, HOST_SERVICES, SERVICE_NAMES)
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
 # 현재 호스트
 HOSTNAME=$(hostname)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 호스트별 서비스 정의
-# NOTE: processor는 Supernoba-back 저장소에서 관리됩니다.
-declare -A HOST_SERVICES
-HOST_SERVICES["stock-bastion"]="engine mm"
-HOST_SERVICES["stock-streamer"]="streamer"
-HOST_SERVICES["stock-aggregator"]="aggregator"
-# 현재 단일 EC2 환경 (모든 서비스가 하나의 인스턴스에서 실행)
-HOST_SERVICES["ip-172-31-10-211"]="engine streamer mm aggregator"
 
 # Private IP 기반 서비스 매핑 (호스트명 인식 실패 시 fallback)
 declare -A IP_SERVICES
@@ -50,13 +36,6 @@ IP_SERVICES["172.31.47.97"]="engine mm"        # stock-bastion
 IP_SERVICES["172.31.57.219"]="streamer"        # stock-streamer
 IP_SERVICES["172.31.35.62"]="aggregator"       # stock-aggregator
 IP_SERVICES["172.31.10.211"]="engine streamer mm aggregator"  # 현재 단일 EC2
-
-# 서비스명 매핑 (short -> systemd name)
-declare -A SERVICE_NAMES
-SERVICE_NAMES["engine"]="supernoba-engine"
-SERVICE_NAMES["streamer"]="supernoba-streamer"
-SERVICE_NAMES["mm"]="supernoba-mm"
-SERVICE_NAMES["aggregator"]="supernoba-aggregator"
 
 # 로그 경로
 declare -A LOG_PATHS
@@ -80,11 +59,6 @@ SERVICE_DESC["mm"]="Market Maker Service (Node.js)"
 SERVICE_DESC["aggregator"]="Candle Aggregator (C++)"
 
 #===== 유틸리티 함수 =====
-
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # 현재 호스트의 로컬 서비스 목록
 get_local_services() {

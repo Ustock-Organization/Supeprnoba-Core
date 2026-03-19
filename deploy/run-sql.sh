@@ -11,17 +11,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SQL_DIR="$SCRIPT_DIR/sql"
 
-# 색상 정의
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# 공통 라이브러리 로드 (색상, 로깅 함수)
+source "$SCRIPT_DIR/lib/common.sh"
 
 # RDS 연결 정보 (Secrets Manager에서 가져옴)
 get_rds_credentials() {

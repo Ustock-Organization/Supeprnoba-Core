@@ -12,6 +12,7 @@ WorkingDirectory=/home/ec2-user/Supernoba-Core_Old/streamer/node
 
 # 환경변수
 EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/common.env
+EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/localhost-override.env
 EnvironmentFile=/home/ec2-user/Supernoba-Core_Old/deploy/env/streamer.env
 
 # Node.js 메모리 제한
