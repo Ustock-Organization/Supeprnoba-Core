@@ -27,7 +27,7 @@ env:
   AWS_REGION: ap-northeast-2
   EC2_INSTANCE_ID: i-025aa470d3d8a127e
   S3_DEPLOY_BUCKET: supernoba-deploy-artifacts
-  DEPLOY_USER: ubuntu
+  DEPLOY_USER: ec2-user
 
 jobs:
   deploy:
