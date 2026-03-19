@@ -264,7 +264,7 @@ jobs:
         run: |
           if [ -d dist ]; then
             cd dist
-            zip -r ../function.zip index.js
+            zip -r ../function.zip *.mjs *.js 2>/dev/null || true
             cd ..
           elif [ -f package.json ] && [ -d node_modules ]; then
             zip -r function.zip index.mjs node_modules/ package.json -x "*.git*" "*.test.*" "*.spec.*"

@@ -7,11 +7,10 @@ esbuild.build({
   bundle: true,
   minify: true,
   platform: 'node',
-  target: 'node20',
+  target: 'node22',
   format: 'esm',
   outfile: 'dist/index.mjs',
-  // createRequire 배너: ESM 번들 내 CJS 의존성의 require() 호출을 지원
-  // AWS SDK v3 등 CJS 모듈이 require('buffer') 등을 사용하므로 필수
+  external: ['@aws-sdk/*'],
   banner: {
     js: 'import{createRequire as ___cr}from"module";const require=___cr(import.meta.url);',
   },
