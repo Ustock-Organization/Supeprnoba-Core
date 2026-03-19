@@ -53,8 +53,9 @@ export default class SineStrategy extends BaseStrategy {
 
     this.currentPrice = price;
 
-    // Operating Cache에 가격/주문 수 저장 (Streamer → Admin 전달용)
+    // Operating Cache에 가격/주문 수/생존 시각 저장 (Streamer → Admin 전달용)
     await this.operatingCache.set(`mm:price:${this.symbol}`, price.toString());
     await this.operatingCache.set(`mm:orderCount:${this.symbol}`, this._orderCount.toString());
+    await this.operatingCache.set(`mm:lastTick:${this.symbol}`, Date.now().toString());
   }
 }

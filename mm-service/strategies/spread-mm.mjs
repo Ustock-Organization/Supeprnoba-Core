@@ -144,6 +144,10 @@ export default class SpreadStrategy extends BaseStrategy {
       `mm:orderCount:${this.symbol}`,
       this._orderCount.toString()
     );
+    await this.operatingCache.set(
+      `mm:lastTick:${this.symbol}`,
+      Date.now().toString()
+    );
   }
 
   /**

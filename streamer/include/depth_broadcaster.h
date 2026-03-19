@@ -16,11 +16,6 @@ public:
     void start(int interval_ms = 100);
     void stop();
     
-    // 심볼 구독 등록
-    void subscribe(const std::string& connection_id, const std::string& symbol);
-    void unsubscribe(const std::string& connection_id, const std::string& symbol);
-    void unsubscribeAll(const std::string& connection_id);
-
 private:
     void pollingLoop();
     

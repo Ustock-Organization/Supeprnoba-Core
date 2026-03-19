@@ -157,6 +157,10 @@ export default class DepthStrategy extends SpreadStrategy {
       `mm:orderCount:${this.symbol}`,
       this._orderCount.toString()
     );
+    await this.operatingCache.set(
+      `mm:lastTick:${this.symbol}`,
+      Date.now().toString()
+    );
   }
 
   /** @override — include depth-specific info */

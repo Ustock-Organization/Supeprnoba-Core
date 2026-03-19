@@ -428,28 +428,44 @@ function setupPubSubHandlers() {
           return;
         }
 
-        // 각 심볼의 실제 체결가(ohlc.c) 조회
+        // 각 심볼의 실제 체결가(ohlc.c) + phase_time 조회
         const symbolsWithPrice = await Promise.all(
           (rawData.symbols || []).map(async (s) => {
-            const ohlcJson = await depthClient.get(`ohlc:${s.symbol}`);
+            const [ohlcJson, startedAtStr] = await Promise.all([
+              depthClient.get(`ohlc:${s.symbol}`),
+              operatingClient.get(`mm:started_at:${s.symbol}`),
+            ]);
             const ohlc = ohlcJson ? JSON.parse(ohlcJson) : null;
+
+            // phase_time 계산 (getMMData와 동일 로직)
+            const period = s.config?.period || 600;
+            let phaseTime = null;
+            if (s.isRunning && startedAtStr && period > 0) {
+              const elapsed = (Date.now() - parseInt(startedAtStr)) / 1000;
+              phaseTime = elapsed % period;
+            }
 
             return {
               symbol: s.symbol,
               base_price: s.basePrice,
-              current_price: ohlc?.c || s.price,  // 실제 체결가 우선
-              mm_target_price: s.price,  // MM 목표가 (참고용)
+              current_price: ohlc?.c || s.price,
+              mm_target_price: s.price,
               order_count: s.orders,
               is_running: s.isRunning,
-              weekly_amplitude: s.config?.weeklyAmplitude || 0.15,
-              daily_amplitude: s.config?.dailyAmplitude || 0.08,
-              hourly_amplitude: s.config?.hourlyAmplitude || 0.04,
-              minute_amplitude: s.config?.minuteAmplitude || 0.02,
-              noise_amplitude: s.config?.noiseAmplitude || 0.005,
+              // v10 fields
+              strategy: s.strategy || s.config?.strategy || 'legacy_sine',
+              period: period,
+              amplitude: s.config?.amplitude || 0.1,
               tick_interval: s.config?.tickInterval || 1000,
+              trade_interval: s.config?.tradeInterval || 3,
+              trade_quantity: s.config?.tradeQuantity || 50,
+              spread: s.config?.spread || 0.005,
+              // OHLC
               volume: ohlc?.v || 0,
               high: ohlc?.h || null,
               low: ohlc?.l || null,
+              // phase_time
+              phase_time: phaseTime,
             };
           })
         );
@@ -465,7 +481,7 @@ function setupPubSubHandlers() {
 
         // 데이터가 변경되었을 때만 브로드캐스트 (깜빡임 방지)
         const dataHash = JSON.stringify(symbolsWithPrice.map(s =>
-          `${s.symbol}:${s.is_running}:${s.base_price}:${Math.round(s.current_price || 0)}`
+          `${s.symbol}:${s.is_running}:${s.base_price}:${Math.round(s.current_price || 0)}:${s.order_count}`
         ));
         if (dataHash !== lastMMDataHash) {
           console.log('[MM Hash] Changed:', dataHash.substring(0, 100));
