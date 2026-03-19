@@ -8,6 +8,7 @@ on:
       - 'aggregator/**'
       - 'streamer/**'
       - 'mm-service/**'
+      - 'deploy/**'
       - '.github/workflows/deploy-engine.yml'
   workflow_dispatch:
     inputs:
@@ -22,6 +23,12 @@ on:
         type: boolean
         default: false
 
+env:
+  AWS_REGION: ap-northeast-2
+  EC2_INSTANCE_ID: i-025aa470d3d8a127e
+  S3_DEPLOY_BUCKET: supernoba-deploy-artifacts
+  DEPLOY_USER: ubuntu
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -33,13 +40,12 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Configure SSH
-        uses: webfactory/ssh-agent@v0.7.0
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
-
-      - name: Add EC2 host to known_hosts
-        run: ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Determine services to deploy
         id: services
@@ -57,140 +63,190 @@ jobs:
           echo "list=$SERVICES" >> $GITHUB_OUTPUT
           echo "Services to deploy: $SERVICES"
 
-      - name: Upload source to EC2
+      - name: Package and upload to S3
         run: |
-          # SCP 기반 배포 (git pull 불가 환경)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          ARTIFACT="supernoba-core-${TIMESTAMP}.tar.gz"
+
+          # 필요한 디렉토리만 패키징
+          DIRS=""
           IFS=',' read -ra SVCS <<< "${{ steps.services.outputs.list }}"
           for svc in "${SVCS[@]}"; do
             case "$svc" in
-              engine)
-                echo "Uploading wrapper/ to EC2..."
-                rsync -avz --delete \
-                  --exclude='build/' --exclude='.git/' \
-                  wrapper/ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/Supernoba-Core_Old/wrapper/
-                ;;
-              streamer)
-                echo "Uploading streamer/ to EC2..."
-                rsync -avz --delete \
-                  --exclude='node_modules/' --exclude='.git/' \
-                  streamer/ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/Supernoba-Core_Old/streamer/
-                ;;
-              mm)
-                echo "Uploading mm-service/ to EC2..."
-                rsync -avz --delete \
-                  --exclude='node_modules/' --exclude='.git/' \
-                  mm-service/ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/Supernoba-Core_Old/mm-service/
-                ;;
-              aggregator)
-                echo "Uploading aggregator/ to EC2..."
-                rsync -avz --delete \
-                  --exclude='build/' --exclude='.git/' \
-                  aggregator/ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/Supernoba-Core_Old/aggregator/
-                ;;
+              engine)     DIRS="$DIRS wrapper/" ;;
+              streamer)   DIRS="$DIRS streamer/" ;;
+              mm)         DIRS="$DIRS mm-service/" ;;
+              aggregator) DIRS="$DIRS aggregator/" ;;
             esac
           done
 
-      - name: Build and restart services
+          # deploy/ 항상 포함 (supernoba-ctl.sh 등)
+          tar czf "$ARTIFACT" \
+            --exclude='build' --exclude='node_modules' --exclude='.git' --exclude='.github' \
+            $DIRS deploy/
+
+          aws s3 cp "$ARTIFACT" "s3://${{ env.S3_DEPLOY_BUCKET }}/core/$ARTIFACT"
+          echo "ARTIFACT=$ARTIFACT" >> $GITHUB_ENV
+          echo "Uploaded $ARTIFACT ($DIRS) to S3"
+
+      - name: Deploy via SSM
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          set -e
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 600 \
+            --parameters commands='[
+              "set -e",
+              "DEPLOY_HOME=/home/${{ env.DEPLOY_USER }}",
+              "CTL=\"$DEPLOY_HOME/Supernoba-Core_Old/deploy/supernoba-ctl.sh\"",
+              "SERVICES=\"${{ steps.services.outputs.list }}\"",
+              "BUILD_ONLY=\"${{ github.event.inputs.build_only }}\"",
+              "",
+              "echo \"========================================\"",
+              "echo \"Downloading source from S3...\"",
+              "echo \"========================================\"",
+              "aws s3 cp s3://${{ env.S3_DEPLOY_BUCKET }}/core/${{ env.ARTIFACT }} /tmp/${{ env.ARTIFACT }} --region ${{ env.AWS_REGION }}",
+              "",
+              "# Extract over existing directory",
+              "tar xzf /tmp/${{ env.ARTIFACT }} -C $DEPLOY_HOME/Supernoba-Core_Old/",
+              "rm -f /tmp/${{ env.ARTIFACT }}",
+              "chown -R ${{ env.DEPLOY_USER }}:${{ env.DEPLOY_USER }} $DEPLOY_HOME/Supernoba-Core_Old/",
+              "",
+              "IFS=\",\" read -ra SVCS <<< \"$SERVICES\"",
+              "for svc in \"${SVCS[@]}\"; do",
+              "  echo \"\"",
+              "  echo \"==========================================\"",
+              "  echo \"Processing: $svc\"",
+              "  echo \"==========================================\"",
+              "",
+              "  case \"$svc\" in",
+              "    engine)",
+              "      cd $DEPLOY_HOME/Supernoba-Core_Old/wrapper",
+              "      if [ ! -d build ]; then",
+              "        sudo -u ${{ env.DEPLOY_USER }} cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$DEPLOY_HOME/vcpkg/scripts/buildsystems/vcpkg.cmake",
+              "      fi",
+              "      sudo -u ${{ env.DEPLOY_USER }} cmake --build build -j$(nproc)",
+              "      ;;",
+              "    aggregator)",
+              "      cd $DEPLOY_HOME/Supernoba-Core_Old/aggregator",
+              "      if [ ! -d build ]; then",
+              "        sudo -u ${{ env.DEPLOY_USER }} cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$DEPLOY_HOME/vcpkg/scripts/buildsystems/vcpkg.cmake",
+              "      fi",
+              "      sudo -u ${{ env.DEPLOY_USER }} cmake --build build -j$(nproc)",
+              "      ;;",
+              "    streamer)",
+              "      cd $DEPLOY_HOME/Supernoba-Core_Old/streamer/node",
+              "      sudo -u ${{ env.DEPLOY_USER }} npm install --omit=dev",
+              "      ;;",
+              "    mm)",
+              "      cd $DEPLOY_HOME/Supernoba-Core_Old/mm-service",
+              "      sudo -u ${{ env.DEPLOY_USER }} npm install --omit=dev",
+              "      ;;",
+              "  esac",
+              "  echo \"Build complete for $svc\"",
+              "",
+              "  if [ \"$BUILD_ONLY\" != \"true\" ]; then",
+              "    echo \"Restarting $svc via systemd...\"",
+              "    if [ \"$svc\" == \"engine\" ] && [ -x \"$CTL\" ]; then",
+              "      \"$CTL\" restart engine",
+              "    else",
+              "      systemctl restart \"supernoba-$svc\"",
+              "    fi",
+              "    sleep 3",
+              "  fi",
+              "done",
+              "",
+              "echo \"\"",
+              "echo \"==========================================\"",
+              "echo \"Deployment complete!\"",
+              "echo \"========================================\""
+            ]' \
+            --query 'Command.CommandId' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
-          CTL="$HOME/Supernoba-Core_Old/deploy/supernoba-ctl.sh"
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_ENV
 
-          # supernoba-ctl.sh 존재 확인
-          if [ ! -x "$CTL" ]; then
-            echo "supernoba-ctl.sh not found at $CTL"
-            exit 1
-          fi
+          # Wait for command completion (max 10 min)
+          echo "Waiting for command to complete..."
+          for i in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id ${{ env.EC2_INSTANCE_ID }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
 
-          SERVICES="${{ steps.services.outputs.list }}"
-          BUILD_ONLY="${{ github.event.inputs.build_only }}"
-
-          IFS=',' read -ra SVCS <<< "$SERVICES"
-          for svc in "${SVCS[@]}"; do
-            echo ""
-            echo "=========================================="
-            echo "Processing: $svc"
-            echo "=========================================="
-
-            # 빌드 (build_service 함수 활용)
-            echo "Building $svc..."
-            # build 명령은 supernoba-ctl.sh에는 없으므로 직접 빌드
-            case "$svc" in
-              engine)
-                cd ~/Supernoba-Core_Old/wrapper
-                if [ ! -d build ]; then
-                  cmake -B build -S . \
-                    -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
-                fi
-                cmake --build build -j$(nproc)
-                ;;
-              aggregator)
-                cd ~/Supernoba-Core_Old/aggregator
-                if [ ! -d build ]; then
-                  cmake -B build -S . \
-                    -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
-                fi
-                cmake --build build -j$(nproc)
-                ;;
-              streamer)
-                cd ~/Supernoba-Core_Old/streamer/node
-                npm install --omit=dev
-                ;;
-              mm)
-                cd ~/Supernoba-Core_Old/mm-service
-                npm install --omit=dev
-                ;;
-            esac
-            echo "Build complete for $svc"
-
-            # 재시작 (build_only가 아닌 경우)
-            if [ "$BUILD_ONLY" != "true" ]; then
-              echo "Restarting $svc via systemd..."
-              # 엔진 재시작 시 supernoba-ctl.sh가 MM pause/resume 처리
-              if [ "$svc" == "engine" ]; then
-                "$CTL" restart engine
-              else
-                sudo systemctl restart "supernoba-$svc"
-              fi
-              sleep 3
+            if [ "$STATUS" == "Success" ]; then
+              echo "Command completed successfully"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id ${{ env.EC2_INSTANCE_ID }} \
+                --region ${{ env.AWS_REGION }} \
+                --query 'StandardOutputContent' \
+                --output text
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ] || [ "$STATUS" == "TimedOut" ]; then
+              echo "Command failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id ${{ env.EC2_INSTANCE_ID }} \
+                --region ${{ env.AWS_REGION }} \
+                --query '[StandardOutputContent, StandardErrorContent]' \
+                --output text
+              exit 1
             fi
-          done
 
-          echo ""
-          echo "=========================================="
-          echo "Deployment complete!"
-          echo "=========================================="
-          ENDSSH
+            sleep 5
+          done
 
       - name: Verify services
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          echo "=== Service Status ==="
-          for svc in supernoba-engine supernoba-streamer supernoba-mm supernoba-aggregator; do
-            STATUS=$(systemctl is-active $svc 2>/dev/null || echo "inactive")
-            PID=$(systemctl show $svc --property=MainPID --value 2>/dev/null || echo "0")
-            echo "$svc: $STATUS (PID: $PID)"
-          done
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "echo \"=== Service Status ===\"",
+              "for svc in supernoba-engine supernoba-streamer supernoba-mm supernoba-aggregator supernoba-processor; do",
+              "  STATUS=$(systemctl is-active $svc 2>/dev/null || echo inactive)",
+              "  PID=$(systemctl show $svc --property=MainPID --value 2>/dev/null || echo 0)",
+              "  echo \"$svc: $STATUS (PID: $PID)\"",
+              "done",
+              "",
+              "echo \"\"",
+              "echo \"=== Valkey 4-Cache PING ===\"",
+              "for port in 6379 6380 6381 6382; do",
+              "  PONG=$(redis-cli -h 127.0.0.1 -p $port PING 2>/dev/null || echo FAIL)",
+              "  echo \"Port $port: $PONG\"",
+              "done",
+              "",
+              "echo \"\"",
+              "echo \"=== Recent Logs ===\"",
+              "for logfile in /var/log/supernoba/engine/engine.log /var/log/supernoba/streamer/streamer.log /var/log/supernoba/mm-service/mm-service.log /var/log/supernoba/aggregator/aggregator.log; do",
+              "  if [ -f \"$logfile\" ]; then",
+              "    echo \"--- $(basename $(dirname $logfile)) (last 3 lines) ---\"",
+              "    tail -3 \"$logfile\"",
+              "  fi",
+              "done"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
-          echo ""
-          echo "=== Valkey 4-Cache PING ==="
-          for port in 6379 6380 6381 6382; do
-            PONG=$(redis-cli -h 127.0.0.1 -p $port PING 2>/dev/null || echo "FAIL")
-            echo "Port $port: $PONG"
-          done
+          sleep 10
+          RESULT=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id ${{ env.EC2_INSTANCE_ID }} \
+            --region ${{ env.AWS_REGION }} \
+            --query '[Status, StandardOutputContent]' \
+            --output text)
+          echo "$RESULT"
 
-          echo ""
-          echo "=== Recent Logs ==="
-          for logfile in /var/log/supernoba/engine/engine.log /var/log/supernoba/streamer/streamer.log /var/log/supernoba/mm-service/mm-service.log /var/log/supernoba/aggregator/aggregator.log; do
-            if [ -f "$logfile" ]; then
-              echo "--- $(basename $(dirname $logfile)) (last 3 lines) ---"
-              tail -3 "$logfile"
-            fi
-          done
-          ENDSSH
+      - name: Cleanup S3 artifact
+        if: always()
+        run: |
+          aws s3 rm "s3://${{ env.S3_DEPLOY_BUCKET }}/core/${{ env.ARTIFACT }}" 2>/dev/null || true
 
       - name: Send Slack notification
         if: always()
@@ -217,7 +273,7 @@ jobs:
                     {\"title\": \"브랜치\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
                     {\"title\": \"커밋\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$COMMIT_SHORT>\", \"short\": true}
                   ],
-                  \"footer\": \"GitHub Actions\",
+                  \"footer\": \"GitHub Actions (SSM)\",
                   \"ts\": $(date +%s)
                 }]
               }" \
