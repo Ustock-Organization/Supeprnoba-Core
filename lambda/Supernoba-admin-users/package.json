@@ -5,8 +5,7 @@
   "type": "module",
   "main": "index.mjs",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.400.0",
-    "@aws-sdk/lib-dynamodb": "^3.400.0",
+    "@aws-sdk/client-sfn": "^3.624.0",
     "ioredis": "^5.3.2"
   }
 }

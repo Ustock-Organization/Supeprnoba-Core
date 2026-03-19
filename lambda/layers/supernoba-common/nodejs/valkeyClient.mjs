@@ -134,20 +134,6 @@ export function getValkeyClient(options = {}) {
 }
 
 /**
- * 특정 타입의 클라이언트 연결 종료
- *
- * @param {string} type - 캐시 타입
- */
-export async function closeValkeyClient(type = 'default') {
-  for (const [key, client] of instances) {
-    if (key.startsWith(type)) {
-      await client.quit().catch(() => {});
-      instances.delete(key);
-    }
-  }
-}
-
-/**
  * 모든 클라이언트 연결 종료
  */
 export async function closeAllValkeyClients() {
@@ -180,4 +166,4 @@ export function createLegacyClient(legacyOptions) {
 }
 
 // 기본 export
-export default { getValkeyClient, closeValkeyClient, closeAllValkeyClients, createLegacyClient };
+export default { getValkeyClient, closeAllValkeyClients, createLegacyClient };

@@ -145,9 +145,6 @@ const detectPlatform = (url) => {
     if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'YOUTUBE';
     if (lower.includes('twitter.com') || lower.includes('x.com')) return 'X';
     if (lower.includes('instagram.com')) return 'INSTAGRAM';
-    if (lower.includes('tiktok.com')) return 'TIKTOK';
-    if (lower.includes('chzzk')) return 'CHZZK';
-    if (lower.includes('afreecatv')) return 'AFREECATV';
     return 'ETC';
 };
 

@@ -40,16 +40,6 @@ export const CORS = Object.freeze({
     'Content-Type': 'application/json',
   }),
 
-  /**
-   * Type WITH_API_KEY: API Key 포함 (레거시 지원)
-   * Methods: GET, OPTIONS, POST
-   */
-  WITH_API_KEY: Object.freeze({
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS, POST',
-    'Content-Type': 'application/json',
-  }),
 });
 
 /**
@@ -153,40 +143,5 @@ export function handleOptions(event, headers = CORS.STANDARD) {
   return null;
 }
 
-/**
- * HTTP 메서드 추출
- *
- * @param {Object} event - Lambda 이벤트
- * @returns {string} HTTP 메서드 (대문자)
- */
-export function getHttpMethod(event) {
-  return (event.httpMethod || event.requestContext?.http?.method || 'GET').toUpperCase();
-}
-
-/**
- * 에러 코드별 응답 생성
- */
-export const ErrorCodes = Object.freeze({
-  UNAUTHORIZED: { code: 401, error: 'UNAUTHORIZED', message: '인증이 필요합니다' },
-  FORBIDDEN: { code: 403, error: 'FORBIDDEN', message: '권한이 없습니다' },
-  NOT_FOUND: { code: 404, error: 'NOT_FOUND', message: '리소스를 찾을 수 없습니다' },
-  BAD_REQUEST: { code: 400, error: 'BAD_REQUEST', message: '잘못된 요청입니다' },
-  VALIDATION_ERROR: { code: 400, error: 'VALIDATION_ERROR', message: '입력값이 유효하지 않습니다' },
-  CONFLICT: { code: 409, error: 'CONFLICT', message: '리소스가 이미 존재합니다' },
-  INTERNAL_ERROR: { code: 500, error: 'INTERNAL_ERROR', message: '서버 오류가 발생했습니다' },
-});
-
-/**
- * 에러 코드로 응답 생성
- *
- * @param {string} errorKey - ErrorCodes의 키
- * @param {string} [customMessage] - 커스텀 메시지 (선택)
- * @param {Object} [headers=CORS.STANDARD] - CORS 헤더
- */
-export function errorByCode(errorKey, customMessage, headers = CORS.STANDARD) {
-  const errDef = ErrorCodes[errorKey] || ErrorCodes.INTERNAL_ERROR;
-  return response.error(errDef.code, customMessage || errDef.message, headers);
-}
-
 // 기본 export
-export default { CORS, response, handleOptions, getHttpMethod, ErrorCodes, errorByCode };
+export default { CORS, response, handleOptions };

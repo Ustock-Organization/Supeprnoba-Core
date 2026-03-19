@@ -1,8 +1,7 @@
 {
-  "name": "supernoba-symbol-admin",
+  "name": "supernoba-delete-account",
   "version": "1.0.0",
   "type": "module",
-  "description": "Symbol domain management Lambda",
   "main": "index.mjs",
   "dependencies": {
     "@aws-sdk/client-sfn": "^3.624.0"

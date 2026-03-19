@@ -137,6 +137,10 @@ async function isActiveSymbol(symbol, userId = null) {
     if (!cached.isActive) {
       return { valid: false, error: 'SYMBOL_NOT_ACTIVE', message: `거래할 수 없는 심볼입니다 (${normalized})` };
     }
+    // PENDING IPO 캐시된 경우
+    if (cached.pendingIpo) {
+      return { valid: true, data: cached.data, pendingIpo: true };
+    }
     // 캐시된 데이터가 테스트 종목인 경우 권한 확인
     if (cached.data?.is_test === true && userId) {
       const canTrade = await isAuthorizedTester(userId);
@@ -157,6 +161,12 @@ async function isActiveSymbol(symbol, userId = null) {
     if (!Item) {
       symbolCache.set(normalized, { isActive: false, expiry: Date.now() + SYMBOL_CACHE_TTL });
       return { valid: false, error: 'SYMBOL_NOT_FOUND', message: `존재하지 않는 심볼입니다 (${normalized})` };
+    }
+
+    // PENDING 상태: IPO 매수만 허용
+    if (Item.status === 'PENDING') {
+      symbolCache.set(normalized, { isActive: true, data: Item, pendingIpo: true, expiry: Date.now() + SYMBOL_CACHE_TTL });
+      return { valid: true, data: Item, pendingIpo: true };
     }
 
     if (Item.status !== 'ACTIVE') {
@@ -490,6 +500,14 @@ export const handler = async (event) => {
         // 테스트 종목 접근 제한은 403, 기타 심볼 오류는 400
         const statusCode = symbolCheck.error === 'TEST_SYMBOL_RESTRICTED' ? 403 : 400;
         return { statusCode, headers: HEADERS, body: JSON.stringify(symbolCheck) };
+      }
+
+      // IPO PENDING 종목: 매도 차단 (관리자 주문 바이패스)
+      if (symbolCheck.pendingIpo && !isAdminOrder && side.toUpperCase() === 'SELL') {
+        return { statusCode: 400, headers: HEADERS, body: JSON.stringify({
+          error: 'IPO_SELL_BLOCKED',
+          message: 'IPO 진행 중에는 매도할 수 없습니다'
+        })};
       }
 
       const orderId = crypto.randomUUID();

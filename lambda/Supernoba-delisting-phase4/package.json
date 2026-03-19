@@ -4,10 +4,5 @@
   "type": "module",
   "description": "Delisting Phase 4: Final verification (Valkey, DynamoDB, RDS checks)",
   "main": "index.mjs",
-  "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.699.0",
-    "@aws-sdk/client-secrets-manager": "^3.699.0",
-    "@aws-sdk/lib-dynamodb": "^3.699.0",
-    "pg": "^8.13.1"
-  }
+  "dependencies": {}
 }

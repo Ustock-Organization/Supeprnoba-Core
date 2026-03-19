@@ -415,6 +415,54 @@ export async function verifyAdmin(event) {
 }
 
 /**
+ * Cognito JWT payload에서 실제 플랫폼 user_id를 해석
+ *
+ * X/Google/Apple 등 외부 프로바이더 로그인 시 Cognito sub(UUID)를
+ * 플랫폼 user_id(x_*, google_*, apple_*)로 변환합니다.
+ *
+ * @param {AuthResult} authResult - verifyAuth() 반환값
+ * @returns {string} 해석된 user_id
+ */
+export function resolveUserId(authResult) {
+  let userId = authResult.userId;
+
+  // 1. X 로그인: custom:x_user_id 클레임
+  const xUserId = authResult.payload?.['custom:x_user_id'];
+  if (xUserId) {
+    return `x_${xUserId}`;
+  }
+
+  // 2. X 로그인: email 패턴 fallback
+  if (authResult.email?.includes('@x.supernoba.com')) {
+    return `x_${authResult.email.split('@')[0]}`;
+  }
+
+  // 3. Google/Apple 로그인: cognito:username 패턴
+  const cognitoUsername = authResult.payload?.['cognito:username'] || '';
+  if (cognitoUsername.startsWith('Google_')) {
+    return `google_${cognitoUsername.replace('Google_', '')}`;
+  }
+  if (cognitoUsername.startsWith('SignInWithApple_')) {
+    return `apple_${cognitoUsername.replace('SignInWithApple_', '')}`;
+  }
+
+  // 4. Google/Apple: identities 배열에서 추출
+  try {
+    const identities = typeof authResult.payload?.identities === 'string'
+      ? JSON.parse(authResult.payload.identities)
+      : authResult.payload?.identities;
+    if (Array.isArray(identities)) {
+      const googleId = identities.find(id => id.providerName === 'Google');
+      if (googleId) return `google_${googleId.userId}`;
+      const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+      if (appleId) return `apple_${appleId.userId}`;
+    }
+  } catch { /* ignore */ }
+
+  return userId;
+}
+
+/**
  * 사용자 본인 확인 (자신의 리소스에만 접근 가능)
  *
  * @param {Object} event - Lambda 이벤트 객체
@@ -433,60 +481,8 @@ export async function verifySelf(event, resourceUserId) {
     return { ...authResult, userId: resourceUserId };
   }
 
-  // Apple/Google 사용자 디버깅: JWT 클레임 로깅
-  if (resourceUserId?.startsWith('apple_') || resourceUserId?.startsWith('google_')) {
-    console.log('[verifySelf] Provider ID resolution attempt:', JSON.stringify({
-      resolvedUserId: authResult.userId,
-      resourceUserId,
-      tokenUse: authResult.payload?.token_use,
-      cognitoUsername: authResult.payload?.['cognito:username'],
-      identitiesType: typeof authResult.payload?.identities,
-      identitiesValue: authResult.payload?.identities,
-      email: authResult.email,
-    }));
-  }
-
-  // X 로그인 사용자: Cognito sub(UUID)와 요청의 x_ user_id 매핑
-  let resolvedUserId = authResult.userId;
-  const xUserId = authResult.payload?.['custom:x_user_id'];
-  if (xUserId) {
-    resolvedUserId = `x_${xUserId}`;
-  } else if (authResult.email?.includes('@x.supernoba.com')) {
-    const xId = authResult.email.split('@')[0];
-    resolvedUserId = `x_${xId}`;
-  }
-
-  // Google/Apple 로그인 사용자: identities 클레임에서 sub 추출
-  if (resolvedUserId === authResult.userId && (resourceUserId?.startsWith('google_') || resourceUserId?.startsWith('apple_'))) {
-    let googleSub = null;
-    let appleSub = null;
-    try {
-      const identities = typeof authResult.payload?.identities === 'string'
-        ? JSON.parse(authResult.payload.identities)
-        : authResult.payload?.identities;
-      if (Array.isArray(identities)) {
-        const googleId = identities.find(id => id.providerName === 'Google');
-        if (googleId) googleSub = googleId.userId;
-        const appleId = identities.find(id => id.providerName === 'SignInWithApple');
-        if (appleId) appleSub = appleId.userId;
-      }
-    } catch { /* ignore parse errors */ }
-
-    // Fallback: cognito:username 패턴
-    const cognitoUsername = authResult.payload?.['cognito:username'] || '';
-    if (!googleSub && cognitoUsername.startsWith('Google_')) {
-      googleSub = cognitoUsername.replace('Google_', '');
-    }
-    if (!appleSub && cognitoUsername.startsWith('SignInWithApple_')) {
-      appleSub = cognitoUsername.replace('SignInWithApple_', '');
-    }
-
-    if (appleSub && resourceUserId?.startsWith('apple_')) {
-      resolvedUserId = `apple_${appleSub}`;
-    } else if (googleSub && resourceUserId?.startsWith('google_')) {
-      resolvedUserId = `google_${googleSub}`;
-    }
-  }
+  // resolveUserId()로 Cognito sub → 플랫폼 user_id 변환
+  const resolvedUserId = resolveUserId(authResult);
 
   if (resolvedUserId !== resourceUserId) {
     console.warn('[verifySelf] User ID mismatch:', { resolved: resolvedUserId, resource: resourceUserId, original: authResult.userId });
@@ -531,4 +527,4 @@ export function authErrorResponse(authResult, headers = {}) {
   };
 }
 
-export default { verifyAuth, verifyAdmin, verifySelf, authErrorResponse };
+export default { verifyAuth, verifyAdmin, verifySelf, authErrorResponse, resolveUserId };

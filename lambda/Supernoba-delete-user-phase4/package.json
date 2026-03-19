@@ -5,6 +5,5 @@
   "description": "Phase 4: Anonymize RDS trade_history for deleted users",
   "main": "index.mjs",
   "dependencies": {
-    "pg": "^8.11.3"
   }
 }

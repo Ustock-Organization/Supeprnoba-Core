@@ -7,11 +7,6 @@
   "scripts": {
     "deploy": "aws lambda update-function-code --function-name Supernoba-order-router --zip-file fileb://function.zip"
   },
-  "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.0.0",
-    "@aws-sdk/client-kinesis": "^3.0.0",
-    "@aws-sdk/lib-dynamodb": "^3.0.0"
-  },
   "devDependencies": {
     "esbuild": "^0.19.12"
   }

@@ -40,6 +40,7 @@ const IPO_SYSTEM_ACCOUNT = 'ipo-system';
 const DELIST_JOBS_TABLE = process.env.DELIST_JOBS_TABLE || 'supernoba-delist-jobs';
 const STATE_MACHINE_ARN = process.env.DELISTING_STATE_MACHINE_ARN || 'arn:aws:states:ap-northeast-2:264520158196:stateMachine:supernoba-delisting';
 const IPO_ORDERS_TABLE = 'supernoba-ipo-orders';
+const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 
 // Layer를 통한 클라이언트 초기화 (4-Cache: operating + depth + candle + backup)
 const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
@@ -729,14 +730,16 @@ export const handler = async (event) => {
 
         let detectedPlatform = providedPlatform || 'ETC';
         let creatorUrl = '';
+        let reqData = null;
 
         if (requestId) {
           try {
             // Primary Key is 'request_id', not 'id'
-            const { Item: reqData } = await dynamodb.send(new GetCommand({
+            const { Item: fetchedReqData } = await dynamodb.send(new GetCommand({
               TableName: CREATOR_REQUESTS_TABLE,
               Key: { request_id: requestId }
             }));
+            reqData = fetchedReqData;
             if (!reqData) {
               console.error(`[APPROVE] Request not found: ${requestId}`);
               return err(404, 'Request not found');
@@ -768,7 +771,7 @@ export const handler = async (event) => {
           name: name || symbol.toUpperCase(),
           base_asset: symbol.toUpperCase(),
           quote_asset: 'BOLT',
-          status: 'ACTIVE',
+          status: 'PENDING',  // IPO 단계: PENDING → activate 후 ACTIVE
           listingDate: now,
           listingPrice: listingPrice || 0,
           totalShares: totalShares || 0,
@@ -794,14 +797,55 @@ export const handler = async (event) => {
         };
 
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
+        // PENDING이지만 종목 목록에 노출 + Streamer가 실시간 폴링하도록 추가
         await operatingCache.sadd('active:symbols', symbol.toUpperCase());
+        await operatingCache.sadd('subscribed:symbols', symbol.toUpperCase());
 
-        // 랭킹 Sorted Set 초기 점수 (신규 종목 즉시 노출)
+        // IPO 알림 레코드 생성 (요청자에게 포인트 보상 알림)
+        if (requestId && reqData?.user_id && reqData.user_id !== 'anonymous') {
+          try {
+            // IPO 보상 설정 조회
+            const { Item: settingsItem } = await dynamodb.send(new GetCommand({
+              TableName: SETTINGS_TABLE,
+              Key: { setting_id: 'SYSTEM_SETTINGS' }
+            }));
+            const ipoSettings = settingsItem?.settings?.ipo;
+            const rewardEnabled = ipoSettings?.requester_reward_enabled !== false; // 기본값 true
+            const rewardAmount = ipoSettings?.requester_reward_amount ?? 10000;
+
+            if (rewardEnabled && rewardAmount > 0) {
+              const notifId = `notif-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+              await dynamodb.send(new PutCommand({
+                TableName: 'supernoba-notifications',
+                Item: {
+                  user_id: reqData.user_id,
+                  notification_id: notifId,
+                  type: 'ipo_reward',
+                  body: `상장요청한 ${name} 종목이 IPO단계에 진입했습니다! 눌러서 포인트 받기`,
+                  symbol: sym,
+                  symbol_logo_url: logo_url || '',
+                  reward_amount: rewardAmount,
+                  reward_claimed: false,
+                  read: false,
+                  created_at: now,
+                  ttl: Math.floor(Date.now() / 1000) + 86400 * 30
+                }
+              }));
+              console.log(`[APPROVE] IPO reward notification created for ${reqData.user_id}: ${notifId} (${rewardAmount} BOLT)`);
+            }
+          } catch (notifErr) {
+            console.warn(`[APPROVE] Notification creation failed (non-fatal): ${notifErr.message}`);
+          }
+        }
+
+        // 랭킹 Sorted Set 초기 점수 (신규 종목 즉시 노출) + listingPrice 캐시
         try {
           const mcap = (listingPrice || 0) * (totalShares || 0);
           await Promise.all([
             backupCache.zadd('ranking:volume', 1, symbol.toUpperCase()),
             backupCache.zadd('ranking:marketcap', mcap, symbol.toUpperCase()),
+            // listingPrice를 operating cache에 저장 (Streamer/프론트엔드 초기가격 표시용)
+            listingPrice > 0 ? operatingCache.set(`symbol:${symbol.toUpperCase()}:listingPrice`, String(listingPrice)) : null,
           ]);
           console.log(`[APPROVE] Ranking scores initialized for ${symbol.toUpperCase()}: vol=1, mcap=${mcap}`);
         } catch (rankErr) {

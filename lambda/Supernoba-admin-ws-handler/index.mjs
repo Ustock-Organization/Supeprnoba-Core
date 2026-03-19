@@ -4,7 +4,8 @@
  * - MM 실시간 데이터 구독 및 푸시
  * - Cognito JWT 인증 (DynamoDB is_admin 확인)
  */
-import { ApiGatewayManagementApiClient, PostToConnectionCommand, DeleteConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 
 // Common Layer - Valkey
 import { getValkeyClient } from '/opt/nodejs/index.mjs';
@@ -14,15 +15,34 @@ import { verifyAdmin } from '/opt/nodejs/verifyAuth.mjs';
 
 // Layer를 통한 Redis 클라이언트 (4개 캐시 아키텍처)
 const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
-const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });  // MM 관련 데이터는 Operating Cache
+const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 
-let cacheConnected = false;
+// Lambda 클라이언트 (DB 동기화용)
+const lambdaClient = new LambdaClient({ region: 'ap-northeast-2' });
 
 // EC2 MM Service에 제어 신호 발송 (mm:control Pub/Sub)
 async function sendMMControl(action, symbol = null) {
   const message = { action, symbol, timestamp: Date.now() };
   await operatingCache.publish('mm:control', JSON.stringify(message));
   console.log(`[admin-ws] MM Control sent: ${action}`, symbol || '');
+}
+
+// admin-mm Lambda를 비동기 invoke하여 PostgreSQL DB 동기화
+async function syncToDb(action, data) {
+  try {
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: 'Supernoba-admin-mm',
+      InvocationType: 'Event',  // 비동기, 응답 안 기다림
+      Payload: JSON.stringify({
+        httpMethod: 'POST',
+        body: JSON.stringify({ action, ...data }),
+        headers: { 'x-internal-call': 'true' },
+      }),
+    }));
+    console.log(`[admin-ws] DB sync dispatched: ${action}`);
+  } catch (e) {
+    console.error('[admin-ws] DB sync failed:', e.message);
+  }
 }
 
 async function ensureConnected(redis) {
@@ -172,13 +192,14 @@ async function getMMData() {
   const mmList = [];
 
   for (const symbol of allSymbols) {
-    const [configStr, priceStr, orderCountStr, ohlcStr, startedAtStr] = await Promise.all([
+    const [configStr, priceStr, orderCountStr, ohlcStr, startedAtStr, lastTickStr] = await Promise.all([
       operatingCache.get(`mm:config:${symbol}`),
       operatingCache.get(`mm:price:${symbol}`),
       operatingCache.get(`mm:orderCount:${symbol}`),
       depthCache.get(`ohlc:${symbol}`),
-      operatingCache.get(`mm:started_at:${symbol}`),  // 시작 시간 조회
-    ]).catch(() => [null, null, null, null, null]);
+      operatingCache.get(`mm:started_at:${symbol}`),
+      operatingCache.get(`mm:lastTick:${symbol}`),  // MM 생존 확인
+    ]).catch(() => [null, null, null, null, null, null]);
 
     let config = { basePrice: 100 };
     try { if (configStr) config = JSON.parse(configStr); } catch (e) {}
@@ -203,22 +224,37 @@ async function getMMData() {
       phaseTime = (elapsedMs / 1000) % period;  // 현재 주기 내 경과 시간 (초)
     }
 
-    // 단순 사인파 설정
+    // v10 전체 필드 반환
     mmList.push({
       symbol,
       base_price: config.basePrice ?? 100,
       current_price: ohlc?.c ?? parseFloat(priceStr) ?? null,
       order_count: parseInt(orderCountStr) || 0,
       is_running: isRunning,
-      period: period,                         // 주기 (초)
-      amplitude: config.amplitude ?? 0.1,     // 진폭 (0~0.5)
+      period: period,
+      amplitude: config.amplitude ?? 0.1,
       tick_interval: config.tickInterval ?? 1000,
       trade_interval: config.tradeInterval ?? 3,
       trade_quantity: config.tradeQuantity ?? 50,
       volume: ohlc?.v ?? 0,
       high: ohlc?.h ?? null,
       low: ohlc?.l ?? null,
-      phase_time: phaseTime,                  // 현재 주기 내 경과 시간 (초)
+      phase_time: phaseTime,
+      last_tick: lastTickStr ? parseInt(lastTickStr) : null,
+      // v10 fields
+      strategy: config.strategy || 'legacy_sine',
+      spread: config.spread ?? 0.02,
+      depth_levels: config.depthLevels ?? 3,
+      depth_decay: config.depthDecay ?? 0.50,
+      external_feed: config.externalFeed || 'none',
+      external_symbol: config.externalSymbol || 'btcusdt',
+      correlation: config.correlation ?? 0.30,
+      cancel_interval: config.cancelInterval ?? 5,
+      max_open_orders: config.maxOpenOrders ?? 10,
+      trend_bias: config.trendBias ?? 0,
+      position_limit: config.positionLimit ?? 500,
+      risk_aversion: config.riskAversion ?? 0.50,
+      volatility: config.volatility ?? 0.0001,
     });
   }
 
@@ -328,13 +364,20 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           await sendToConnection(apiClient, connectionId, { type: 'error', message: 'Symbol required' });
           return { statusCode: 400, body: 'Symbol required' };
         }
-        // 기존 설정 조회
-        let existingConfig = { basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000, tradeInterval: 3, tradeQuantity: 50 };
+        // 기존 설정 조회 (v10 기본값 포함)
+        let existingConfig = {
+          basePrice: 100, period: 600, amplitude: 0.1, tickInterval: 1000,
+          tradeInterval: 3, tradeQuantity: 50,
+          strategy: 'legacy_sine', spread: 0.02, depthLevels: 3, depthDecay: 0.50,
+          externalFeed: 'none', externalSymbol: 'btcusdt', correlation: 0.30,
+          cancelInterval: 5, maxOpenOrders: 10, trendBias: 0,
+          positionLimit: 500, riskAversion: 0.50, volatility: 0.0001,
+        };
         try {
           const existingStr = await operatingCache.get(`mm:config:${sym}`);
-          if (existingStr) existingConfig = JSON.parse(existingStr);
+          if (existingStr) existingConfig = { ...existingConfig, ...JSON.parse(existingStr) };
         } catch (e) {}
-        // 단순 사인파 설정
+        // v10 전체 필드 보존
         const startConfig = {
           basePrice: basePrice || existingConfig.basePrice || 100,
           period: cfg.period ?? existingConfig.period ?? 600,
@@ -342,6 +385,19 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           tickInterval: cfg.tickInterval ?? existingConfig.tickInterval ?? 1000,
           tradeInterval: cfg.tradeInterval ?? existingConfig.tradeInterval ?? 3,
           tradeQuantity: cfg.tradeQuantity ?? existingConfig.tradeQuantity ?? 50,
+          strategy: cfg.strategy || existingConfig.strategy || 'legacy_sine',
+          spread: cfg.spread ?? existingConfig.spread ?? 0.02,
+          depthLevels: cfg.depthLevels ?? existingConfig.depthLevels ?? 3,
+          depthDecay: cfg.depthDecay ?? existingConfig.depthDecay ?? 0.50,
+          externalFeed: cfg.externalFeed || existingConfig.externalFeed || 'none',
+          externalSymbol: cfg.externalSymbol || existingConfig.externalSymbol || 'btcusdt',
+          correlation: cfg.correlation ?? existingConfig.correlation ?? 0.30,
+          cancelInterval: cfg.cancelInterval ?? existingConfig.cancelInterval ?? 5,
+          maxOpenOrders: cfg.maxOpenOrders ?? existingConfig.maxOpenOrders ?? 10,
+          trendBias: cfg.trendBias ?? existingConfig.trendBias ?? 0,
+          positionLimit: cfg.positionLimit ?? existingConfig.positionLimit ?? 500,
+          riskAversion: cfg.riskAversion ?? existingConfig.riskAversion ?? 0.50,
+          volatility: cfg.volatility ?? existingConfig.volatility ?? 0.0001,
         };
         await operatingCache.set('mm:running', 'true');
         await operatingCache.sadd('mm:all:symbols', sym);       // 전체 목록에 추가
@@ -352,6 +408,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         // EC2 MM Service에 시작 명령 전송
         await sendMMControl('start', sym);
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'start', symbol: sym });
+        syncToDb('start', { symbol: sym, basePrice: startConfig.basePrice, config: startConfig });
         break;
 
       case 'stop':
@@ -372,6 +429,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           await sendMMControl('stopAll');
         }
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'stop', symbol: sym || 'all' });
+        syncToDb('stop', { symbol: sym || null });
         break;
 
       case 'startAll':
@@ -386,6 +444,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         // EC2 MM Service에 전체 시작 명령 전송
         await sendMMControl('startAll');
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'startAll' });
+        syncToDb('startAll', {});
         break;
 
       case 'stopAll':
@@ -399,6 +458,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         // EC2 MM Service에 전체 중지 명령 전송
         await sendMMControl('stopAll');
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'stopAll' });
+        syncToDb('stopAll', {});
         break;
 
       case 'save':
@@ -407,19 +467,45 @@ async function handleMMControl(event, apiClient, connectionId, body) {
           return { statusCode: 400, body: 'Symbol required' };
         }
         console.log('[admin-ws] Save request:', JSON.stringify({ symbol: sym, basePrice, config: cfg }));
-        // 단순 사인파 설정
+        // 기존 설정 읽어서 v10 필드 병합
+        let existingSaveConfig = {};
+        try {
+          const existingSaveStr = await operatingCache.get(`mm:config:${sym}`);
+          if (existingSaveStr) existingSaveConfig = JSON.parse(existingSaveStr);
+        } catch (e) {}
+        // v10 전체 필드 보존
         const saveConfig = {
-          basePrice: basePrice || 100,
-          period: cfg.period ?? 600,
-          amplitude: cfg.amplitude ?? 0.1,
-          tickInterval: cfg.tickInterval ?? 1000,
-          tradeInterval: cfg.tradeInterval ?? 3,
-          tradeQuantity: cfg.tradeQuantity ?? 50,
+          basePrice: basePrice || existingSaveConfig.basePrice || 100,
+          period: cfg.period ?? existingSaveConfig.period ?? 600,
+          amplitude: cfg.amplitude ?? existingSaveConfig.amplitude ?? 0.1,
+          tickInterval: cfg.tickInterval ?? existingSaveConfig.tickInterval ?? 1000,
+          tradeInterval: cfg.tradeInterval ?? existingSaveConfig.tradeInterval ?? 3,
+          tradeQuantity: cfg.tradeQuantity ?? existingSaveConfig.tradeQuantity ?? 50,
+          strategy: cfg.strategy || existingSaveConfig.strategy || 'legacy_sine',
+          spread: cfg.spread ?? existingSaveConfig.spread ?? 0.02,
+          depthLevels: cfg.depthLevels ?? existingSaveConfig.depthLevels ?? 3,
+          depthDecay: cfg.depthDecay ?? existingSaveConfig.depthDecay ?? 0.50,
+          externalFeed: cfg.externalFeed || existingSaveConfig.externalFeed || 'none',
+          externalSymbol: cfg.externalSymbol || existingSaveConfig.externalSymbol || 'btcusdt',
+          correlation: cfg.correlation ?? existingSaveConfig.correlation ?? 0.30,
+          cancelInterval: cfg.cancelInterval ?? existingSaveConfig.cancelInterval ?? 5,
+          maxOpenOrders: cfg.maxOpenOrders ?? existingSaveConfig.maxOpenOrders ?? 10,
+          trendBias: cfg.trendBias ?? existingSaveConfig.trendBias ?? 0,
+          positionLimit: cfg.positionLimit ?? existingSaveConfig.positionLimit ?? 500,
+          riskAversion: cfg.riskAversion ?? existingSaveConfig.riskAversion ?? 0.50,
+          volatility: cfg.volatility ?? existingSaveConfig.volatility ?? 0.0001,
         };
         console.log('[admin-ws] Saving config:', JSON.stringify(saveConfig));
-        await operatingCache.sadd('mm:all:symbols', sym);  // 전체 목록에 추가 (대기 상태)
+        await operatingCache.sadd('mm:all:symbols', sym);
         await operatingCache.set(`mm:config:${sym}`, JSON.stringify(saveConfig));
+        // 실행 중인 심볼이면 즉시 reload 발행
+        const isSaveRunning = await operatingCache.sismember('mm:running:symbols', sym);
+        if (isSaveRunning) {
+          await sendMMControl('reload', sym);
+          console.log(`[admin-ws] Reload sent for running symbol: ${sym}`);
+        }
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'save', symbol: sym });
+        syncToDb('save', { symbol: sym, basePrice: saveConfig.basePrice, config: saveConfig });
         break;
 
       case 'delete':
@@ -435,6 +521,7 @@ async function handleMMControl(event, apiClient, connectionId, body) {
         await operatingCache.del(`mm:orderCount:${sym}`);
         await operatingCache.del(`mm:started_at:${sym}`);  // 시작 시간도 제거
         await sendToConnection(apiClient, connectionId, { type: 'success', action: 'delete', symbol: sym });
+        syncToDb('delete', { symbol: sym });
         break;
     }
 
@@ -511,49 +598,3 @@ export const handler = async (event, context) => {
   }
 };
 
-// === 주기적 데이터 푸시를 위한 별도 핸들러 (EventBridge 트리거) ===
-export const pushHandler = async (event) => {
-  console.log('[admin-ws-push] Starting periodic push');
-
-  await ensureConnected(operatingCache);
-
-  const subscribers = await operatingCache.smembers('admin:mm:subscribers').catch(() => []);
-  if (subscribers.length === 0) {
-    console.log('[admin-ws-push] No subscribers');
-    return { statusCode: 200, body: 'No subscribers' };
-  }
-
-  const mmData = await getMMData();
-  const message = JSON.stringify({ type: 'mm_data', data: mmData });
-
-  // WebSocket endpoint from environment
-  const wsEndpoint = process.env.WS_ENDPOINT;
-  if (!wsEndpoint) {
-    console.error('[admin-ws-push] WS_ENDPOINT not configured');
-    return { statusCode: 500, body: 'WS_ENDPOINT not configured' };
-  }
-
-  const apiClient = new ApiGatewayManagementApiClient({
-    endpoint: wsEndpoint,
-    region: process.env.AWS_REGION || 'ap-northeast-2',
-  });
-
-  let sent = 0;
-  for (const connId of subscribers) {
-    try {
-      await apiClient.send(new PostToConnectionCommand({
-        ConnectionId: connId,
-        Data: Buffer.from(message),
-      }));
-      sent++;
-    } catch (err) {
-      if (err.statusCode === 410) {
-        await operatingCache.srem('admin:mm:subscribers', connId).catch(() => {});
-        await operatingCache.srem('admin:connections', connId).catch(() => {});
-      }
-    }
-  }
-
-  console.log(`[admin-ws-push] Sent to ${sent}/${subscribers.length} subscribers`);
-  return { statusCode: 200, body: `Sent to ${sent} subscribers` };
-};

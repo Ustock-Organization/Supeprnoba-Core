@@ -70,14 +70,6 @@ export async function getJsonSecret(secretName, envFallback) {
 }
 
 /**
- * Get admin API key with secure fallback
- * @returns {Promise<string>} - The admin API key
- */
-export async function getAdminApiKey() {
-  return getSecret('supernoba/admin-api-key', process.env.ADMIN_API_KEY);
-}
-
-/**
  * Get Twitter bearer token with secure fallback
  * @returns {Promise<string>} - The Twitter bearer token
  */
@@ -136,7 +128,6 @@ export function clearSecretsCache() {
  * Secret names constants
  */
 export const SecretNames = {
-  ADMIN_API_KEY: 'supernoba/admin-api-key',
   TWITTER_BEARER_TOKEN: 'supernoba/twitter-bearer-token',
   YOUTUBE_API_KEY: 'supernoba/youtube-api-key',
   SUPERNOBA_API_KEY: 'supernoba/api-key',
@@ -149,7 +140,6 @@ export const SecretNames = {
 export default {
   getSecret,
   getJsonSecret,
-  getAdminApiKey,
   getTwitterBearerToken,
   getYouTubeApiKey,
   getStripeSecretKey,

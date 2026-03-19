@@ -10,7 +10,8 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { CORS, response, handleOptions } from '/opt/nodejs/index.mjs';
-import { verifyAuth, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+import { verifyAuth, authErrorResponse, resolveUserId } from '/opt/nodejs/verifyAuth.mjs';
+
 
 // ── DynamoDB ────────────────────────────────────────────
 const dynamodb = DynamoDBDocumentClient.from(
@@ -21,51 +22,27 @@ const dynamodb = DynamoDBDocumentClient.from(
 const USER_TABLE = process.env.USER_TABLE || 'supernoba-users';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 
+// ── Test Mode ───────────────────────────────────────────
+// VPC 밖 Lambda → Valkey 접근 불가 → DynamoDB settings에서 직접 읽기
+async function isTestMode() {
+  try {
+    const { Item } = await dynamodb.send(new GetCommand({
+      TableName: SETTINGS_TABLE,
+      Key: { setting_id: 'SYSTEM_SETTINGS' },
+      ProjectionExpression: 'settings.platform.beta_mode',
+    }));
+    return Item?.settings?.platform?.beta_mode === true;
+  } catch (err) {
+    console.error('[point-claim] isTestMode check failed:', err.message);
+    return false;
+  }
+}
+
 // ── Helpers ─────────────────────────────────────────────
 
 /** KST 기준 오늘 날짜 (YYYY-MM-DD) */
 function getTodayKST() {
   return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
-/** Cognito JWT → userId 변환 (delete-account Lambda 패턴) */
-function resolveUserId(authResult) {
-  let userId = authResult.userId;
-
-  // 1. X 로그인: custom:x_user_id 클레임
-  const xUserId = authResult.payload?.['custom:x_user_id'];
-  if (xUserId) {
-    return `x_${xUserId}`;
-  }
-
-  // 2. X 로그인: email 패턴 fallback
-  if (authResult.email?.includes('@x.supernoba.com')) {
-    return `x_${authResult.email.split('@')[0]}`;
-  }
-
-  // 3. Google/Apple 로그인: cognito:username 패턴
-  const cognitoUsername = authResult.payload?.['cognito:username'] || '';
-  if (cognitoUsername.startsWith('Google_')) {
-    return `google_${cognitoUsername.replace('Google_', '')}`;
-  }
-  if (cognitoUsername.startsWith('SignInWithApple_')) {
-    return `apple_${cognitoUsername.replace('SignInWithApple_', '')}`;
-  }
-
-  // 4. Google/Apple: identities 배열에서 추출
-  try {
-    const identities = typeof authResult.payload?.identities === 'string'
-      ? JSON.parse(authResult.payload.identities)
-      : authResult.payload?.identities;
-    if (Array.isArray(identities)) {
-      const googleId = identities.find(id => id.providerName === 'Google');
-      if (googleId) return `google_${googleId.userId}`;
-      const appleId = identities.find(id => id.providerName === 'SignInWithApple');
-      if (appleId) return `apple_${appleId.userId}`;
-    }
-  } catch { /* ignore */ }
-
-  return userId;
 }
 
 /** supernoba-settings에서 rewards 설정 조회 */
@@ -89,18 +66,21 @@ async function claimPremiumReward(userId) {
   const points = rewards.premiumDailyPoints ?? 5000;
   const today = getTodayKST();
 
-  // 1) 구독 상태 확인
+  // 1) 구독 상태 확인 (Test/Live suffix 적용)
+  const testMode = await isTestMode();
+  const suffix = testMode ? '_test' : '';
+
   const { Item: user } = await dynamodb.send(new GetCommand({
     TableName: USER_TABLE,
     Key: { user_id: userId },
-    ProjectionExpression: 'subscription_status, last_premium_claim',
+    ProjectionExpression: `subscription_status${suffix}, last_premium_claim`,
   }));
 
   if (!user) {
     return response.error(404, 'User not found', CORS.STANDARD);
   }
 
-  const status = user.subscription_status;
+  const status = user[`subscription_status${suffix}`];
   if (status !== 'active' && status !== 'trialing' && status !== 'test_active') {
     console.log(`[point-claim] Subscription check failed: user=${userId}, status=${status}`);
     return response.error(403, 'Premium subscription required', CORS.STANDARD);
@@ -179,12 +159,15 @@ async function claimAdReward(userId) {
 
 // ── GET /rewards/status ─────────────────────────────────
 async function getRewardStatus(userId) {
+  const testMode = await isTestMode();
+  const suffix = testMode ? '_test' : '';
+
   const [rewards, userData] = await Promise.all([
     getRewardSettings(),
     dynamodb.send(new GetCommand({
       TableName: USER_TABLE,
       Key: { user_id: userId },
-      ProjectionExpression: 'subscription_status, last_premium_claim, balances.BOLT.available',
+      ProjectionExpression: `subscription_status${suffix}, last_premium_claim, balances.BOLT.available`,
     })),
   ]);
 
@@ -194,7 +177,7 @@ async function getRewardStatus(userId) {
   }
 
   const today = getTodayKST();
-  const status = user.subscription_status;
+  const status = user[`subscription_status${suffix}`];
   const isSubscribed = status === 'active' || status === 'trialing' || status === 'test_active';
 
   return response.ok({

@@ -230,31 +230,67 @@ async function cleanFavorites(symbol) {
   let lastKey = undefined;
 
   do {
+    // FilterExpression 없이 전체 스캔 — 구/신 포맷 모두 처리하기 위함
+    // 'groups'는 DynamoDB 예약어이므로 ExpressionAttributeNames 필수
     const result = await dynamodb.send(new ScanCommand({
       TableName: FAVORITES_TABLE,
-      FilterExpression: 'contains(symbols, :symbol)',
-      ExpressionAttributeValues: { ':symbol': symbol },
-      ProjectionExpression: 'user_id, symbols',
+      ProjectionExpression: 'user_id, symbols, #g',
+      ExpressionAttributeNames: { '#g': 'groups' },
       ExclusiveStartKey: lastKey
     }));
 
     const items = result.Items || [];
 
     for (const item of items) {
-      const newSymbols = (item.symbols || []).filter(s => s !== symbol);
-      try {
-        await dynamodb.send(new UpdateCommand({
+      let needsUpdate = false;
+      let groupsChanged = false;
+      const updateExprs = [];
+      const exprValues = { ':updated_at': new Date().toISOString() };
+
+      // 신 포맷: groups 맵 처리
+      if (item.groups && typeof item.groups === 'object') {
+        const newGroups = {};
+        for (const [groupName, groupSymbols] of Object.entries(item.groups)) {
+          const arr = Array.isArray(groupSymbols) ? groupSymbols : [];
+          if (arr.includes(symbol)) {
+            newGroups[groupName] = arr.filter(s => s !== symbol);
+            groupsChanged = true;
+          } else {
+            newGroups[groupName] = arr;
+          }
+        }
+        if (groupsChanged) {
+          updateExprs.push('#g = :groups');
+          exprValues[':groups'] = newGroups;
+          needsUpdate = true;
+        }
+      }
+
+      // 구 포맷: symbols 배열 처리
+      if (Array.isArray(item.symbols) && item.symbols.includes(symbol)) {
+        updateExprs.push('symbols = :symbols');
+        exprValues[':symbols'] = item.symbols.filter(s => s !== symbol);
+        needsUpdate = true;
+      }
+
+      if (needsUpdate) {
+        updateExprs.push('updated_at = :updated_at');
+        const params = {
           TableName: FAVORITES_TABLE,
           Key: { user_id: item.user_id },
-          UpdateExpression: 'SET symbols = :symbols, updated_at = :updated_at',
-          ExpressionAttributeValues: {
-            ':symbols': newSymbols,
-            ':updated_at': new Date().toISOString()
-          }
-        }));
-        updatedCount++;
-      } catch (err) {
-        console.error(`[delisting-phase3] Favorites update failed for user ${item.user_id}: ${err.message}`);
+          UpdateExpression: 'SET ' + updateExprs.join(', '),
+          ExpressionAttributeValues: exprValues
+        };
+        // #g alias는 groups 변경 시에만 필요
+        if (groupsChanged) {
+          params.ExpressionAttributeNames = { '#g': 'groups' };
+        }
+        try {
+          await dynamodb.send(new UpdateCommand(params));
+          updatedCount++;
+        } catch (err) {
+          console.error(`[delisting-phase3] Favorites update failed for user ${item.user_id}: ${err.message}`);
+        }
       }
     }
 

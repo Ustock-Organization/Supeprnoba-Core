@@ -5,8 +5,6 @@
   "description": "User management and system settings Lambda",
   "main": "index.mjs",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.624.0",
-    "@aws-sdk/lib-dynamodb": "^3.624.0",
     "ioredis": "^5.4.1"
   }
 }

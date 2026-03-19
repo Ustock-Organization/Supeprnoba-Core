@@ -1,11 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.699.0",
-    "@aws-sdk/client-secrets-manager": "^3.699.0",
-    "@aws-sdk/client-sqs": "^3.699.0",
-    "@aws-sdk/lib-dynamodb": "^3.699.0",
-    "ioredis": "^5.4.1",
-    "pg": "^8.13.1"
+    "@aws-sdk/s3-request-presigner": "^3.624.0",
+    "ioredis": "^5.4.1"
   }
 }

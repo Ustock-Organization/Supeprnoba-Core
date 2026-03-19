@@ -115,9 +115,13 @@ export const handler = async (event) => {
     const q = event.queryStringParameters || {};
     const action = q.action;
 
-    // 모든 요청에 관리자 인증 필요
-    const adminCheck = await checkAdmin(event);
-    if (!adminCheck.authorized) return adminCheck.response;
+    // 내부 호출(admin-ws-handler → Lambda invoke)은 인증 스킵
+    const headers = event.headers || {};
+    const isInternal = headers['x-internal-call'] === 'true';
+    if (!isInternal) {
+      const adminCheck = await checkAdmin(event);
+      if (!adminCheck.authorized) return adminCheck.response;
+    }
 
     if (method === 'GET') {
       const db = await getPg();
@@ -227,7 +231,10 @@ export const handler = async (event) => {
         // Redis에 단순 포맷으로 저장 (항상)
         await valkey.set(`mm:config:${sym}`, JSON.stringify(redisCfg));
         const isRunning = await valkey.sismember('mm:running:symbols', sym);
-        return ok({ success: true, applied: !!isRunning });
+        if (isRunning) {
+          await sendMMControl('reload', sym);
+        }
+        return ok({ success: true, applied: !!isRunning, reloaded: !!isRunning });
       }
 
       if (action === 'start') {

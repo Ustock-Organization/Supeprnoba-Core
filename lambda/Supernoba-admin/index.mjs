@@ -25,13 +25,15 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
 // Auth Layer - Cognito JWT 검증
-import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+import { verifyAdmin, verifyAuth, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
 const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const ANNOUNCEMENTS_TABLE = process.env.ANNOUNCEMENTS_TABLE || 'supernoba-announcements';
+const NOTIFICATIONS_TABLE = process.env.NOTIFICATIONS_TABLE || 'supernoba-notifications';
+const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'supernoba-announcements-media';
 const s3 = new S3Client({ region: 'ap-northeast-2' });
 
@@ -612,6 +614,189 @@ export const handler = async (event) => {
     }
 
     // ==========================================
+    // notifications - 유저 알림 조회 (인증 필수)
+    // ==========================================
+    if (q.type === 'notifications') {
+      if (m === 'GET') {
+        const authResult = await verifyAuth(event);
+        if (!authResult.success) return authErrorResponse(authResult, H);
+        const userId = authResult.userId;
+        if (!userId) return err(401, 'Authentication required');
+
+        // X 로그인 사용자 ID 변환
+        let resolvedUserId = userId;
+        const xUserId = authResult.payload?.['custom:x_user_id'];
+        if (xUserId) resolvedUserId = `x_${xUserId}`;
+        else if (authResult.email?.includes('@x.supernoba.com')) {
+          resolvedUserId = `x_${authResult.email.split('@')[0]}`;
+        }
+        // Google/Apple 사용자 ID 변환
+        try {
+          const identities = typeof authResult.payload?.identities === 'string'
+            ? JSON.parse(authResult.payload.identities) : authResult.payload?.identities;
+          if (Array.isArray(identities)) {
+            const googleId = identities.find(id => id.providerName === 'Google');
+            if (googleId) resolvedUserId = `google_${googleId.userId}`;
+            const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+            if (appleId) resolvedUserId = `apple_${appleId.userId}`;
+          }
+        } catch { /* ignore */ }
+
+        try {
+          const result = await dynamodb.send(new QueryCommand({
+            TableName: NOTIFICATIONS_TABLE,
+            KeyConditionExpression: 'user_id = :uid',
+            ExpressionAttributeValues: { ':uid': resolvedUserId },
+            ScanIndexForward: false, // 최신순
+            Limit: 50
+          }));
+          return ok({ notifications: result.Items || [] });
+        } catch (e) {
+          console.error('[notifications GET] Error:', e.message);
+          return ok({ notifications: [] });
+        }
+      }
+    }
+
+    // ==========================================
+    // claimReward - IPO 보상 수령 (인증 필수)
+    // ==========================================
+    if (q.type === 'claimReward') {
+      if (m === 'POST') {
+        const authResult = await verifyAuth(event);
+        if (!authResult.success) return authErrorResponse(authResult, H);
+        const userId = authResult.userId;
+        if (!userId) return err(401, 'Authentication required');
+
+        // 사용자 ID 변환 (verifySelf 패턴 재사용)
+        let resolvedUserId = userId;
+        const xUserId = authResult.payload?.['custom:x_user_id'];
+        if (xUserId) resolvedUserId = `x_${xUserId}`;
+        else if (authResult.email?.includes('@x.supernoba.com')) {
+          resolvedUserId = `x_${authResult.email.split('@')[0]}`;
+        }
+        try {
+          const identities = typeof authResult.payload?.identities === 'string'
+            ? JSON.parse(authResult.payload.identities) : authResult.payload?.identities;
+          if (Array.isArray(identities)) {
+            const googleId = identities.find(id => id.providerName === 'Google');
+            if (googleId) resolvedUserId = `google_${googleId.userId}`;
+            const appleId = identities.find(id => id.providerName === 'SignInWithApple');
+            if (appleId) resolvedUserId = `apple_${appleId.userId}`;
+          }
+        } catch { /* ignore */ }
+
+        const body = JSON.parse(event.body || '{}');
+        const { notificationId } = body;
+        if (!notificationId) return err(400, 'notificationId is required');
+
+        try {
+          // 1. 알림 조회 + 수령 여부 확인 (원자적 업데이트)
+          const updateResult = await dynamodb.send(new UpdateCommand({
+            TableName: NOTIFICATIONS_TABLE,
+            Key: { user_id: resolvedUserId, notification_id: notificationId },
+            UpdateExpression: 'SET reward_claimed = :true, #read = :true, claimed_at = :now',
+            ConditionExpression: 'attribute_exists(user_id) AND reward_claimed = :false',
+            ExpressionAttributeNames: { '#read': 'read' },
+            ExpressionAttributeValues: {
+              ':true': true,
+              ':false': false,
+              ':now': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+          }));
+
+          const notification = updateResult.Attributes;
+          const rewardAmount = notification.reward_amount || 0;
+
+          if (rewardAmount > 0) {
+            // 2. 잔고에 포인트 추가 (ADD 연산 — 원자적)
+            await dynamodb.send(new UpdateCommand({
+              TableName: WALLETS_TABLE,
+              Key: { user_id: resolvedUserId },
+              UpdateExpression: 'ADD #avail :amount',
+              ExpressionAttributeNames: { '#avail': 'available' },
+              ExpressionAttributeValues: { ':amount': rewardAmount }
+            }));
+            console.log(`[claimReward] ${resolvedUserId} claimed ${rewardAmount} BOLT from ${notificationId}`);
+          }
+
+          return ok({ claimed: true, amount: rewardAmount, symbol: notification.symbol });
+        } catch (e) {
+          if (e.name === 'ConditionalCheckFailedException') {
+            return err(400, 'Reward already claimed or notification not found');
+          }
+          console.error('[claimReward] Error:', e.message);
+          return err(500, 'Failed to claim reward: ' + e.message);
+        }
+      }
+    }
+
+    // ==========================================
+    // ipoSettings - IPO 보상 설정 (관리자 전용)
+    // ==========================================
+    if (q.type === 'ipoSettings') {
+      if (m === 'GET') {
+        try {
+          const { Item } = await dynamodb.send(new GetCommand({
+            TableName: SETTINGS_TABLE,
+            Key: { setting_id: 'SYSTEM_SETTINGS' }
+          }));
+          return ok({
+            ipo: Item?.settings?.ipo || {
+              requester_reward_enabled: true,
+              requester_reward_amount: 10000
+            }
+          });
+        } catch (e) {
+          console.error('[ipoSettings GET] Error:', e.message);
+          return ok({ ipo: { requester_reward_enabled: true, requester_reward_amount: 10000 } });
+        }
+      }
+
+      if (m === 'PUT') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const body = JSON.parse(event.body || '{}');
+        const { requester_reward_enabled, requester_reward_amount } = body;
+
+        try {
+          // 기존 SYSTEM_SETTINGS 가져와서 ipo 섹션만 병합
+          const { Item: current } = await dynamodb.send(new GetCommand({
+            TableName: SETTINGS_TABLE,
+            Key: { setting_id: 'SYSTEM_SETTINGS' }
+          }));
+          const currentSettings = current?.settings || {};
+
+          const newIpoSettings = {
+            requester_reward_enabled: requester_reward_enabled !== undefined
+              ? requester_reward_enabled
+              : (currentSettings.ipo?.requester_reward_enabled ?? true),
+            requester_reward_amount: requester_reward_amount !== undefined
+              ? requester_reward_amount
+              : (currentSettings.ipo?.requester_reward_amount ?? 10000),
+          };
+
+          await dynamodb.send(new PutCommand({
+            TableName: SETTINGS_TABLE,
+            Item: {
+              setting_id: 'SYSTEM_SETTINGS',
+              settings: { ...currentSettings, ipo: newIpoSettings },
+              updated_at: new Date().toISOString()
+            }
+          }));
+
+          console.log(`[ipoSettings] Updated by admin: ${JSON.stringify(newIpoSettings)}`);
+          return ok({ success: true, ipo: newIpoSettings });
+        } catch (e) {
+          console.error('[ipoSettings PUT] Error:', e.message);
+          return err(500, 'Failed to save IPO settings: ' + e.message);
+        }
+      }
+    }
+
+    // ==========================================
     // announcements - 공지사항 CRUD
     // ==========================================
     if (q.type === 'announcements') {
@@ -777,7 +962,7 @@ export const handler = async (event) => {
       return err(410, 'Symbol DELETE moved to /Supernoba-symbol-admin endpoint');
     }
 
-    return err(404, 'Not found. Available endpoints: ?type=auth, ?type=alerts, ?type=siteConfig, ?type=tickerTape, ?type=tickerTape_pc, ?type=tickerTape_mobile, ?type=gameSettings');
+    return err(404, 'Not found. Available endpoints: ?type=auth, ?type=alerts, ?type=siteConfig, ?type=tickerTape, ?type=tickerTape_pc, ?type=tickerTape_mobile, ?type=gameSettings, ?type=notifications, ?type=claimReward, ?type=ipoSettings');
   } catch (e) {
     console.error('Error:', e);
     return err(500, e.message);

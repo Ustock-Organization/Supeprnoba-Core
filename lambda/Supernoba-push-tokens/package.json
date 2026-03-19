@@ -2,9 +2,5 @@
   "name": "supernoba-push-tokens",
   "version": "1.0.0",
   "type": "module",
-  "description": "Push notification token registration API",
-  "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.700.0",
-    "@aws-sdk/lib-dynamodb": "^3.700.0"
-  }
+  "description": "Push notification token registration API"
 }
