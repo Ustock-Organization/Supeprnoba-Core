@@ -33,21 +33,9 @@ public:
     bool connect();
     bool ping();
     
-    // 마감된 1분봉 리스트 조회
-    std::vector<Candle> get_closed_candles(const std::string& symbol);
-    
-    // 활성 1분봉 조회
-    Candle get_active_candle(const std::string& symbol);
-    
     // 심볼 목록 조회 (candle:closed:1m:* 패턴)
     std::vector<std::string> get_closed_symbols();
     
-    // 처리 완료 후 삭제 (전체)
-    bool delete_closed_candles(const std::string& symbol);
-    
-    // 처리 완료 후 삭제 (부분 - 오래된 순)
-    bool trim_closed_candles(const std::string& symbol, size_t count);
-
     // === 진행중 캔들 관리 (증분 업데이트용) ===
 
     // 진행중 캔들 조회 (candle:{interval}:{symbol})

@@ -34,11 +34,6 @@ std::string Aggregator::align_to_timeframe(const std::string& ymdhm, int minutes
     return oss.str();
 }
 
-bool Aggregator::is_timeframe_boundary(const std::string& ymdhm, const Timeframe& tf) {
-    int min = std::stoi(ymdhm.substr(10, 2));
-    return (min % tf.minutes == 0);
-}
-
 Candle Aggregator::aggregate_candles(const std::vector<Candle>& candles, 
                                     const std::string& aligned_time) {
     Candle result;
@@ -64,88 +59,6 @@ Candle Aggregator::aggregate_candles(const std::vector<Candle>& candles,
         result.volume += c.volume;
     }
     
-    return result;
-}
-
-// 타임프레임 종료 시간 계산 (aligned_time + minutes)
-// [FIX] epoch 변환으로 월/년 경계 오버플로 방지
-std::string Aggregator::get_timeframe_end(const std::string& aligned_time, int minutes) {
-    // KST 시간 문자열 → UTC epoch → 분 추가 → KST 시간 문자열
-    int64_t utc_epoch = Candle::ymdhm_to_utc_epoch(aligned_time);
-    if (utc_epoch == 0) return aligned_time;  // 파싱 실패 시 원본 반환
-
-    utc_epoch += static_cast<int64_t>(minutes) * 60;
-    return epoch_to_ymdhm(utc_epoch);
-}
-
-std::map<std::string, std::vector<Candle>> Aggregator::aggregate(
-    const std::vector<Candle>& one_min_candles) {
-
-    std::map<std::string, std::vector<Candle>> result;
-
-    if (one_min_candles.empty()) return result;
-
-    // 1분봉은 그대로 추가
-    result["1m"] = one_min_candles;
-
-    // [FIX] 가장 최근 1분봉 시간을 "현재 시간"으로 사용
-    // 이 시간 이전에 종료된 타임프레임만 집계
-    std::string latest_time = one_min_candles[0].time;
-    for (const auto& c : one_min_candles) {
-        if (c.time > latest_time) latest_time = c.time;
-    }
-
-    // 각 타임프레임별로 집계
-    for (const auto& tf : TIMEFRAMES) {
-        if (tf.minutes <= 1) continue;  // 1분봉은 스킵
-
-        // 1분봉들을 타임프레임 경계로 그룹화
-        std::map<std::string, std::vector<Candle>> groups;
-
-        for (const auto& candle : one_min_candles) {
-            std::string aligned = align_to_timeframe(candle.time, tf.minutes);
-            groups[aligned].push_back(candle);
-        }
-
-        // 각 그룹을 하나의 캔들로 집계
-        std::vector<Candle> aggregated;
-        for (const auto& [aligned_time, group_candles] : groups) {
-            // [FIX] 타임프레임이 완전히 종료된 경우만 저장
-            // 예: 3분봉 09:18은 09:21이 되어야 저장
-            std::string tf_end = get_timeframe_end(aligned_time, tf.minutes);
-
-            if (tf_end > latest_time) {
-                // 아직 진행중인 타임프레임 - 저장하지 않음
-                Logger::debug("[AGG-SKIP]", tf.interval, "@", aligned_time,
-                             "not closed yet (ends at", tf_end, ", latest:", latest_time, ")");
-                continue;
-            }
-
-            // [FIX] 최소 50% 캔들이 있으면 집계 허용
-            size_t min_required = std::max(static_cast<size_t>(1),
-                                           static_cast<size_t>(tf.minutes) / 2);
-
-            if (group_candles.size() >= min_required) {
-                Candle agg = aggregate_candles(group_candles, aligned_time);
-                aggregated.push_back(agg);
-
-                // 부분 집계인 경우 경고 로그
-                if (group_candles.size() < static_cast<size_t>(tf.minutes)) {
-                    Logger::debug("[AGG-PARTIAL]", agg.symbol, tf.interval, "@", aligned_time,
-                                 "candles:", group_candles.size(), "/", tf.minutes,
-                                 "O:", agg.open, "H:", agg.high, "L:", agg.low, "C:", agg.close);
-                } else {
-                    Logger::debug("[AGG]", agg.symbol, tf.interval, "@", aligned_time,
-                                 "O:", agg.open, "H:", agg.high, "L:", agg.low, "C:", agg.close);
-                }
-            }
-        }
-
-        if (!aggregated.empty()) {
-            result[tf.interval] = aggregated;
-        }
-    }
-
     return result;
 }
 
