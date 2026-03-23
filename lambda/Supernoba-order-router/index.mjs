@@ -97,7 +97,7 @@ async function checkIdempotency(idempotencyKey, userId) {
 
 // === Symbol Validation Cache ===
 const symbolCache = new Map(); // symbol -> { isActive: boolean, data: {...}, expiry: timestamp }
-const SYMBOL_CACHE_TTL = 2 * 60 * 1000; // 2분 (심볼은 자주 바뀌지 않음)
+const SYMBOL_CACHE_TTL = 30 * 1000; // 30초 (상태 변경 시 빠른 반영)
 
 // === Symbol Format Validation ===
 const SYMBOL_REGEX = /^[A-Z0-9]{2,20}$/;
@@ -106,7 +106,7 @@ function isValidSymbolFormat(symbol) {
   return SYMBOL_REGEX.test(symbol.toUpperCase().trim());
 }
 
-// === Active Symbol Verification (2분 캐시) ===
+// === Active Symbol Verification (30초 캐시) ===
 // userId 파라미터: 테스트 종목 거래 권한 확인용
 async function isActiveSymbol(symbol, userId = null) {
   const normalized = symbol.toUpperCase().trim();
@@ -117,13 +117,13 @@ async function isActiveSymbol(symbol, userId = null) {
   }
 
   // blocked:symbols 체크 (Valkey Set) - DynamoDB 캐시보다 먼저 실행하여 즉시 차단
-  // 상장폐지 진행 중인 종목은 2분 symbolCache TTL 관계없이 즉시 거부
+  // 상장폐지 또는 거래 중단된 종목은 symbolCache TTL 관계없이 즉시 거부
   if (valkey) {
     try {
       const isBlocked = await valkey.sismember('blocked:symbols', normalized);
       if (isBlocked) {
         console.log(`[SymbolCheck] Blocked symbol rejected: ${normalized}`);
-        return { valid: false, error: 'SYMBOL_BLOCKED', message: `해당 종목은 상장폐지 진행 중이므로 거래할 수 없습니다 (${normalized})` };
+        return { valid: false, error: 'SYMBOL_BLOCKED', message: `해당 종목은 현재 거래가 중단되었습니다 (${normalized})` };
       }
     } catch (e) {
       // Valkey 장애 시 fail-open: DynamoDB 캐시 방식으로 진행

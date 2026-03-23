@@ -7,6 +7,7 @@
  * - GET /symbols/{symbol} - 개별 종목 상세 (공개)
  * - POST /symbols (action=listing) - 신규 종목 등록 (관리자)
  * - POST /symbols (action=activate) - 종목 활성화 (관리자)
+ * - POST /symbols (action=deactivate) - 종목 비활성화/일시정지 (관리자)
  * - POST /symbols (action=approve) - 크리에이터 승인 + IPO 생성 (관리자)
  * - POST /symbols (action=reject) - 크리에이터 거절 (관리자)
  * - POST /symbols (action=restore) - 삭제된 종목 복원 (관리자)
@@ -307,12 +308,17 @@ export const handler = async (event) => {
           const opPipe = operatingCache.pipeline();
           const depthPipe = depthCache.pipeline();
           opPipe.del('active:symbols');
+          opPipe.del('subscribed:symbols');
+          // Note: blocked:symbols는 SUSPENDED 종목만 재구성 (DELISTING은 Phase1에서 관리)
           let syncedCount = 0;
+          let subscribedCount = 0;
+          let blockedCount = 0;
 
           for (const i of Items) {
             if (deletedSet.has(i.symbol)) continue;
             if (i.status === 'ACTIVE') {
               opPipe.sadd('active:symbols', i.symbol);
+              opPipe.sadd('subscribed:symbols', i.symbol);
               depthPipe.set(`ticker:${i.symbol}`, JSON.stringify({
                 symbol: i.symbol,
                 price: i.listingPrice || 0,
@@ -320,10 +326,16 @@ export const handler = async (event) => {
                 volume: 0
               }));
               syncedCount++;
+            } else if (i.status === 'PENDING') {
+              opPipe.sadd('subscribed:symbols', i.symbol);
+              subscribedCount++;
+            } else if (i.status === 'SUSPENDED') {
+              opPipe.sadd('blocked:symbols', i.symbol);
+              blockedCount++;
             }
           }
           await Promise.all([opPipe.exec(), depthPipe.exec()]);
-          return ok({ synced: syncedCount, skippedDeleted: deletedSymbols.length });
+          return ok({ synced: syncedCount, subscribed: subscribedCount, blocked: blockedCount, skippedDeleted: deletedSymbols.length });
         }
         return ok({ synced: 0 });
       }
@@ -669,6 +681,7 @@ export const handler = async (event) => {
         if (Item.status === 'ACTIVE') return err(400, `Symbol ${sym} is already active`);
 
         const now = new Date().toISOString();
+        const prevStatus = Item.status;
 
         await dynamodb.send(new UpdateCommand({
           TableName: SYMBOLS_TABLE,
@@ -678,8 +691,20 @@ export const handler = async (event) => {
           ExpressionAttributeValues: { ':status': 'ACTIVE', ':updatedAt': now }
         }));
 
-        await operatingCache.sadd('subscribed:symbols', sym);
-        await operatingCache.sadd('active:symbols', sym);
+        try {
+          await operatingCache.sadd('subscribed:symbols', sym);
+          await operatingCache.sadd('active:symbols', sym);
+        } catch (valkeyErr) {
+          console.error(`[ACTIVATE] Valkey failed, rolling back DynamoDB: ${valkeyErr.message}`);
+          await dynamodb.send(new UpdateCommand({
+            TableName: SYMBOLS_TABLE,
+            Key: { symbol: sym },
+            UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':status': prevStatus, ':updatedAt': now }
+          }));
+          return err(500, `Failed to activate: Valkey error (rolled back)`);
+        }
 
         // 랭킹 Sorted Set 초기 점수 (신규 종목 즉시 노출)
         try {
@@ -695,6 +720,66 @@ export const handler = async (event) => {
         }
 
         return ok({ success: true, symbol: sym, status: 'ACTIVE', message: `Symbol ${sym} activated successfully` });
+      }
+
+      // deactivate - 종목 비활성화 (일시정지)
+      if (action === 'deactivate') {
+        const adminCheck = await checkAdmin(event);
+        if (!adminCheck.authorized) return adminCheck.response;
+
+        const { symbol } = b;
+        if (!symbol || typeof symbol !== 'string') return err(400, 'symbol is required');
+        if (!validateSymbol(symbol)) return err(400, 'Invalid symbol format');
+
+        const sym = symbol.toUpperCase().trim();
+
+        const { Item } = await dynamodb.send(new GetCommand({ TableName: SYMBOLS_TABLE, Key: { symbol: sym } }));
+        if (!Item) return err(404, `Symbol ${sym} not found`);
+        if (Item.status === 'SUSPENDED') return err(400, `Symbol ${sym} is already suspended`);
+        if (Item.status === 'DELISTING') return err(400, `Symbol ${sym} is being delisted`);
+
+        const now = new Date().toISOString();
+        const prevStatus = Item.status;
+
+        // DynamoDB first (source of truth)
+        await dynamodb.send(new UpdateCommand({
+          TableName: SYMBOLS_TABLE,
+          Key: { symbol: sym },
+          UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':status': 'SUSPENDED', ':updatedAt': now }
+        }));
+
+        try {
+          await Promise.all([
+            operatingCache.srem('active:symbols', sym),
+            operatingCache.srem('subscribed:symbols', sym),
+            operatingCache.sadd('blocked:symbols', sym),
+          ]);
+        } catch (valkeyErr) {
+          // Valkey 실패 시 DynamoDB 롤백
+          console.error(`[DEACTIVATE] Valkey failed, rolling back DynamoDB: ${valkeyErr.message}`);
+          await dynamodb.send(new UpdateCommand({
+            TableName: SYMBOLS_TABLE,
+            Key: { symbol: sym },
+            UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':status': prevStatus, ':updatedAt': now }
+          }));
+          return err(500, `Failed to deactivate: Valkey error (rolled back)`);
+        }
+
+        // MM 중지
+        try {
+          await operatingCache.publish('mm:control', JSON.stringify({ action: 'stop', symbol: sym, timestamp: Date.now() }));
+          await operatingCache.srem('mm:all:symbols', sym);
+          await operatingCache.srem('mm:running:symbols', sym);
+        } catch (mmErr) {
+          console.warn(`[DEACTIVATE] MM stop failed (non-fatal): ${mmErr.message}`);
+        }
+
+        console.log(`[DEACTIVATE] Symbol ${sym} suspended (was ${prevStatus})`);
+        return ok({ success: true, symbol: sym, status: 'SUSPENDED', message: `Symbol ${sym} has been suspended` });
       }
 
       // approve - 크리에이터 승인 + IPO 생성
@@ -797,8 +882,7 @@ export const handler = async (event) => {
         };
 
         await dynamodb.send(new PutCommand({ TableName: SYMBOLS_TABLE, Item: newSymbol }));
-        // PENDING이지만 종목 목록에 노출 + Streamer가 실시간 폴링하도록 추가
-        await operatingCache.sadd('active:symbols', symbol.toUpperCase());
+        // PENDING 상태이므로 active:symbols에는 추가하지 않음 (subscribed만 추가하여 Streamer 구독)
         await operatingCache.sadd('subscribed:symbols', symbol.toUpperCase());
 
         // IPO 알림 레코드 생성 (요청자에게 포인트 보상 알림)
@@ -982,6 +1066,22 @@ export const handler = async (event) => {
           await operatingCache.srem('blocked:symbols', job.symbol);
         } catch (e) { console.warn('Valkey force-complete warning:', e.message); }
 
+        // symbols 테이블 레코드 삭제 (이미 상장폐지 강제완료이므로)
+        try {
+          await dynamodb.send(new UpdateCommand({
+            TableName: SYMBOLS_TABLE,
+            Key: { symbol: job.symbol },
+            UpdateExpression: 'SET #status = :status, updatedAt = :now',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':status': 'DELISTED', ':now': new Date().toISOString() }
+          }));
+          // active:symbols에서도 제거
+          await operatingCache.srem('active:symbols', job.symbol);
+          await operatingCache.srem('subscribed:symbols', job.symbol);
+        } catch (symErr) {
+          console.warn(`[FORCE-COMPLETE] symbols table update failed (non-fatal): ${symErr.message}`);
+        }
+
         // delist-jobs 업데이트
         const fcNow = new Date().toISOString();
         await dynamodb.send(new UpdateCommand({
@@ -1043,13 +1143,7 @@ export const handler = async (event) => {
         exprAttrNames['#status'] = 'status';
         exprAttrValues[':status'] = b.status;
 
-        if (b.status === 'ACTIVE') {
-          await operatingCache.sadd('subscribed:symbols', sym);
-          await operatingCache.sadd('active:symbols', sym);
-        } else if (b.status !== 'ACTIVE' && Item.status === 'ACTIVE') {
-          await operatingCache.srem('subscribed:symbols', sym);
-          await operatingCache.srem('active:symbols', sym);
-        }
+        // Valkey 상태 동기화 (DynamoDB 업데이트 후 아래에서 실행)
       }
 
       await dynamodb.send(new UpdateCommand({
@@ -1059,6 +1153,26 @@ export const handler = async (event) => {
         ExpressionAttributeNames: Object.keys(exprAttrNames).length > 0 ? exprAttrNames : undefined,
         ExpressionAttributeValues: exprAttrValues
       }));
+
+      // Valkey 상태 동기화 (PUT에서 status 변경 시)
+      if (b.status !== undefined) {
+        const prevStatus = Item.status;
+        try {
+          if (b.status === 'ACTIVE') {
+            await operatingCache.sadd('subscribed:symbols', sym);
+            await operatingCache.sadd('active:symbols', sym);
+            await operatingCache.srem('blocked:symbols', sym);
+          } else if (prevStatus === 'ACTIVE' || prevStatus === 'PENDING') {
+            await operatingCache.srem('subscribed:symbols', sym);
+            await operatingCache.srem('active:symbols', sym);
+            if (b.status === 'SUSPENDED') {
+              await operatingCache.sadd('blocked:symbols', sym);
+            }
+          }
+        } catch (valkeyErr) {
+          console.warn(`[PUT] Valkey sync failed (DynamoDB already updated): ${valkeyErr.message}`);
+        }
+      }
 
       if (b.listingPrice !== undefined) {
         await operatingCache.set(`symbol:${sym}:listingPrice`, b.listingPrice.toString());
@@ -1157,6 +1271,15 @@ export const handler = async (event) => {
         console.log(`[DELETE] Ranking entries removed for ${sym}`);
       } catch (rankErr) {
         console.warn(`[DELETE] Ranking cleanup failed (non-fatal): ${rankErr.message}`);
+      }
+
+      // 3.9. 즉시 blocked:symbols 추가 (Step Functions 실패해도 주문 차단)
+      try {
+        await operatingCache.sadd('blocked:symbols', sym);
+        await operatingCache.srem('active:symbols', sym);
+        console.log(`[DELETE] Immediately blocked ${sym} + removed from active:symbols`);
+      } catch (blockErr) {
+        console.warn(`[DELETE] Immediate block failed (continuing): ${blockErr.message}`);
       }
 
       // 4. Step Functions 실행 시작
