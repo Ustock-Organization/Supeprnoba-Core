@@ -10,9 +10,9 @@
 
 | 저장소 | 경로 | 기술 스택 | 역할 |
 |--------|------|----------|------|
-| **Supernoba-Core_Old** | `C:\develop\Supernoba-Core_Old` | C++17, Node.js, Lambda | 매칭 엔진, 스트리밍, Lambda 함수 |
-| **Supernoba-front** | `C:\develop\Supernoba-front` | React 18, Redux Toolkit | 웹/모바일 프론트엔드 |
-| **Supernoba-back** | `C:\develop\Supernoba-back` | C++17 | Lambda 통합 프로세서 (stock-processor) |
+| **Supernoba-Core_Old** | `C:\develop\supernoba\Supernoba-Core_Old` | C++17, Node.js, Lambda | 매칭 엔진, 스트리밍, Lambda 함수 |
+| **Supernoba-front** | `C:\develop\supernoba\Supernoba-front` | React 18, Redux Toolkit | 웹/모바일 프론트엔드 |
+| **Supernoba-back** | `C:\develop\supernoba\Supernoba-back` | C++17 | Lambda 통합 프로세서 (stock-processor) |
 
 ---
 
