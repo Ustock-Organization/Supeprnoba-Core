@@ -264,9 +264,39 @@ int main(int argc, char* argv[]) {
 
             checkpoint_manager = std::make_unique<CheckpointManager>(&checkpoint_redis, cp_config);
 
-            // 재시작 시 stale checkpoint에서 과거 레코드를 재생하는 문제 방지
-            // 스냅샷 + DynamoDB 복원으로 주문을 복구하므로 Kinesis replay 불필요
-            if (clear_checkpoints_on_start) {
+            // === 복구 모드 ===
+            // replay(AWS 기본): 스냅샷과 정합한 앵커(engine:snapshot:anchor)에서 Kinesis 재생.
+            //   앵커는 스냅샷 저장 직전의 샤드 위치라 anchor ≤ snapshot 커버리지 → 유실 0,
+            //   [anchor, snapshot] 중복분은 엔진 dedup(processed_orders_)이 흡수.
+            //   이로써 스냅샷~크래시 사이 10초 유실창과 시간우선순위 소실이 원리적으로 닫힘.
+            // clear(레거시): 체크포인트 삭제 후 LATEST — 다운타임 유입분 유실.
+            const std::string recovery_mode = Config::get("RECOVERY_MODE", "replay");
+            if (recovery_mode == "replay") {
+                checkpoint_manager->clearAllCheckpoints();  // 스테일 raw 체크포인트 제거
+                std::string anchor_json;
+                if (backup_connected) {
+                    auto a = backup_redis.get("engine:snapshot:anchor");
+                    if (a.has_value()) anchor_json = a.value();
+                }
+                if (!anchor_json.empty()) {
+                    try {
+                        auto anchor = nlohmann::json::parse(anchor_json);
+                        int seeded = 0;
+                        for (auto it = anchor.begin(); it != anchor.end(); ++it) {
+                            checkpoint_manager->checkpointImmediate(
+                                it.key(), it.value().get<std::string>());
+                            ++seeded;
+                        }
+                        Logger::info("RECOVERY=replay: seeded", seeded,
+                                     "shard checkpoints from snapshot anchor");
+                    } catch (const std::exception& e) {
+                        Logger::warn("RECOVERY=replay: anchor parse failed, LATEST fallback:",
+                                     e.what());
+                    }
+                } else {
+                    Logger::info("RECOVERY=replay: no anchor (first run) - shards start from LATEST");
+                }
+            } else if (clear_checkpoints_on_start) {
                 checkpoint_manager->clearAllCheckpoints();
                 Logger::info("Cleared stale checkpoints - all shards will start from LATEST");
             }
@@ -355,6 +385,11 @@ int main(int argc, char* argv[]) {
             if (backup_connected &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_snapshot).count() >= 10) {
 
+                // 앵커: 스냅샷 "직전"의 샤드 위치를 먼저 캡처.
+                // 스냅샷은 이 위치 이후 레코드까지 반영하므로 anchor ≤ snapshot 커버리지가 보장되어,
+                // 복구 시 재생이 유실 없이(중복은 dedup 흡수) 이어진다.
+                auto positions = consumer.getShardPositions();
+
                 auto symbols = engine.getAllSymbols();
                 for (const auto& symbol : symbols) {
                     auto snapshot = engine.snapshotOrderBook(symbol);
@@ -362,8 +397,17 @@ int main(int argc, char* argv[]) {
                         backup_redis.saveSnapshot(symbol, snapshot);
                     }
                 }
+
+                // 앵커 영속화 (스냅샷 이후 — 스냅샷이 먼저 안전하게 저장된 뒤 앵커 갱신)
+                if (!positions.empty()) {
+                    nlohmann::json anchor;
+                    for (const auto& [shard, seq] : positions) anchor[shard] = seq;
+                    backup_redis.set("engine:snapshot:anchor", anchor.dump());
+                }
+
                 last_snapshot = now;
-                Logger::debug("Snapshots saved for", symbols.size(), "symbols");
+                Logger::debug("Snapshots saved for", symbols.size(), "symbols (anchor:",
+                              positions.size(), "shards)");
             }
 
             // 30초마다 메트릭 로깅

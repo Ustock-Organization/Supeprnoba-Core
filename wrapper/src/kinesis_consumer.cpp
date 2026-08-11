@@ -210,6 +210,12 @@ void KinesisConsumer::stop() {
     Logger::info("KinesisConsumer stopped gracefully, records processed:", records_processed_.load());
 }
 
+std::map<std::string, std::string> KinesisConsumer::getShardPositions() const {
+    std::lock_guard<std::mutex> seq_lock(seq_mutex_);
+    return std::map<std::string, std::string>(
+        last_sequence_numbers_.begin(), last_sequence_numbers_.end());
+}
+
 void KinesisConsumer::restart() {
     Logger::warn("KinesisConsumer restarting...");
     stop();
@@ -439,7 +445,10 @@ void KinesisConsumer::consumeLoop() {
                         ++records_processed_;
 
                         // 시퀀스 번호 저장 (체크포인팅용)
-                        last_sequence_numbers_[shard_id] = sequence_number;
+                        {
+                            std::lock_guard<std::mutex> seq_lock(seq_mutex_);
+                            last_sequence_numbers_[shard_id] = sequence_number;
+                        }
 
                         // 체크포인트 저장
                         if (checkpoint_enabled_ && checkpoint_manager_) {
