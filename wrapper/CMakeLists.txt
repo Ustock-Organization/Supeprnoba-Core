@@ -64,6 +64,7 @@ set(SOURCES
     src/ranking_manager.cpp
     src/checkpoint_manager.cpp
     src/notification_client.cpp
+    src/local_journal.cpp
 )
 
 # 메인 실행파일
