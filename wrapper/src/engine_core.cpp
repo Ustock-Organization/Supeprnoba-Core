@@ -15,7 +15,58 @@ EngineCore::EngineCore(MarketDataHandler* handler, RedisClient* redis)
     Logger::info("EngineCore initialized");
 }
 
-OrderPtr EngineCore::findOrder(const std::string& symbol, 
+bool EngineCore::isMarketMaker(const std::string& user_id) {
+    // MM 계정은 mm-buyer/mm-seller 등 두 ID로 의도적 자전체결을 하므로 STP 면제.
+    // restoreOrderBook의 MM 판별과 동일 기준(단일 진실원천 유지 목적).
+    return user_id.rfind("mm-", 0) == 0 || user_id.rfind("mm_", 0) == 0;
+}
+
+int EngineCore::applySelfTradePrevention(const std::string& symbol,
+                                          const OrderPtr& aggressor) {
+    // 락(rw_mutex_) 보유 상태에서 호출됨.
+    // MM aggressor는 면제 — 의도적 유동성 공급.
+    if (isMarketMaker(aggressor->user_id())) return 0;
+
+    auto book_it = books_.find(symbol);
+    auto map_it = order_maps_.find(symbol);
+    if (book_it == books_.end() || map_it == order_maps_.end()) return 0;
+
+    const std::string& uid = aggressor->user_id();
+    const bool agg_buy = aggressor->is_buy();
+    const liquibook::book::Price agg_price = aggressor->price();
+    // 시장가(price==0)는 반대편 전 구간과 교차 가능 → 모든 동일 유저 resting을 대상.
+    const bool agg_is_market = (agg_price == 0);
+
+    // iteration 중 erase 방지 위해 대상을 먼저 수집.
+    std::vector<OrderPtr> to_cancel;
+    for (const auto& [id, resting] : map_it->second) {
+        if (resting->open_qty() == 0) continue;
+        if (resting->user_id() != uid) continue;      // 동일 유저만
+        if (resting->is_buy() == agg_buy) continue;    // 반대 방향만
+        if (isMarketMaker(resting->user_id())) continue;
+
+        // 교차 판정: BUY aggressor는 price >= resting(SELL) 이면 체결,
+        //            SELL aggressor는 price <= resting(BUY) 이면 체결.
+        bool crosses = agg_is_market ||
+            (agg_buy ? agg_price >= resting->price()
+                     : agg_price <= resting->price());
+        if (crosses) to_cancel.push_back(resting);
+    }
+
+    for (const auto& resting : to_cancel) {
+        // cancel-oldest: resting 취소 → on_cancel 발행(프로세서가 잔고 락 해제).
+        book_it->second->cancel(resting);
+        book_it->second->perform_callbacks();
+        map_it->second.erase(resting->order_id());
+        ++self_trades_prevented_;
+        Logger::warn("STP: cancelled resting order", resting->order_id(),
+                     "(user", uid, "symbol", symbol,
+                     ") to prevent self-trade with", aggressor->order_id());
+    }
+    return static_cast<int>(to_cancel.size());
+}
+
+OrderPtr EngineCore::findOrder(const std::string& symbol,
                                 const std::string& order_id) {
     auto sym_it = order_maps_.find(symbol);
     if (sym_it == order_maps_.end()) return nullptr;
@@ -85,6 +136,10 @@ bool EngineCore::addOrder(OrderPtr order) {
             Logger::warn("Order rejected (blocked/deleted symbol):", order_id, symbol);
             return false;
         }
+
+        // Self-Trade Prevention (cancel-oldest): 동일 유저의 반대편 resting 주문을
+        // aggressor 추가 전에 취소해 자전체결을 원천 차단. MM 계정은 면제.
+        applySelfTradePrevention(symbol, order);
 
         // 주문 맵에 저장
         order_maps_[symbol][order_id] = order;
