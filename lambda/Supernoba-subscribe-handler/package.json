@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-subscribe-handler",
+  "version": "1.0.0",
+  "description": "Handles WebSocket subscribe and auth actions",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.3.2"
+  }
+}

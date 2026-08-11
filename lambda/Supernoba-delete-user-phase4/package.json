@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-delete-user-phase4",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Phase 4: Anonymize RDS trade_history for deleted users",
+  "main": "index.mjs",
+  "dependencies": {
+  }
+}

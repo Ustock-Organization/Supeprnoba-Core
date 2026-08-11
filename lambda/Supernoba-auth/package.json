@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-auth",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Unified authentication Lambda (X OAuth + User Init)",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/s3-request-presigner": "^3.624.0"
+  }
+}

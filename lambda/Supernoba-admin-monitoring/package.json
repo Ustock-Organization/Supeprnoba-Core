@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-admin-monitoring",
+  "version": "1.0.0",
+  "description": "Supernoba Admin - Real-time Monitoring Lambda",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "ioredis": "^5.3.2"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "supernoba-order-router",
+  "version": "1.0.0",
+  "description": "Order Router with Kinesis and DynamoDB",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "deploy": "aws lambda update-function-code --function-name Supernoba-order-router --zip-file fileb://function.zip"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.12"
+  }
+}

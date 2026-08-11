@@ -1,0 +1,147 @@
+{
+  "Comment": "Supernoba Delisting State Machine - Orchestrates 4-phase symbol delisting",
+  "StartAt": "UpdateJobStarted",
+  "States": {
+    "UpdateJobStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "supernoba-delist-jobs",
+        "Key": {
+          "job_id": { "S.$": "$.job_id" }
+        },
+        "UpdateExpression": "SET #s = :s, updated_at = :now",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "IN_PROGRESS" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "Phase1_BlockOrders"
+    },
+    "Phase1_BlockOrders": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase1",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "symbol.$": "$.symbol"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase1Result",
+      "Next": "Phase2_EngineCleanup"
+    },
+    "Phase2_EngineCleanup": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase2",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "symbol.$": "$.symbol",
+        "phase": "ORDER_BLOCKED"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "EngineUnavailable"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase2Result",
+      "Next": "Phase3_DataCleanup"
+    },
+    "Phase3_DataCleanup": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase3",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "symbol.$": "$.symbol",
+        "phase": "ENGINE_CLEANED"
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase3Result",
+      "Next": "Phase4_Verify"
+    },
+    "Phase4_Verify": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase4",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "symbol.$": "$.symbol",
+        "phase": "USER_DATA_CLEANED"
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "supernoba-delist-jobs",
+        "Key": {
+          "job_id": { "S.$": "$.job_id" }
+        },
+        "UpdateExpression": "SET #s = :s, #e = :e, updated_at = :now",
+        "ExpressionAttributeNames": { "#s": "status", "#e": "error" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "FAILED" },
+          ":e": { "S.$": "States.Format('Phase failed: {}', $.error.Cause)" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "supernoba-delisting-phase1",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Delisting Phase 1: Block orders for symbol (Valkey + DynamoDB)",
+  "main": "index.mjs"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-stripe-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Stripe Webhook receiver - payment/subscription event processing with idempotency",
+  "dependencies": {
+    "stripe": "^17.0.0"
+  }
+}

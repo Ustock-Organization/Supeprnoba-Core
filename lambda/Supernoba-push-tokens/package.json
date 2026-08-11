@@ -1,0 +1,6 @@
+{
+  "name": "supernoba-push-tokens",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Push notification token registration API"
+}

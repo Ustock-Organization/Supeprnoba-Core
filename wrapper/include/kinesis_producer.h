@@ -20,7 +20,10 @@ public:
                      const std::string& buyer_id,
                      const std::string& seller_id,
                      uint64_t qty,
-                     uint64_t price) override;
+                     uint64_t price,
+                     bool buyer_fully_filled = false,
+                     bool seller_fully_filled = false,
+                     bool buyer_is_maker = false) override;
     
     // 거래 이벤트 발행
     void publishTrade(const std::string& symbol,
@@ -36,7 +39,11 @@ public:
                             const std::string& order_id,
                             const std::string& user_id,
                             const std::string& status,
-                            const std::string& reason = "") override;
+                            const std::string& reason = "",
+                            uint64_t price = 0,
+                            uint64_t quantity = 0,
+                            bool is_buy = true,
+                            const std::string& order_type = "") override;
     
     void flush(int timeout_ms = 1000) override;
     
@@ -44,7 +51,11 @@ private:
     void produce(const std::string& stream_name,
                  const std::string& partition_key,
                  const std::string& data);
-    
+
+    void saveToWAL(const std::string& stream_name,
+                   const std::string& partition_key,
+                   const std::string& data);
+
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::string fills_stream_;
     std::string trades_stream_;

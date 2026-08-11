@@ -1,0 +1,8 @@
+{
+  "name": "supernoba-delisting-phase4",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Delisting Phase 4: Final verification (Valkey, DynamoDB, RDS checks)",
+  "main": "index.mjs",
+  "dependencies": {}
+}

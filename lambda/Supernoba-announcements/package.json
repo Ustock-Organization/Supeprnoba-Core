@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-announcements",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/s3-request-presigner": "^3.624.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-admin-payments",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Admin payment management API - listing, stats, refunds, subscriptions",
+  "dependencies": {
+    "stripe": "^17.0.0"
+  }
+}

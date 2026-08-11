@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-admin-stats",
+  "version": "1.0.0",
+  "description": "Supernoba Admin - Trading Statistics Lambda",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "ioredis": "^5.3.2"
+  }
+}

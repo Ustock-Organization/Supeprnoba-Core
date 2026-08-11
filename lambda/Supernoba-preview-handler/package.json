@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-preview-handler",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  }
+}

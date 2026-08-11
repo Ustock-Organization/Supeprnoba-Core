@@ -1,0 +1,12 @@
+{
+  "name": "supernoba-delisting-phase2",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Delisting Phase 2: Engine cleanup (gRPC CancelAllOrders + RemoveOrderBook, Valkey snapshot)",
+  "main": "index.mjs",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.4",
+    "@grpc/proto-loader": "^0.7.15",
+    "ioredis": "^5.4.1"
+  }
+}

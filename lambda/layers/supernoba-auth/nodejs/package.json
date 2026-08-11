@@ -1,0 +1,20 @@
+{
+  "name": "supernoba-auth-layer",
+  "version": "1.0.1",
+  "description": "Supernoba Authentication Layer - JWT verification for Lambda functions",
+  "type": "module",
+  "main": "verifyAuth.mjs",
+  "exports": {
+    ".": "./verifyAuth.mjs",
+    "./verifyAuth": "./verifyAuth.mjs"
+  },
+  "keywords": [
+    "supernoba",
+    "auth",
+    "jwt",
+    "lambda",
+    "layer"
+  ],
+  "author": "Supernoba",
+  "license": "MIT"
+}

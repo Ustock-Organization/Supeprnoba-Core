@@ -1,0 +1,16 @@
+{
+  "name": "candle-aggregator",
+  "version": "1.0.0",
+  "description": "Real-time candle aggregator for multiple timeframes",
+  "dependencies": [
+    "nlohmann-json",
+    "hiredis",
+    "curl",
+    "openssl",
+    "libpq",
+    {
+      "name": "aws-sdk-cpp",
+      "features": ["secretsmanager"]
+    }
+  ]
+}

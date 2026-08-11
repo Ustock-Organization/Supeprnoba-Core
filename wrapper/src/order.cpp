@@ -21,8 +21,11 @@ std::shared_ptr<Order> Order::fromJson(const nlohmann::json& j) {
     
     order->price_ = j.value("price", 0);
     order->order_qty_ = j.value("quantity", 0);
+    order->filled_qty_ = j.value("filled_qty", (uint64_t)0);
+    order->filled_cost_ = j.value("filled_cost", (uint64_t)0);
     order->stop_price_ = j.value("stop_price", 0);
-    
+    order->order_type_ = j.value("order_type", "LIMIT");
+
     // Conditions 파싱
     if (j.contains("conditions")) {
         auto& cond = j["conditions"];
@@ -59,6 +62,7 @@ nlohmann::json Order::toJson() const {
         {"all_or_none", all_or_none()},
         {"immediate_or_cancel", immediate_or_cancel()}
     };
+    j["order_type"] = order_type_;
     j["timestamp"] = timestamp_;
     return j;
 }

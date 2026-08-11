@@ -32,27 +32,6 @@ void DepthBroadcaster::stop() {
     std::cout << "DepthBroadcaster stopped" << std::endl;
 }
 
-void DepthBroadcaster::subscribe(const std::string& connection_id, const std::string& symbol) {
-    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-    subscriptions_[symbol].insert(connection_id);
-    std::cout << "Subscribed " << connection_id << " to " << symbol << std::endl;
-}
-
-void DepthBroadcaster::unsubscribe(const std::string& connection_id, const std::string& symbol) {
-    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-    auto it = subscriptions_.find(symbol);
-    if (it != subscriptions_.end()) {
-        it->second.erase(connection_id);
-    }
-}
-
-void DepthBroadcaster::unsubscribeAll(const std::string& connection_id) {
-    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-    for (auto& [symbol, subscribers] : subscriptions_) {
-        subscribers.erase(connection_id);
-    }
-}
-
 void DepthBroadcaster::pollingLoop() {
     while (running_) {
         // 구독 목록 복사

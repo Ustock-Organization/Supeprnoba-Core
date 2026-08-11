@@ -1,0 +1,11 @@
+{
+  "name": "supernoba-admin-users",
+  "version": "1.0.0",
+  "description": "Supernoba Admin - User Management Lambda",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-sfn": "^3.624.0",
+    "ioredis": "^5.3.2"
+  }
+}

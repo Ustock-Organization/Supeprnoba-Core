@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-apple-iap",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Apple IAP verification + App Store Server Notifications v2 with JWS local validation",
+  "dependencies": {
+    "jose": "^5.9.0"
+  }
+}

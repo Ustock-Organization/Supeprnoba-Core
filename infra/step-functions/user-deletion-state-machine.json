@@ -1,0 +1,199 @@
+{
+  "Comment": "Supernoba User Deletion State Machine - Orchestrates 6-phase user deletion",
+  "StartAt": "UpdateJobStarted",
+  "States": {
+    "UpdateJobStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "supernoba-delete-user-jobs",
+        "Key": {
+          "job_id": { "S.$": "$.job_id" }
+        },
+        "UpdateExpression": "SET #s = :s, updated_at = :now",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "IN_PROGRESS" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "Phase1_BlockUser"
+    },
+    "Phase1_BlockUser": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase1",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase1Result",
+      "Next": "Phase2_CancelOrders"
+    },
+    "Phase2_CancelOrders": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase2",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id",
+        "phase": "BLOCK_USER"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase2Result",
+      "Next": "Phase3_DeleteDynamoDB"
+    },
+    "Phase3_DeleteDynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase3",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id",
+        "phase": "CANCEL_ORDERS"
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase3Result",
+      "Next": "Phase4_AnonymizeRDS"
+    },
+    "Phase4_AnonymizeRDS": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase4",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id"
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase4Result",
+      "Next": "Phase5_DeleteCognito"
+    },
+    "Phase5_DeleteCognito": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase5",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.phase5Result",
+      "Next": "Phase6_Finalize"
+    },
+    "Phase6_Finalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delete-user-phase6",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_id.$": "$.user_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "supernoba-delete-user-jobs",
+        "Key": {
+          "job_id": { "S.$": "$.job_id" }
+        },
+        "UpdateExpression": "SET #s = :s, #e = :e, updated_at = :now",
+        "ExpressionAttributeNames": { "#s": "status", "#e": "error" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "FAILED" },
+          ":e": { "S.$": "States.Format('Phase failed: {}', $.error.Cause)" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "End": true
+    }
+  }
+}

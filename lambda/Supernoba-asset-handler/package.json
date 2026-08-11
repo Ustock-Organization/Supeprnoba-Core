@@ -1,0 +1,7 @@
+{
+  "name": "supernoba-asset-handler",
+  "version": "1.0.0",
+  "description": "Lambda for fetching user assets and history",
+  "main": "index.mjs",
+  "type": "module"
+}

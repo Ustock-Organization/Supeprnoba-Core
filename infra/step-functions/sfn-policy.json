@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeDelistingLambdas",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase1",
+        "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase2",
+        "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase3",
+        "arn:aws:lambda:ap-northeast-2:264520158196:function:Supernoba-delisting-phase4"
+      ]
+    },
+    {
+      "Sid": "UpdateDelistJobs",
+      "Effect": "Allow",
+      "Action": "dynamodb:UpdateItem",
+      "Resource": "arn:aws:dynamodb:ap-northeast-2:264520158196:table/supernoba-delist-jobs"
+    }
+  ]
+}

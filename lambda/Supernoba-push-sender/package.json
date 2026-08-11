@@ -1,0 +1,6 @@
+{
+  "name": "supernoba-push-sender",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "APNs push notification sender triggered by DynamoDB Streams"
+}

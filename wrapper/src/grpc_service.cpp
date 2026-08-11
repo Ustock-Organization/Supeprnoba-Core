@@ -90,6 +90,72 @@ grpc::Status GrpcServiceImpl::HealthCheck(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GrpcServiceImpl::CancelAllOrders(
+    grpc::ServerContext* context,
+    const CancelAllRequest* request,
+    CancelAllResponse* response) {
+
+    const std::string& symbol = request->symbol();
+
+    if (symbol.empty()) {
+        response->set_success(false);
+        response->set_error("symbol is required");
+        return grpc::Status::OK;
+    }
+
+    Logger::info("gRPC CancelAllOrders:", symbol);
+
+    try {
+        auto result = engine_->cancelAllOrders(symbol);
+        response->set_success(true);
+        response->set_cancelled_count(result.cancelled_count);
+        for (const auto& id : result.failed_order_ids) {
+            response->add_failed_order_ids(id);
+        }
+        Logger::info("gRPC CancelAllOrders completed:", symbol,
+                     "cancelled:", result.cancelled_count);
+    } catch (const std::exception& e) {
+        response->set_success(false);
+        response->set_error(e.what());
+        Logger::error("gRPC CancelAllOrders failed:", symbol, e.what());
+    }
+
+    return grpc::Status::OK;
+}
+
+grpc::Status GrpcServiceImpl::CancelOrder(
+    grpc::ServerContext* context,
+    const CancelOrderRequest* request,
+    CancelOrderResponse* response) {
+
+    const std::string& symbol = request->symbol();
+    const std::string& order_id = request->order_id();
+
+    if (symbol.empty() || order_id.empty()) {
+        response->set_success(false);
+        response->set_error("symbol and order_id are required");
+        return grpc::Status::OK;
+    }
+
+    Logger::info("gRPC CancelOrder:", symbol, order_id);
+
+    try {
+        bool cancelled = engine_->cancelOrder(symbol, order_id);
+        response->set_success(cancelled);
+        if (!cancelled) {
+            response->set_error("Order not found or already cancelled");
+        }
+        Logger::info("gRPC CancelOrder result:", symbol, order_id,
+                     cancelled ? "success" : "not found");
+    } catch (const std::exception& e) {
+        response->set_success(false);
+        response->set_error(e.what());
+        Logger::error("gRPC CancelOrder failed:", symbol, order_id, e.what());
+    }
+
+    return grpc::Status::OK;
+}
+
 // GrpcService implementation
 GrpcService::GrpcService(EngineCore* engine, RedisClient* redis)
     : service_(std::make_unique<GrpcServiceImpl>(engine, redis)) {

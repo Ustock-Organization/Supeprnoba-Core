@@ -1,0 +1,8 @@
+{
+  "name": "supernoba-pg-layer",
+  "version": "1.0.0",
+  "description": "PostgreSQL client layer for Supernoba Lambda functions",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

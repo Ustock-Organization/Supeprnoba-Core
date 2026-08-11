@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-approval-handler",
+  "version": "1.0.0",
+  "description": "Lambda for approving creator requests and creating symbols",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}

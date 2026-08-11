@@ -1,0 +1,251 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": "1",
+        "title": "Setup Test Environment for Supernoba Lambda Functions",
+        "description": "Create local testing environment with AWS SAM CLI, mock services (DynamoDB, Redis, PostgreSQL), and test data setup",
+        "details": "Install AWS SAM CLI, create samconfig.toml with local Docker emulation. Use LocalStack for DynamoDB/Redis/SQS emulation. Setup test PostgreSQL container with pgAdmin. Create initial test data: 5 symbols, 3 admin users, 2 regular users. Configure environment variables for all 3 Lambda functions.",
+        "testStrategy": "Verify SAM local invoke works for all functions. Check LocalStack services running: sam local start-api --port 3000. Confirm test data loaded via pgAdmin/DynamoDB console.",
+        "priority": "high",
+        "dependencies": [],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T16:51:32.784Z"
+      },
+      {
+        "id": "2",
+        "title": "Test Symbol-Admin Public APIs - GET /symbols endpoints",
+        "description": "Test public symbol list and detail retrieval without authentication",
+        "details": "Use curl or Postman: GET /symbols (expect 200 with list), GET /symbols/valid-symbol (200 with details), GET /symbols/invalid-symbol (404), GET /symbols?q=test (search param). Verify response format matches PRD expectations.",
+        "testStrategy": "sam local invoke SymbolAdminFunction -e events/get-symbols.json && sam local invoke SymbolAdminFunction -e events/get-symbol-detail.json. Assert status codes and response structure using pytest with Arrange-Act-Assert.",
+        "priority": "high",
+        "dependencies": [
+          "1"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T16:53:13.433Z"
+      },
+      {
+        "id": "3",
+        "title": "Test Symbol-Admin Symbol Registration and Activation",
+        "description": "Test POST /symbols with action=listing and action=activate requiring admin auth",
+        "details": "Mock admin JWT token. Test: valid listing (symbol 2-20 chars alphanumeric), duplicate symbol (409), missing fields (400), activate success with Redis active:symbols sync. Use moto.mock_dynamodb() for DynamoDB mocking.",
+        "testStrategy": "pytest with @pytest.fixture mock_dynamodb. Test cases: valid_registration(), duplicate_symbol(), invalid_symbol_length(), missing_required_fields(). Verify Redis key via redis-py.",
+        "priority": "high",
+        "dependencies": [
+          "1",
+          "2"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T16:58:50.120Z"
+      },
+      {
+        "id": "4",
+        "title": "Test Symbol-Admin Symbol Update and Delete Operations",
+        "description": "Test PUT /symbols/{symbol} and DELETE /symbols/{symbol} with Redis sync and SQS cleanup",
+        "details": "Test PUT updates with status change (verify Redis sync), DELETE adds to deleted:symbols Redis set and sends SQS message, POST restore from deleted state. Mock SQS with moto.mock_sqs().",
+        "testStrategy": "Integration test with LocalStack SQS. Verify: status updates in DB, Redis sets populated, SQS message queue length +1 after delete.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "3"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T16:59:31.739Z"
+      },
+      {
+        "id": "5",
+        "title": "Test Symbol-Admin Utility APIs - Sync and CleanChart",
+        "description": "Test POST /sync Redis synchronization and POST /cleanChart data cleanup",
+        "details": "POST /sync: verify active:symbols Redis set count matches DB. POST /cleanChart: verify PostgreSQL candle_history DELETE and Redis candle cache cleanup. Use testcontainers-python for PostgreSQL.",
+        "testStrategy": "Before/after counts: DB rows, Redis keys. sam local invoke with custom events. Assert candle_history table empty after cleanChart.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "4"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T16:59:31.891Z"
+      },
+      {
+        "id": "6",
+        "title": "Test Admin-Core Authentication API",
+        "description": "Test GET /auth admin permission check by userId and twitterUsername",
+        "details": "Test admin user (true), non-admin (false), invalid userId (false). Mock Cognito JWT verification. Test both lookup methods.",
+        "testStrategy": "Unit tests with mocked JWT decoder. Integration test with sam local invoke. Verify DynamoDB admin_users table queries.",
+        "priority": "high",
+        "dependencies": [
+          "1"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:00:31.104Z"
+      },
+      {
+        "id": "7",
+        "title": "Test Admin-Core User Management APIs",
+        "description": "Test GET /users list with pagination, search, status filter and GET /users/{userId} detail",
+        "details": "Test pagination (?page=1&limit=10), search (?q=username), status filter (?status=active). Detail includes wallets, orders, holdings nested objects.",
+        "testStrategy": "pytest with multiple query param combinations. Verify response pagination metadata and nested objects present.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:00:31.108Z"
+      },
+      {
+        "id": "8",
+        "title": "Test Admin-Core User Action APIs",
+        "description": "Test user suspend/unsuspend, setBalance, setHolding with audit logging",
+        "details": "POST suspend (Redis user:suspended key), unsuspend (key delete), setBalance (wallet update), setHolding (holdings table). Verify audit_log table entries.",
+        "testStrategy": "Before/after Redis key checks, DB table verification. Test audit log INSERT with correct timestamps and action details.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "7"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:00:31.112Z"
+      },
+      {
+        "id": "9",
+        "title": "Test Admin-Core Settings Management APIs",
+        "description": "Test site and tickerTape settings CRUD with validation and cache invalidation",
+        "details": "GET/PUT /settings/site (validate default symbol exists), GET/PUT /settings/tickerTape. Verify cache invalidation on Redis.",
+        "testStrategy": "Test invalid symbol setting returns 400. Verify Redis cache keys cleared after PUT. Check settings table updates.",
+        "priority": "medium",
+        "dependencies": [
+          "1"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:00:31.115Z"
+      },
+      {
+        "id": "10",
+        "title": "Test Admin-Core Alerts API",
+        "description": "Test GET /alerts retrieving ENGINE_ERRORS, MISSING_PRICE_DATA, MARKET_MAKER_RUNNING alerts",
+        "details": "Seed alerts table with test data for all 3 types. Verify pagination and filtering works.",
+        "testStrategy": "Verify specific alert types returned in response. Test empty alerts list scenario.",
+        "priority": "low",
+        "dependencies": [
+          "1",
+          "9"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:00:31.119Z"
+      },
+      {
+        "id": "11",
+        "title": "Test Auth X OAuth Initialization Flow",
+        "description": "Test GET /auth/x/init generating OAuth URL with PKCE and state storage",
+        "details": "Verify response contains X OAuth URL, state saved in DynamoDB, PKCE code_challenge generated correctly.",
+        "testStrategy": "Mock crypto.randomBytes for PKCE. Verify DynamoDB oauth_states table INSERT. Check callback URL format.",
+        "priority": "high",
+        "dependencies": [
+          "1"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:01:50.904Z"
+      },
+      {
+        "id": "12",
+        "title": "Test Auth X OAuth Callback Processing",
+        "description": "Test GET /auth/x/callback handling OAuth response and token exchange",
+        "details": "Mock X OAuth response. Test state validation, code verification, token exchange with X API. Store access/refresh tokens.",
+        "testStrategy": "Integration test with mocked X API responses. Verify tokens stored in DynamoDB users table.",
+        "priority": "high",
+        "dependencies": [
+          "1",
+          "11"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:01:50.908Z"
+      },
+      {
+        "id": "13",
+        "title": "Test Auth User Initialization Flow",
+        "description": "Test GET/POST /auth/init for new/existing users with wallet creation and welcome bonus",
+        "details": "GET /auth/init status check, POST creates user-cache, wallets records, applies welcomeBonus. Test idempotency.",
+        "testStrategy": "Test new user flow end-to-end. Verify wallets table INSERT, user-cache created, bonus applied to balance.",
+        "priority": "high",
+        "dependencies": [
+          "1",
+          "12"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:01:50.912Z"
+      },
+      {
+        "id": "14",
+        "title": "Test Auth Token Refresh API",
+        "description": "Test POST /auth/x/refresh with valid/expired refresh tokens",
+        "details": "Valid refresh → new access/idToken. Expired refresh → 401 error. Mock Cognito token validation.",
+        "testStrategy": "Test token expiry scenarios. Verify new tokens issued with correct expiry times.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "13"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:01:50.916Z"
+      },
+      {
+        "id": "15",
+        "title": "Test Security, Authorization, and Error Handling",
+        "description": "Test 401/404/400/500 responses, CORS headers, injection protection across all APIs",
+        "details": "Test unauth admin calls (401), invalid JSON (400), non-existent resources (404), SQL/symbol injection attempts. Verify CORS headers present.",
+        "testStrategy": "Security scan with curl fuzzing. Verify all error responses follow standard format. Check symbol regex validation.",
+        "priority": "high",
+        "dependencies": [
+          "1",
+          "2",
+          "3",
+          "6",
+          "11"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:03:38.919Z"
+      },
+      {
+        "id": "16",
+        "title": "Test Performance, Connection Management, and Frontend Integration",
+        "description": "Test PostgreSQL pool, Redis stability, concurrent requests, and frontend compatibility",
+        "details": "Load test 100 concurrent requests. Verify 30s idle timeout disconnects. Test SystemSettingsService.js integration with /auth/init.",
+        "testStrategy": "Apache Bench (ab -n 100 -c 10), monitor connection pools. Frontend e2e test with Cypress calling new endpoints.",
+        "priority": "medium",
+        "dependencies": [
+          "1",
+          "15"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-05T17:03:38.923Z"
+      }
+    ],
+    "metadata": {
+      "version": "1.0.0",
+      "lastModified": "2026-01-05T17:03:38.924Z",
+      "taskCount": 16,
+      "completedCount": 16,
+      "tags": [
+        "master"
+      ]
+    }
+  }
+}

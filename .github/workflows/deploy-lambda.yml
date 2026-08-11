@@ -1,0 +1,313 @@
+name: Deploy Lambda Functions
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'lambda/**'
+      - '.github/workflows/deploy-lambda.yml'
+  workflow_dispatch:
+    inputs:
+      function_name:
+        description: 'Lambda function name to deploy (leave empty for all)'
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        function:
+          # === REST API (18) ===
+          - name: Supernoba-admin
+            path: lambda/Supernoba-admin
+            has_build: false
+          - name: Supernoba-admin-core
+            path: lambda/Supernoba-admin-core
+            has_build: false
+          - name: Supernoba-admin-stats
+            path: lambda/Supernoba-admin-stats
+            has_build: false
+          - name: Supernoba-admin-monitoring
+            path: lambda/Supernoba-admin-monitoring
+            has_build: false
+          - name: Supernoba-admin-users
+            path: lambda/Supernoba-admin-users
+            has_build: false
+          - name: Supernoba-admin-mm
+            path: lambda/Supernoba-admin-mm
+            has_build: false
+          - name: Supernoba-symbol-admin
+            path: lambda/Supernoba-symbol-admin
+            has_build: false
+          - name: Supernoba-order-router
+            path: lambda/Supernoba-order-router
+            has_build: true
+          - name: Supernoba-asset-handler
+            path: lambda/Supernoba-asset-handler
+            has_build: false
+          - name: Supernoba-chart-data-handler
+            path: lambda/Supernoba-chart-data-handler
+            has_build: false
+          - name: Supernoba-history
+            path: lambda/Supernoba-history
+            has_build: false
+          - name: Supernoba-rankings
+            path: lambda/Supernoba-rankings
+            has_build: false
+          - name: Supernoba-treemap-data
+            path: lambda/Supernoba-treemap-data
+            has_build: false
+          - name: Supernoba-announcements
+            path: lambda/Supernoba-announcements
+            has_build: false
+          - name: Supernoba-approval-handler
+            path: lambda/Supernoba-approval-handler
+            has_build: false
+          - name: Supernoba-preview-handler
+            path: lambda/Supernoba-preview-handler
+            has_build: false
+          - name: Supernoba-favorites
+            path: lambda/Supernoba-favorites
+            has_build: false
+          - name: Supernoba-creator-requests
+            path: lambda/Supernoba-creator-requests
+            has_build: false
+          - name: Supernoba-point-claim
+            path: lambda/Supernoba-point-claim
+            has_build: false
+          - name: Supernoba-image-sync
+            path: lambda/Supernoba-image-sync
+            has_build: false
+
+          # === WebSocket (5) ===
+          - name: Supernoba-connect-handler
+            path: lambda/Supernoba-connect-handler
+            has_build: false
+          - name: Supernoba-subscribe-handler
+            path: lambda/Supernoba-subscribe-handler
+            has_build: false
+          - name: Supernoba-disconnect-handler
+            path: lambda/Supernoba-disconnect-handler
+            has_build: false
+          - name: Supernoba-admin-ws-handler
+            path: lambda/Supernoba-admin-ws-handler
+            has_build: false
+          - name: Supernoba-cleanup-handler
+            path: lambda/Supernoba-cleanup-handler
+            has_build: false
+
+          # === Event/Batch (2) ===
+          - name: Supernoba-ipo-processor
+            path: lambda/Supernoba-ipo-processor
+            has_build: false
+          - name: Supernoba-auth
+            path: lambda/Supernoba-auth
+            has_build: false
+
+          # === Payment (4) ===
+          - name: Supernoba-payments
+            path: lambda/Supernoba-payments
+            has_build: false
+          - name: Supernoba-stripe-webhook
+            path: lambda/Supernoba-stripe-webhook
+            has_build: false
+          - name: Supernoba-admin-payments
+            path: lambda/Supernoba-admin-payments
+            has_build: false
+          - name: Supernoba-apple-iap
+            path: lambda/Supernoba-apple-iap
+            has_build: false
+
+          # === Push Notification (2) ===
+          - name: Supernoba-push-tokens
+            path: lambda/Supernoba-push-tokens
+            has_build: false
+          - name: Supernoba-push-sender
+            path: lambda/Supernoba-push-sender
+            has_build: false
+
+          # === User Preferences (1) ===
+          - name: Supernoba-user-preferences
+            path: lambda/Supernoba-user-preferences
+            has_build: false
+
+          # === User Account (1) ===
+          - name: Supernoba-delete-account
+            path: lambda/Supernoba-delete-account
+            has_build: false
+
+          # === Utility (2) ===
+          - name: Supernoba-ec2-mgmt
+            path: lambda/Supernoba-ec2-mgmt
+            has_build: false
+          - name: Supernoba-symbol-cleanup
+            path: lambda/Supernoba-symbol-cleanup
+            has_build: false
+
+          # === Step Functions - Delisting (4) ===
+          - name: Supernoba-delisting-phase1
+            path: lambda/Supernoba-delisting-phase1
+            has_build: false
+          - name: Supernoba-delisting-phase2
+            path: lambda/Supernoba-delisting-phase2
+            has_build: false
+          - name: Supernoba-delisting-phase3
+            path: lambda/Supernoba-delisting-phase3
+            has_build: false
+          - name: Supernoba-delisting-phase4
+            path: lambda/Supernoba-delisting-phase4
+            has_build: false
+
+          # === Step Functions - Delete User (6) ===
+          - name: Supernoba-delete-user-phase1
+            path: lambda/Supernoba-delete-user-phase1
+            has_build: false
+          - name: Supernoba-delete-user-phase2
+            path: lambda/Supernoba-delete-user-phase2
+            has_build: false
+          - name: Supernoba-delete-user-phase3
+            path: lambda/Supernoba-delete-user-phase3
+            has_build: false
+          - name: Supernoba-delete-user-phase4
+            path: lambda/Supernoba-delete-user-phase4
+            has_build: false
+          - name: Supernoba-delete-user-phase5
+            path: lambda/Supernoba-delete-user-phase5
+            has_build: false
+          - name: Supernoba-delete-user-phase6
+            path: lambda/Supernoba-delete-user-phase6
+            has_build: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - name: Filter changed functions
+        id: filter
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.function_name }}" ]; then
+              if [ "${{ github.event.inputs.function_name }}" == "${{ matrix.function.name }}" ]; then
+                echo "should_deploy=true" >> $GITHUB_OUTPUT
+              else
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            if [ -z "${{ github.event.before }}" ] || [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            else
+              if git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+                if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^${{ matrix.function.path }}"; then
+                  echo "should_deploy=true" >> $GITHUB_OUTPUT
+                else
+                  echo "should_deploy=false" >> $GITHUB_OUTPUT
+                fi
+              else
+                echo "should_deploy=true" >> $GITHUB_OUTPUT
+              fi
+            fi
+          fi
+          echo "Filter result for ${{ matrix.function.name }}: $(grep should_deploy $GITHUB_OUTPUT | cut -d'=' -f2)"
+
+      - name: Check function directory exists
+        if: steps.filter.outputs.should_deploy == 'true'
+        run: |
+          if [ ! -d "${{ matrix.function.path }}" ]; then
+            echo "Directory ${{ matrix.function.path }} does not exist, skipping"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          if [ -f package.json ]; then
+            echo "Installing dependencies for ${{ matrix.function.name }}..."
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build (if needed)
+        if: steps.filter.outputs.should_deploy == 'true' && matrix.function.has_build
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          npm install --include=dev
+          if [ -f build.cjs ]; then
+            node build.cjs
+          elif [ -f build.js ]; then
+            node build.js
+          fi
+
+      - name: Create deployment package
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          if [ -d dist ]; then
+            cd dist
+            zip -r ../function.zip *.mjs *.js 2>/dev/null || true
+            cd ..
+          elif [ -f package.json ] && [ -d node_modules ]; then
+            zip -r function.zip index.mjs node_modules/ package.json -x "*.git*" "*.test.*" "*.spec.*"
+          elif [ -f index.mjs ]; then
+            zip -r function.zip index.mjs -x "*.git*" "*.test.*" "*.spec.*"
+          else
+            echo "No deployable files found"
+            exit 1
+          fi
+
+      - name: Deploy to Lambda
+        if: steps.filter.outputs.should_deploy == 'true'
+        working-directory: ${{ matrix.function.path }}
+        run: |
+          echo "=== Deploying ${{ matrix.function.name }} ==="
+          echo "ZIP file size: $(ls -lh function.zip | awk '{print $5}')"
+
+          DEPLOY_RESULT=$(aws lambda update-function-code \
+            --function-name ${{ matrix.function.name }} \
+            --zip-file fileb://function.zip \
+            --region ap-northeast-2 \
+            --output json)
+
+          echo "$DEPLOY_RESULT" | jq -r '"FunctionArn: \(.FunctionArn)\nLastModified: \(.LastModified)\nCodeSize: \(.CodeSize) bytes"'
+          echo "Deployed ${{ matrix.function.name }}"
+
+      - name: Verify deployment
+        if: steps.filter.outputs.should_deploy == 'true'
+        run: |
+          sleep 2
+          FUNCTION_INFO=$(aws lambda get-function \
+            --function-name ${{ matrix.function.name }} \
+            --region ap-northeast-2 \
+            --query 'Configuration.[FunctionName,LastModified,CodeSize,State,LastUpdateStatus]' \
+            --output json 2>/dev/null)
+
+          echo "$FUNCTION_INFO" | jq -r '"Function: \(.[0])\nLastModified: \(.[1])\nCodeSize: \(.[2]) bytes\nState: \(.[3])\nLastUpdateStatus: \(.[4])"'
+
+          STATE=$(echo "$FUNCTION_INFO" | jq -r '.[3]')
+          UPDATE_STATUS=$(echo "$FUNCTION_INFO" | jq -r '.[4]')
+
+          if [ "$STATE" == "Active" ] && [ "$UPDATE_STATUS" == "Successful" ]; then
+            echo "Deployment verified for ${{ matrix.function.name }}"
+          else
+            echo "Function state: $STATE, Update status: $UPDATE_STATUS"
+          fi

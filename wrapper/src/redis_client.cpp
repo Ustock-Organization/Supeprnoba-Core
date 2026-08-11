@@ -18,11 +18,12 @@ RedisClient::~RedisClient() {
 bool RedisClient::connect() {
     if (context_) {
         redisFree(context_);
+        context_ = nullptr;
     }
-    
+
     struct timeval timeout = {1, 500000};  // 1.5초
     context_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
-    
+
     if (context_ == nullptr || context_->err) {
         if (context_) {
             Logger::error("Redis connection failed:", context_->errstr);
@@ -31,57 +32,256 @@ bool RedisClient::connect() {
         } else {
             Logger::error("Redis connection failed: can't allocate context");
         }
+        state_ = ConnectionState::DISCONNECTED;
         return false;
     }
-    
-    Logger::info("Redis connected to:", host_, ":", port_);
+
+    // Set command-level socket timeout (SO_RCVTIMEO/SO_SNDTIMEO)
+    // Without this, redisCommand() blocks indefinitely if connection drops mid-operation
+    struct timeval cmd_timeout = {3, 0};  // 3 seconds for read/write operations
+    redisSetTimeout(context_, cmd_timeout);
+
+    Logger::info("Redis connected to:", host_, ":", port_, "(cmd_timeout: 3s)");
+    state_ = ConnectionState::CONNECTED;
+    current_reconnect_attempts_ = 0;  // Reset on successful connection
+    last_health_check_ = std::chrono::steady_clock::now();
     return true;
 }
 
-bool RedisClient::set(const std::string& key, const std::string& value) {
-    if (!context_) return false;
-    
-    auto reply = static_cast<redisReply*>(
-        redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
-    
-    if (!reply) {
-        Logger::error("Redis SET failed:", context_->errstr);
+// === Connection Management Methods ===
+
+void RedisClient::setAutoReconnect(bool enabled) {
+    auto_reconnect_enabled_ = enabled;
+    Logger::info("Redis auto-reconnect:", enabled ? "enabled" : "disabled");
+}
+
+void RedisClient::setMaxReconnectAttempts(int attempts) {
+    max_reconnect_attempts_ = attempts;
+    Logger::info("Redis max reconnect attempts set to:", attempts);
+}
+
+void RedisClient::setReconnectDelay(int initial_ms, int max_ms) {
+    reconnect_delay_ms_ = initial_ms;
+    max_reconnect_delay_ms_ = max_ms;
+    Logger::info("Redis reconnect delay:", initial_ms, "ms to", max_ms, "ms");
+}
+
+void RedisClient::setHealthCheckInterval(int interval_ms) {
+    health_check_interval_ms_ = interval_ms;
+    Logger::info("Redis health check interval:", interval_ms, "ms");
+}
+
+bool RedisClient::isHealthy() {
+    if (!context_) {
         return false;
     }
-    
+    return performHealthCheck();
+}
+
+int RedisClient::calculateBackoffDelay() {
+    if (current_reconnect_attempts_ == 0) {
+        return 0;  // First attempt - no delay
+    }
+
+    // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, ...
+    int delay = reconnect_delay_ms_ * (1 << (current_reconnect_attempts_ - 1));
+    return std::min(delay, max_reconnect_delay_ms_);
+}
+
+void RedisClient::markDisconnected() {
+    if (state_ == ConnectionState::CONNECTED) {
+        Logger::warn("Redis connection lost - marking disconnected");
+        state_ = ConnectionState::DISCONNECTED;
+    }
+
+    if (context_) {
+        redisFree(context_);
+        context_ = nullptr;
+    }
+}
+
+bool RedisClient::attemptReconnect() {
+    auto now = std::chrono::steady_clock::now();
+
+    // Check if circuit breaker is open
+    if (state_ == ConnectionState::CIRCUIT_OPEN) {
+        auto time_since_circuit_opened =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - circuit_breaker_opened_at_).count();
+
+        if (time_since_circuit_opened < circuit_breaker_timeout_ms_) {
+            return false;  // Circuit still open
+        }
+
+        // Close circuit and retry
+        Logger::info("Redis circuit breaker closed - attempting reconnect");
+        state_ = ConnectionState::DISCONNECTED;
+        current_reconnect_attempts_ = 0;
+    }
+
+    // Calculate backoff delay
+    int backoff_delay = calculateBackoffDelay();
+
+    // Check if enough time has passed since last attempt
+    auto time_since_last_attempt =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_reconnect_attempt_).count();
+
+    if (time_since_last_attempt < backoff_delay) {
+        return false;  // Too soon to retry
+    }
+
+    // Check if we've exceeded max attempts
+    if (current_reconnect_attempts_ >= max_reconnect_attempts_) {
+        Logger::warn("Redis reconnect attempts exceeded - opening circuit breaker for",
+                     circuit_breaker_timeout_ms_, "ms");
+        state_ = ConnectionState::CIRCUIT_OPEN;
+        circuit_breaker_opened_at_ = now;
+        return false;
+    }
+
+    // Attempt reconnection
+    last_reconnect_attempt_ = now;
+    current_reconnect_attempts_++;
+
+    Logger::info("Redis reconnect attempt", current_reconnect_attempts_, "/",
+                 max_reconnect_attempts_, "after", backoff_delay, "ms backoff");
+
+    bool success = connect();
+
+    if (success) {
+        Logger::info("Redis reconnected successfully after", current_reconnect_attempts_, "attempts");
+        return true;
+    } else {
+        Logger::warn("Redis reconnect failed, attempt", current_reconnect_attempts_);
+        return false;
+    }
+}
+
+bool RedisClient::isHealthCheckDue() {
+    auto now = std::chrono::steady_clock::now();
+    auto time_since_check =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_health_check_).count();
+    return time_since_check >= health_check_interval_ms_;
+}
+
+bool RedisClient::performHealthCheck() {
+    last_health_check_ = std::chrono::steady_clock::now();
+
+    if (!context_) {
+        return false;
+    }
+
+    // Use PING command for health check
+    auto reply = static_cast<redisReply*>(redisCommand(context_, "PING"));
+
+    if (!reply) {
+        Logger::warn("Redis health check failed - connection appears dead:",
+                     context_->errstr);
+        markDisconnected();
+        return false;
+    }
+
+    bool healthy = (reply->type == REDIS_REPLY_STATUS &&
+                    std::string(reply->str) == "PONG");
+    freeReplyObject(reply);
+
+    if (!healthy) {
+        Logger::warn("Redis health check failed - unexpected PING response");
+        markDisconnected();
+        return false;
+    }
+
+    return true;
+}
+
+bool RedisClient::ensureConnection() {
+    // If already connected and healthy, do nothing
+    if (context_ && state_ == ConnectionState::CONNECTED) {
+        // Periodic health check
+        if (isHealthCheckDue()) {
+            if (!performHealthCheck()) {
+                // Health check failed, will try to reconnect below
+                Logger::warn("Redis health check failed during ensureConnection");
+            } else {
+                return true;  // Healthy connection
+            }
+        } else {
+            return true;  // Skip health check, assume connected
+        }
+    }
+
+    // If disconnected and auto-reconnect enabled, try to reconnect
+    if (!context_ && auto_reconnect_enabled_) {
+        return attemptReconnect();
+    }
+
+    return context_ != nullptr;
+}
+
+bool RedisClient::set(const std::string& key, const std::string& value) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis SET failed:", context_->errstr);
+        markDisconnected();
+
+        // Try one immediate reconnect
+        if (auto_reconnect_enabled_ && attemptReconnect()) {
+            reply = static_cast<redisReply*>(
+                redisCommand(context_, "SET %s %s", key.c_str(), value.c_str()));
+            if (reply) {
+                bool success = (reply->type != REDIS_REPLY_ERROR);
+                freeReplyObject(reply);
+                return success;
+            }
+        }
+        return false;
+    }
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;
 }
 
-bool RedisClient::setEx(const std::string& key, const std::string& value, 
+bool RedisClient::setEx(const std::string& key, const std::string& value,
                          int ttl_seconds) {
-    if (!context_) return false;
-    
+    if (!ensureConnection()) return false;
+
     auto reply = static_cast<redisReply*>(
-        redisCommand(context_, "SETEX %s %d %s", 
+        redisCommand(context_, "SETEX %s %d %s",
                      key.c_str(), ttl_seconds, value.c_str()));
-    
-    if (!reply) return false;
-    
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
     bool success = (reply->type != REDIS_REPLY_ERROR);
     freeReplyObject(reply);
     return success;
 }
 
 std::optional<std::string> RedisClient::get(const std::string& key) {
-    if (!context_) return std::nullopt;
-    
+    if (!ensureConnection()) return std::nullopt;
+
     auto reply = static_cast<redisReply*>(
         redisCommand(context_, "GET %s", key.c_str()));
-    
-    if (!reply) return std::nullopt;
-    
+
+    if (!reply) {
+        markDisconnected();
+        return std::nullopt;
+    }
+
     std::optional<std::string> result;
     if (reply->type == REDIS_REPLY_STRING) {
         result = std::string(reply->str, reply->len);
     }
-    
+
     freeReplyObject(reply);
     return result;
 }
@@ -150,6 +350,469 @@ std::vector<std::string> RedisClient::keys(const std::string& pattern) {
     
     freeReplyObject(reply);
     return result;
+}
+
+bool RedisClient::lpush(const std::string& key, const std::string& value) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "LPUSH %s %s", key.c_str(), value.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis LPUSH failed:", context_->errstr);
+        markDisconnected();
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+bool RedisClient::ltrim(const std::string& key, long start, long stop) {
+    if (!context_) return false;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "LTRIM %s %ld %ld", key.c_str(), start, stop));
+    
+    if (!reply) {
+        Logger::error("Redis LTRIM failed:", context_->errstr);
+        return false;
+    }
+    
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+std::vector<std::string> RedisClient::lrange(const std::string& key, long start, long stop) {
+    std::vector<std::string> result;
+    if (!context_) return result;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "LRANGE %s %ld %ld", key.c_str(), start, stop));
+    
+    if (!reply) return result;
+    
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        for (size_t i = 0; i < reply->elements; ++i) {
+            if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                result.emplace_back(reply->element[i]->str, reply->element[i]->len);
+            }
+        }
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
+std::vector<std::string> RedisClient::smembers(const std::string& key) {
+    std::vector<std::string> result;
+    if (!context_) return result;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "SMEMBERS %s", key.c_str()));
+    
+    if (!reply) return result;
+    
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        for (size_t i = 0; i < reply->elements; ++i) {
+            if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                result.emplace_back(reply->element[i]->str, reply->element[i]->len);
+            }
+        }
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
+bool RedisClient::sismember(const std::string& key, const std::string& member) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "SISMEMBER %s %s", key.c_str(), member.c_str()));
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
+    bool result = (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
+    freeReplyObject(reply);
+    return result;
+}
+
+// === Sorted Set 연산 (랭킹용) ===
+
+bool RedisClient::zadd(const std::string& key, double score, const std::string& member) {
+    if (!context_) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZADD %s %f %s", key.c_str(), score, member.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis ZADD failed:", context_->errstr);
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+double RedisClient::zincrby(const std::string& key, double increment, const std::string& member) {
+    if (!context_) return 0.0;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZINCRBY %s %f %s", key.c_str(), increment, member.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis ZINCRBY failed:", context_->errstr);
+        return 0.0;
+    }
+
+    double result = 0.0;
+    if (reply->type == REDIS_REPLY_STRING) {
+        result = std::stod(reply->str);
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+std::vector<std::pair<std::string, double>> RedisClient::zrevrange(
+    const std::string& key, long start, long stop, bool withScores) {
+    std::vector<std::pair<std::string, double>> result;
+    if (!context_) return result;
+
+    redisReply* reply;
+    if (withScores) {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZREVRANGE %s %ld %ld WITHSCORES", key.c_str(), start, stop));
+    } else {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZREVRANGE %s %ld %ld", key.c_str(), start, stop));
+    }
+
+    if (!reply) return result;
+
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        if (withScores && reply->elements % 2 == 0) {
+            for (size_t i = 0; i < reply->elements; i += 2) {
+                std::string member(reply->element[i]->str, reply->element[i]->len);
+                double score = std::stod(reply->element[i+1]->str);
+                result.emplace_back(member, score);
+            }
+        } else if (!withScores) {
+            for (size_t i = 0; i < reply->elements; ++i) {
+                if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                    result.emplace_back(
+                        std::string(reply->element[i]->str, reply->element[i]->len), 0.0);
+                }
+            }
+        }
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+std::vector<std::pair<std::string, double>> RedisClient::zrange(
+    const std::string& key, long start, long stop, bool withScores) {
+    std::vector<std::pair<std::string, double>> result;
+    if (!context_) return result;
+
+    redisReply* reply;
+    if (withScores) {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZRANGE %s %ld %ld WITHSCORES", key.c_str(), start, stop));
+    } else {
+        reply = static_cast<redisReply*>(
+            redisCommand(context_, "ZRANGE %s %ld %ld", key.c_str(), start, stop));
+    }
+
+    if (!reply) return result;
+
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        if (withScores && reply->elements % 2 == 0) {
+            for (size_t i = 0; i < reply->elements; i += 2) {
+                std::string member(reply->element[i]->str, reply->element[i]->len);
+                double score = std::stod(reply->element[i+1]->str);
+                result.emplace_back(member, score);
+            }
+        } else if (!withScores) {
+            for (size_t i = 0; i < reply->elements; ++i) {
+                if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                    result.emplace_back(
+                        std::string(reply->element[i]->str, reply->element[i]->len), 0.0);
+                }
+            }
+        }
+    }
+
+    freeReplyObject(reply);
+    return result;
+}
+
+bool RedisClient::zremrangebyrank(const std::string& key, long start, long stop) {
+    if (!context_) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "ZREMRANGEBYRANK %s %ld %ld", key.c_str(), start, stop));
+
+    if (!reply) {
+        Logger::error("Redis ZREMRANGEBYRANK failed:", context_->errstr);
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+// === Pub/Sub (랭킹 브로드캐스트용) ===
+
+long long RedisClient::publish(const std::string& channel, const std::string& message) {
+    if (!context_) return 0;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "PUBLISH %s %s", channel.c_str(), message.c_str()));
+
+    if (!reply) {
+        Logger::error("Redis PUBLISH failed:", context_->errstr);
+        return 0;
+    }
+
+    long long subscribers = 0;
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        subscribers = reply->integer;
+    }
+
+    freeReplyObject(reply);
+    return subscribers;
+}
+
+// === Hash 연산 (캔들용) ===
+
+bool RedisClient::hset(const std::string& key, const std::string& field, const std::string& value) {
+    if (!ensureConnection()) return false;
+
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "HSET %s %s %s", key.c_str(), field.c_str(), value.c_str()));
+
+    if (!reply) {
+        markDisconnected();
+        return false;
+    }
+
+    bool success = (reply->type != REDIS_REPLY_ERROR);
+    freeReplyObject(reply);
+    return success;
+}
+
+std::optional<std::string> RedisClient::hget(const std::string& key, const std::string& field) {
+    if (!context_) return std::nullopt;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "HGET %s %s", key.c_str(), field.c_str()));
+    
+    if (!reply) return std::nullopt;
+    
+    std::optional<std::string> result;
+    if (reply->type == REDIS_REPLY_STRING) {
+        result = std::string(reply->str, reply->len);
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
+std::map<std::string, std::string> RedisClient::hgetall(const std::string& key) {
+    std::map<std::string, std::string> result;
+    if (!context_) return result;
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommand(context_, "HGETALL %s", key.c_str()));
+    
+    if (!reply) return result;
+    
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements % 2 == 0) {
+        for (size_t i = 0; i < reply->elements; i += 2) {
+            std::string field(reply->element[i]->str, reply->element[i]->len);
+            std::string value(reply->element[i+1]->str, reply->element[i+1]->len);
+            result[field] = value;
+        }
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
+// === Lua Script EVAL ===
+
+std::string RedisClient::eval(const std::string& script, int numKeys,
+                               const std::vector<std::string>& keys,
+                               const std::vector<std::string>& args) {
+    if (!context_) return "";
+    
+    // 명령어 구성: EVAL script numkeys key1 key2 ... arg1 arg2 ...
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    
+    std::string cmd = "EVAL";
+    argv.push_back(cmd.c_str());
+    argvlen.push_back(cmd.size());
+    
+    argv.push_back(script.c_str());
+    argvlen.push_back(script.size());
+    
+    std::string numKeysStr = std::to_string(numKeys);
+    argv.push_back(numKeysStr.c_str());
+    argvlen.push_back(numKeysStr.size());
+    
+    for (const auto& key : keys) {
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+    }
+    
+    for (const auto& arg : args) {
+        argv.push_back(arg.c_str());
+        argvlen.push_back(arg.size());
+    }
+    
+    auto reply = static_cast<redisReply*>(
+        redisCommandArgv(context_, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
+    
+    if (!reply) {
+        Logger::error("Redis EVAL failed:", context_->errstr);
+        return "";
+    }
+    
+    std::string result;
+    if (reply->type == REDIS_REPLY_STRING) {
+        result = std::string(reply->str, reply->len);
+    } else if (reply->type == REDIS_REPLY_INTEGER) {
+        result = std::to_string(reply->integer);
+    } else if (reply->type == REDIS_REPLY_ERROR) {
+        Logger::error("Redis EVAL error:", reply->str);
+    }
+    
+    freeReplyObject(reply);
+    return result;
+}
+
+// === Unix epoch → YYYYMMDDHHmm 형식 변환 (KST 기준: UTC+9) ===
+std::string epochToYMDHM(int64_t epoch) {
+    // epoch은 UTC 기준이므로, KST로 변환하려면 +9시간
+    // mktime()을 사용하여 올바른 날짜 계산 보장
+    time_t utc_time = static_cast<time_t>(epoch);
+    
+    // UTC 시간 구조체 얻기
+    struct tm* tm_utc = gmtime(&utc_time);
+    if (!tm_utc) {
+        Logger::warn("gmtime() failed for epoch:", epoch);
+        return "000000000000";
+    }
+    
+    // KST = UTC + 9시간
+    // time_t에 9시간(32400초) 추가 후 다시 구조체로 변환
+    time_t kst_time = utc_time + (9 * 3600);
+    struct tm* tm_kst = gmtime(&kst_time);
+    if (!tm_kst) {
+        Logger::warn("gmtime() failed for KST epoch:", kst_time);
+        return "000000000000";
+    }
+    
+    char buffer[13];  // YYYYMMDDHHmm + null
+    snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d",
+        tm_kst->tm_year + 1900,
+        tm_kst->tm_mon + 1,
+        tm_kst->tm_mday,
+        tm_kst->tm_hour,
+        tm_kst->tm_min);
+    
+    return std::string(buffer);
+}
+
+// === 캔들 집계 (Lua Script) ===
+
+bool RedisClient::updateCandle(const std::string& symbol, uint64_t price, uint64_t qty, int64_t timestamp) {
+    if (!context_) return false;
+    
+    // Lua Script: 원자적 캔들 업데이트 (YYYYMMDDHHmm + epoch 둘 다 저장)
+    static const std::string luaScript = R"(
+        local key = KEYS[1]
+        local closedKey = KEYS[2]
+        local price = tonumber(ARGV[1])
+        local qty = tonumber(ARGV[2])
+        local ts = ARGV[3]      -- Unix epoch (초, UTC 기준)
+        local minute = ARGV[4]  -- YYYYMMDDHHmm 형식 (KST 기준, 사람이 읽기 쉬운 형식)
+        
+        local current_t = redis.call("HGET", key, "t")
+        
+        -- 현재 분과 이전 캔들의 분이 다르면 이전 캔들을 닫고 새 캔들을 시작
+        -- 문자열 비교: "202512161403" < "202512161404"
+        if current_t and current_t < minute then
+            -- 이전 캔들 데이터 가져오기 (HGETALL은 flat array 반환)
+            local oldArr = redis.call("HGETALL", key)
+            if #oldArr > 0 then
+                -- flat array를 객체로 변환: {"o", "145", "h", "147"} -> {o=145, h=147}
+                local oldObj = {}
+                for i = 1, #oldArr, 2 do
+                    oldObj[oldArr[i]] = oldArr[i + 1]
+                end
+                local json = cjson.encode(oldObj)
+                redis.call("LPUSH", closedKey, json)
+                redis.call("LTRIM", closedKey, 0, 999)  -- 닫힌 캔들은 최대 1000개 유지
+            end
+            -- 새 캔들 생성: epoch(t_epoch)와 ymdhm(t) 둘 다 저장
+            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute, "t_epoch", ts)
+        elseif not current_t then
+            -- 새 캔들 생성 (처음 또는 만료 후)
+            redis.call("HMSET", key, "o", price, "h", price, "l", price, "c", price, "v", qty, "t", minute, "t_epoch", ts)
+        else
+            -- 기존 캔들 데이터 갱신 (같은 분 내)
+            local h = tonumber(redis.call("HGET", key, "h")) -- 현재 고가
+            local l = tonumber(redis.call("HGET", key, "l")) -- 현재 저가
+            if price > h then redis.call("HSET", key, "h", price) end -- 고가 갱신
+            if price < l then redis.call("HSET", key, "l", price) end -- 저가 갱신
+            redis.call("HSET", key, "c", price) -- 종가 갱신
+            redis.call("HINCRBY", key, "v", qty) -- 거래량 증가 (정수 사용)
+            -- epoch도 업데이트 (같은 분 내에서도 최신 시간으로 갱신)
+            redis.call("HSET", key, "t_epoch", ts)
+        end
+        
+        -- 현재 캔들과 닫힌 캔들 버퍼에 만료 시간 설정
+        redis.call("EXPIRE", key, 600) -- 현재 캔들은 10분 후 만료 (stale check 10초 × 60배 마진)
+        redis.call("EXPIRE", closedKey, 21600) -- 닫힌 캔들 버퍼는 6시간 후 만료 (aggregator 장애 대비)
+        
+        return "OK"
+    )";
+    
+    std::string key = "candle:1m:" + symbol;
+    std::string closedKey = "candle:closed:1m:" + symbol;
+    
+    // YYYYMMDDHHmm 형식으로 변환
+    std::string minuteStr = epochToYMDHM(timestamp);
+    
+    std::vector<std::string> keys = {key, closedKey};
+    std::vector<std::string> args = {
+        std::to_string(price),
+        std::to_string(qty),
+        std::to_string(timestamp),  // epoch (참조용)
+        minuteStr                   // YYYYMMDDHHmm (실제 사용)
+    };
+    
+    std::string result = eval(luaScript, 2, keys, args);
+    
+    if (result == "OK") {
+        Logger::debug("Candle updated:", symbol, "price:", price, "qty:", qty);
+        return true;
+    } else {
+        Logger::warn("Candle update failed:", symbol);
+        return false;
+    }
 }
 
 } // namespace aws_wrapper

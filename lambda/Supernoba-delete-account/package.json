@@ -1,0 +1,9 @@
+{
+  "name": "supernoba-delete-account",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-sfn": "^3.624.0"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "supernoba-delisting-phase3",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Delisting Phase 3: Data cleanup (Valkey cache, RDS, DynamoDB symbols/holdings/orders/favorites)",
+  "main": "index.mjs",
+  "dependencies": {}
+}

@@ -1,0 +1,7 @@
+{
+  "name": "supernoba-ec2-mgmt",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "EC2 instance management Lambda for Supernoba Admin",
+  "main": "index.mjs"
+}

@@ -1,0 +1,594 @@
+/**
+ * Supernoba-apple-iap Lambda
+ *
+ * Apple IAP 검증 + App Store Server Notifications v2 수신
+ *
+ * 엔드포인트:
+ * - POST /payments/apple/verify        : 클라이언트 JWS 영수증 검증 → DB 업데이트 (Cognito JWT 필요)
+ * - POST /payments/apple/notifications  : App Store Server Notifications v2 (Auth 없음)
+ *
+ * JWS 검증 방식:
+ * StoreKit 2는 JWS(JSON Web Signature) 토큰을 반환하며, x5c 헤더에 Apple 인증서 체인이 포함됨.
+ * jose 라이브러리로 서명 검증 + bundleId 확인으로 Secrets Manager 불필요.
+ *
+ * Layers:
+ * - supernoba-common:12 (CORS, response)
+ * - supernoba-auth:18 (JWT 검증) — verify 엔드포인트에서만 사용
+ *
+ * 환경변수:
+ * - USER_TABLE: supernoba-users 테이블명
+ * - PAYMENTS_TABLE: supernoba-payments 테이블명
+ * - APPLE_EVENTS_TABLE: supernoba-apple-events 테이블명
+ * - APPLE_BUNDLE_ID: iOS 앱 번들 ID
+ */
+
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import * as jose from 'jose';
+import { CORS, response, handleOptions } from '/opt/nodejs/index.mjs';
+import { verifyAuth, authErrorResponse, resolveUserId } from '/opt/nodejs/verifyAuth.mjs';
+
+const USER_TABLE = process.env.USER_TABLE || 'supernoba-users';
+const PAYMENTS_TABLE = process.env.PAYMENTS_TABLE || 'supernoba-payments';
+const APPLE_EVENTS_TABLE = process.env.APPLE_EVENTS_TABLE || 'supernoba-apple-events';
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || 'com.supernoba.app';
+
+// Apple Root CA — StoreKit 2 JWS 체인 검증용
+const APPLE_ROOT_CA_G3_FINGERPRINT = '63343abfb89a6a03ebbdcdb3b1bbf613eb12867e';
+
+const dynamodb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-northeast-2' }),
+  { marshallOptions: { removeUndefinedValues: true } }
+);
+
+// 30일 TTL (초 단위)
+const TTL_30_DAYS = 30 * 24 * 60 * 60;
+
+/**
+ * Apple JWS environment 기반 test/live suffix 결정
+ * Stripe의 event.livemode와 동일한 패턴:
+ * - Production → '' (라이브 필드)
+ * - 그 외 (Sandbox, Xcode, LocalTesting 등) → '_test'
+ */
+function determineSuffix(environment) {
+  return environment === 'Production' ? '' : '_test';
+}
+
+export const handler = async (event) => {
+  // CORS preflight
+  const optionsResponse = handleOptions(event, CORS.STANDARD);
+  if (optionsResponse) return optionsResponse;
+
+  const method = event.httpMethod || event.requestContext?.http?.method;
+  const path = event.path || event.rawPath || '';
+
+  try {
+    // POST /payments/apple/verify — 클라이언트 JWS 검증 (Auth 필요)
+    if (method === 'POST' && path.endsWith('/verify')) {
+      return await handleVerify(event);
+    }
+
+    // POST /payments/apple/notifications — App Store Server Notifications v2 (Auth 없음)
+    if (method === 'POST' && path.endsWith('/notifications')) {
+      return await handleNotification(event);
+    }
+
+    return response.error(404, 'Not Found', CORS.STANDARD);
+  } catch (error) {
+    console.error('[apple-iap] Unhandled error:', error);
+    return response.error(500, error.message, CORS.STANDARD);
+  }
+};
+
+// ========== /verify — 클라이언트 영수증 검증 ==========
+
+async function handleVerify(event) {
+  // Cognito JWT 인증
+  const auth = await verifyAuth(event);
+  if (!auth.success) {
+    return authErrorResponse(auth, CORS.STANDARD);
+  }
+
+  const userId = resolveUserId(auth);
+  if (!userId) {
+    return response.error(400, 'User ID를 확인할 수 없습니다', CORS.STANDARD);
+  }
+
+  const body = JSON.parse(event.body || '{}');
+  const { transactionJWS, productId } = body;
+
+  if (!transactionJWS) {
+    return response.error(400, 'transactionJWS is required', CORS.STANDARD);
+  }
+
+  // JWS 검증
+  let payload;
+  try {
+    payload = await verifyAppleJWS(transactionJWS);
+  } catch (error) {
+    console.error('[apple-iap] JWS verification failed:', error.message);
+    return response.error(400, `JWS verification failed: ${error.message}`, CORS.STANDARD);
+  }
+
+  // bundleId 확인
+  if (payload.bundleId !== APPLE_BUNDLE_ID) {
+    console.error(`[apple-iap] Bundle ID mismatch: ${payload.bundleId} !== ${APPLE_BUNDLE_ID}`);
+    return response.error(400, 'Bundle ID mismatch', CORS.STANDARD);
+  }
+
+  const transactionId = payload.transactionId || payload.originalTransactionId;
+  const originalTransactionId = payload.originalTransactionId || transactionId;
+
+  // 멱등성 체크
+  const eventId = `verify_${transactionId}`;
+  const isDuplicate = await checkAndRecordEvent(eventId, 'client_verify');
+  if (isDuplicate) {
+    console.log(`[apple-iap] Duplicate verify skipped: ${eventId}`);
+    return response.ok({ verified: true, duplicate: true }, CORS.STANDARD);
+  }
+
+  // environment 기반 test/live suffix 결정
+  const suffix = determineSuffix(payload.environment);
+
+  // 구독 상태 결정
+  const now = new Date().toISOString();
+  const isSubscription = payload.type === 'Auto-Renewable Subscription';
+  const subscriptionStatus = determineStatus(payload);
+  const expiresAt = payload.expiresDate
+    ? new Date(payload.expiresDate).toISOString()
+    : null;
+
+  // supernoba-users 업데이트 (suffix 적용)
+  const updateExpression = [
+    `SET subscription_status${suffix} = :status`,
+    `subscription_source${suffix} = :source`,
+    `subscription_updated_at${suffix} = :now`,
+    `apple_original_transaction_id${suffix} = :otxn`,
+  ];
+  const expressionValues = {
+    ':status': subscriptionStatus,
+    ':source': 'apple',
+    ':now': now,
+    ':otxn': originalTransactionId,
+  };
+
+  if (isSubscription) {
+    updateExpression.push(`subscription_plan${suffix} = :plan`);
+    expressionValues[':plan'] = productId || payload.productId || 'apple_subscription';
+
+    if (expiresAt) {
+      updateExpression.push(`subscription_expires_at${suffix} = :exp`);
+      expressionValues[':exp'] = expiresAt;
+    }
+  }
+
+  await dynamodb.send(new UpdateCommand({
+    TableName: USER_TABLE,
+    Key: { user_id: userId },
+    UpdateExpression: updateExpression.join(', '),
+    ExpressionAttributeValues: expressionValues,
+  }));
+
+  // supernoba-payments 기록
+  const paymentId = `apple_${transactionId}`;
+  await dynamodb.send(new PutCommand({
+    TableName: PAYMENTS_TABLE,
+    Item: {
+      user_id: userId,
+      payment_id: paymentId,
+      type: isSubscription ? 'subscription' : 'one_time',
+      status: 'completed',
+      source: 'apple',
+      product_id: productId || payload.productId,
+      apple_transaction_id: transactionId,
+      apple_original_transaction_id: originalTransactionId,
+      is_test: suffix === '_test',
+      created_at: now,
+      updated_at: now,
+    },
+  }));
+
+  console.log(`[apple-iap] Verified: ${paymentId} for ${userId} → ${subscriptionStatus} (env=${payload.environment})`);
+
+  return response.ok({
+    verified: true,
+    subscription_status: subscriptionStatus,
+    product_id: productId || payload.productId,
+  }, CORS.STANDARD);
+}
+
+// ========== /notifications — App Store Server Notifications v2 ==========
+
+async function handleNotification(event) {
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body, 'base64').toString('utf-8')
+    : event.body;
+
+  let notificationPayload;
+  try {
+    const parsed = JSON.parse(rawBody);
+    // App Store Server Notifications v2는 signedPayload 필드에 JWS를 담아 보냄
+    const signedPayload = parsed.signedPayload;
+    if (!signedPayload) {
+      console.error('[apple-iap] Missing signedPayload in notification');
+      return { statusCode: 400, body: JSON.stringify({ error: 'Missing signedPayload' }) };
+    }
+
+    notificationPayload = await verifyAppleJWS(signedPayload);
+  } catch (error) {
+    console.error('[apple-iap] Notification JWS verification failed:', error.message);
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid notification' }) };
+  }
+
+  const notificationType = notificationPayload.notificationType;
+  const subtype = notificationPayload.subtype;
+  const notificationUUID = notificationPayload.notificationUUID;
+
+  // 멱등성 체크
+  if (notificationUUID) {
+    const isDuplicate = await checkAndRecordEvent(notificationUUID, `notification_${notificationType}`);
+    if (isDuplicate) {
+      console.log(`[apple-iap] Duplicate notification skipped: ${notificationUUID}`);
+      return { statusCode: 200, body: JSON.stringify({ received: true, duplicate: true }) };
+    }
+  }
+
+  // 트랜잭션 정보 추출 — data.signedTransactionInfo에 JWS가 또 있음
+  let transactionInfo = null;
+  if (notificationPayload.data?.signedTransactionInfo) {
+    try {
+      transactionInfo = await verifyAppleJWS(notificationPayload.data.signedTransactionInfo);
+    } catch (error) {
+      console.warn('[apple-iap] Failed to verify signedTransactionInfo:', error.message);
+    }
+  }
+
+  // 갱신 정보 추출 (renewalInfo에서 autoRenewStatus 등 확인)
+  let renewalInfo = null;
+  if (notificationPayload.data?.signedRenewalInfo) {
+    try {
+      renewalInfo = await verifyAppleJWS(notificationPayload.data.signedRenewalInfo);
+    } catch (error) {
+      console.warn('[apple-iap] Failed to verify signedRenewalInfo:', error.message);
+    }
+  }
+
+  if (!transactionInfo) {
+    console.warn(`[apple-iap] No transactionInfo for ${notificationType}, skipping`);
+    return { statusCode: 200, body: JSON.stringify({ received: true }) };
+  }
+
+  // environment 기반 test/live suffix 결정
+  const environment = notificationPayload.data?.environment || transactionInfo.environment;
+  const suffix = determineSuffix(environment);
+
+  // originalTransactionId로 사용자 조회
+  const originalTransactionId = transactionInfo.originalTransactionId;
+  const userId = await findUserByAppleTransactionId(originalTransactionId);
+
+  if (!userId) {
+    console.warn(`[apple-iap] No user found for originalTransactionId: ${originalTransactionId}`);
+    return { statusCode: 200, body: JSON.stringify({ received: true }) };
+  }
+
+  // 알림 타입별 구독 상태 매핑
+  const subscriptionStatus = mapNotificationToStatus(notificationType, subtype);
+  if (!subscriptionStatus) {
+    console.log(`[apple-iap] Unhandled notification type: ${notificationType} / ${subtype}`);
+    return { statusCode: 200, body: JSON.stringify({ received: true }) };
+  }
+
+  const now = new Date().toISOString();
+  const expiresAt = transactionInfo.expiresDate
+    ? new Date(transactionInfo.expiresDate).toISOString()
+    : null;
+
+  const setParts = [
+    `subscription_status${suffix} = :status`,
+    `subscription_source${suffix} = :source`,
+    `subscription_updated_at${suffix} = :now`,
+  ];
+  const expressionValues = {
+    ':status': subscriptionStatus,
+    ':source': 'apple',
+    ':now': now,
+  };
+
+  const isCancelledOrExpired = (subscriptionStatus === 'cancelled' || subscriptionStatus === 'expired');
+
+  // cancelled/expired가 아닐 때만 만료일 SET (REMOVE와 충돌 방지)
+  if (expiresAt && !isCancelledOrExpired) {
+    setParts.push(`subscription_expires_at${suffix} = :exp`);
+    expressionValues[':exp'] = expiresAt;
+  }
+
+  // DID_CHANGE_RENEWAL_STATUS — cancel_at_period_end 추적
+  if (notificationType === 'DID_CHANGE_RENEWAL_STATUS') {
+    setParts.push(`subscription_cancel_at_period_end${suffix} = :cancelEnd`);
+    expressionValues[':cancelEnd'] = subtype === 'AUTO_RENEW_DISABLED';
+  }
+
+  // plan 업데이트 — 갱신/구독/플랜변경 시 productId 반영
+  if (['DID_CHANGE_RENEWAL_PREF', 'DID_RENEW', 'SUBSCRIBED'].includes(notificationType)) {
+    const planProductId = renewalInfo?.autoRenewProductId || transactionInfo.productId;
+    if (planProductId) {
+      setParts.push(`subscription_plan${suffix} = :plan`);
+      expressionValues[':plan'] = planProductId;
+    }
+  }
+
+  // SET과 REMOVE는 별도 clause로 조합 (쉼표가 아닌 공백 구분)
+  let updateExpression = `SET ${setParts.join(', ')}`;
+
+  if (isCancelledOrExpired) {
+    updateExpression += ` REMOVE subscription_plan${suffix}, subscription_expires_at${suffix}, subscription_cancel_at_period_end${suffix}`;
+  }
+
+  await dynamodb.send(new UpdateCommand({
+    TableName: USER_TABLE,
+    Key: { user_id: userId },
+    UpdateExpression: updateExpression,
+    ExpressionAttributeValues: expressionValues,
+  }));
+
+  // 결제 기록 생성 (갱신, 구독, 환불, 실패)
+  await createApplePaymentRecord(userId, transactionInfo, notificationType, suffix);
+
+  console.log(`[apple-iap] Notification processed: ${notificationType}/${subtype} → ${userId} = ${subscriptionStatus} (env=${environment})`);
+
+  return { statusCode: 200, body: JSON.stringify({ received: true }) };
+}
+
+// ========== JWS 검증 ==========
+
+/**
+ * Apple JWS 토큰 검증
+ *
+ * StoreKit 2 / App Store Server Notifications v2는 JWS 토큰을 사용.
+ * x5c 헤더에 Apple 인증서 체인이 포함되어 있어 Apple Root CA로 검증 가능.
+ *
+ * 보안 검증 4단계:
+ * 1. x5c 체인 최소 3개 인증서 (리프, 중간, 루트) 필수
+ * 2. 루트 인증서 = Apple Root CA G3 fingerprint 매칭
+ * 3. 체인-오브-트러스트: 각 인증서가 상위 인증서에 의해 서명되었는지 확인
+ * 4. JWS 서명을 리프 인증서 공개키로 검증
+ *
+ * @param {string} jwsToken - JWS compact serialization
+ * @returns {Object} verified payload
+ */
+async function verifyAppleJWS(jwsToken) {
+  // 1. JWS 헤더에서 x5c 체인 추출
+  const header = jose.decodeProtectedHeader(jwsToken);
+  const x5c = header.x5c;
+
+  if (!x5c || x5c.length < 3) {
+    throw new Error('Invalid x5c chain: Apple JWS requires at least 3 certificates (leaf, intermediate, root)');
+  }
+
+  // 2. 루트 인증서 fingerprint 검증 (필수)
+  const rootDer = Buffer.from(x5c[x5c.length - 1], 'base64');
+  const rootFingerprint = await computeSHA1(rootDer);
+  if (rootFingerprint !== APPLE_ROOT_CA_G3_FINGERPRINT) {
+    throw new Error(`Root certificate fingerprint mismatch: ${rootFingerprint}`);
+  }
+
+  // 3. 체인-오브-트러스트 검증 — 각 인증서가 상위 인증서에 의해 서명되었는지 확인
+  const { X509Certificate } = await import('node:crypto');
+  const certs = x5c.map(c => new X509Certificate(Buffer.from(c, 'base64')));
+
+  for (let i = 0; i < certs.length - 1; i++) {
+    if (!certs[i].verify(certs[i + 1].publicKey)) {
+      throw new Error(`Certificate chain broken at index ${i}: cert[${i}] not signed by cert[${i + 1}]`);
+    }
+    // 인증서 만료 확인
+    const now = new Date();
+    if (now < new Date(certs[i].validFrom) || now > new Date(certs[i].validTo)) {
+      throw new Error(`Certificate at index ${i} is expired or not yet valid`);
+    }
+  }
+
+  // 4. 리프 인증서에서 공개키 추출
+  const leafCertPem = `-----BEGIN CERTIFICATE-----\n${x5c[0]}\n-----END CERTIFICATE-----`;
+  const leafCert = await jose.importX509(leafCertPem, header.alg || 'ES256');
+
+  // 5. JWS 서명 검증
+  const { payload } = await jose.jwtVerify(jwsToken, leafCert, {
+    algorithms: ['ES256'],
+    // Apple JWS는 iss/aud claim이 없을 수 있으므로 검증 스킵
+  }).catch(async () => {
+    // jwtVerify 실패 시 compactVerify로 fallback (비-JWT JWS인 경우)
+    const result = await jose.compactVerify(jwsToken, leafCert);
+    return { payload: JSON.parse(new TextDecoder().decode(result.payload)) };
+  });
+
+  // payload가 Buffer/Uint8Array인 경우 JSON 파싱
+  if (payload instanceof Uint8Array || Buffer.isBuffer(payload)) {
+    return JSON.parse(new TextDecoder().decode(payload));
+  }
+
+  return payload;
+}
+
+/**
+ * SHA-1 fingerprint 계산 (인증서 검증용)
+ */
+async function computeSHA1(data) {
+  const { createHash } = await import('node:crypto');
+  return createHash('sha1').update(data).digest('hex');
+}
+
+// ========== 멱등성 ==========
+
+async function checkAndRecordEvent(eventId, eventType) {
+  try {
+    await dynamodb.send(new PutCommand({
+      TableName: APPLE_EVENTS_TABLE,
+      Item: {
+        event_id: eventId,
+        event_type: eventType,
+        processed_at: new Date().toISOString(),
+        ttl: Math.floor(Date.now() / 1000) + TTL_30_DAYS,
+      },
+      ConditionExpression: 'attribute_not_exists(event_id)',
+    }));
+    return false; // 신규
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') {
+      return true; // 중복
+    }
+    throw error;
+  }
+}
+
+// ========== 상태 결정 ==========
+
+/**
+ * 클라이언트 verify에서 트랜잭션 payload 기반 상태 결정
+ */
+function determineStatus(payload) {
+  // 만료 확인
+  if (payload.expiresDate) {
+    const expiresMs = typeof payload.expiresDate === 'number'
+      ? payload.expiresDate
+      : new Date(payload.expiresDate).getTime();
+    if (expiresMs < Date.now()) {
+      return 'expired';
+    }
+  }
+
+  // 취소/환불 확인
+  if (payload.revocationDate || payload.revocationReason !== undefined) {
+    return 'cancelled';
+  }
+
+  return 'active';
+}
+
+/**
+ * App Store Server Notification v2 타입 → 구독 상태 매핑
+ */
+function mapNotificationToStatus(notificationType, subtype) {
+  switch (notificationType) {
+    case 'SUBSCRIBED':
+    case 'DID_RENEW':
+      return 'active';
+
+    case 'DID_CHANGE_RENEWAL_STATUS':
+      // AUTO_RENEW_DISABLED = 다음 갱신 안 함 (현재는 아직 active)
+      // cancel_at_period_end는 별도 필드로 추적
+      return 'active';
+
+    case 'DID_CHANGE_RENEWAL_PREF':
+      // 플랜 변경 (업/다운그레이드 예약) — 구독은 여전히 active
+      return 'active';
+
+    case 'DID_FAIL_TO_RENEW':
+      return 'past_due';
+
+    case 'EXPIRED':
+      return 'expired';
+
+    case 'REFUND':
+    case 'REVOKE':
+      return 'cancelled';
+
+    case 'CONSUMPTION_REQUEST':
+    case 'OFFER_REDEEMED':
+    case 'PRICE_INCREASE':
+    case 'RENEWAL_EXTENDED':
+    case 'TEST':
+      // 상태 변경 불필요
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * S2S 알림 시 결제 기록 생성
+ * 갱신, 구독, 환불, 실패 알림에 대해 supernoba-payments에 기록
+ */
+async function createApplePaymentRecord(userId, transactionInfo, notificationType, suffix) {
+  // 결제 기록이 필요한 알림 타입만 처리
+  const recordableTypes = {
+    SUBSCRIBED: 'completed',
+    DID_RENEW: 'completed',
+    REFUND: 'refunded',
+    REVOKE: 'refunded',
+    DID_FAIL_TO_RENEW: 'failed',
+  };
+
+  const paymentStatus = recordableTypes[notificationType];
+  if (!paymentStatus) return;
+
+  // 결제 기록 ID: 알림 타입 + transactionId로 구분
+  const paymentId = `apple_notif_${transactionInfo.transactionId}`;
+
+  try {
+    await dynamodb.send(new PutCommand({
+      TableName: PAYMENTS_TABLE,
+      Item: {
+        user_id: userId,
+        payment_id: paymentId,
+        type: 'subscription',
+        status: paymentStatus,
+        source: 'apple',
+        product_id: transactionInfo.productId,
+        apple_transaction_id: transactionInfo.transactionId,
+        apple_original_transaction_id: transactionInfo.originalTransactionId,
+        notification_type: notificationType,
+        is_test: suffix === '_test',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      ConditionExpression: 'attribute_not_exists(payment_id)',
+    }));
+    console.log(`[apple-iap] Payment record created: ${paymentId} (${notificationType} → ${paymentStatus})`);
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') {
+      console.log(`[apple-iap] Payment record already exists: ${paymentId}`);
+    } else {
+      console.error(`[apple-iap] Failed to create payment record: ${paymentId}`, error.message);
+    }
+  }
+}
+
+// ========== 유틸리티 ==========
+
+/**
+ * apple_original_transaction_id로 supernoba-users에서 user_id 조회
+ * (GSI 없으므로 payments 테이블에서 역조회)
+ */
+async function findUserByAppleTransactionId(originalTransactionId) {
+  if (!originalTransactionId) return null;
+
+  // supernoba-users에서 apple_original_transaction_id로 Scan 조회
+  // GSI가 없으므로 전체 순회 필요 — 알림 빈도가 매우 낮으므로 (일 수~십건) 충분
+  // Limit 없이 페이지네이션으로 전체 테이블 순회 보장
+
+  const { DynamoDBClient: DC, ScanCommand } = await import('@aws-sdk/client-dynamodb');
+  const { unmarshall } = await import('@aws-sdk/util-dynamodb');
+
+  const client = new DC({ region: process.env.AWS_REGION || 'ap-northeast-2' });
+
+  let lastEvaluatedKey = undefined;
+  do {
+    const params = {
+      TableName: USER_TABLE,
+      FilterExpression: 'apple_original_transaction_id = :otxn OR apple_original_transaction_id_test = :otxn',
+      ExpressionAttributeValues: { ':otxn': { S: originalTransactionId } },
+      ProjectionExpression: 'user_id',
+    };
+    if (lastEvaluatedKey) params.ExclusiveStartKey = lastEvaluatedKey;
+
+    const result = await client.send(new ScanCommand(params));
+    if (result.Items && result.Items.length > 0) {
+      return unmarshall(result.Items[0]).user_id;
+    }
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
+
+  return null;
+}
+

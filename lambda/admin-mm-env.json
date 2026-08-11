@@ -1,0 +1,9 @@
+{
+  "Variables": {
+    "RDS_ENDPOINT": "supernoba-rdb1.cluster-cyxfcbnpfoci.ap-northeast-2.rds.amazonaws.com",
+    "COGNITO_USER_POOL_ID": "ap-northeast-2_dhsiCqgku",
+    "DB_SECRET_ARN": "arn:aws:secretsmanager:ap-northeast-2:264520158196:secret:rds!cluster-7c447037-9cfc-4891-ae01-b80040308ddd-DAv2ug",
+    "BACKUP_CACHE_HOST": "master.supernobaorderbookbackupcache.5vrxzz.apn2.cache.amazonaws.com",
+    "VALKEY_TLS": "true"
+  }
+}

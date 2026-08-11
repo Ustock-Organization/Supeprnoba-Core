@@ -1,0 +1,16 @@
+# Supernoba Market Maker Service 로그 로테이션 설정
+# 위치: /etc/logrotate.d/supernoba-mm
+# 대상 서버: server (stock-bastion)
+
+/var/log/supernoba/mm-service/*.log {
+    daily
+    maxsize 100M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d-%H%M
+}

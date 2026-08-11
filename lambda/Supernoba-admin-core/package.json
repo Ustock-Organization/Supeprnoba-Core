@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-admin-core",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "User management and system settings Lambda",
+  "main": "index.mjs",
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}

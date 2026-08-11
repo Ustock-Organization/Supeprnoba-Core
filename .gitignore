@@ -51,3 +51,42 @@ Release
 
 #a place to hide documents that should not go into the repo:
 doc/NotGitWorthy/
+node_modules/
+
+# Lambda Artifacts
+**/lambda/**/function.zip
+**/lambda/**/lambda_only.zip
+**/lambda/**/*.cjs
+**/lambda/**/dist/
+
+# Cache/Debug Data
+cache_*.json
+
+# Deployment Artifacts
+*.zip
+engine_pkg.zip
+func_*.zip
+lambda/**/node_modules/
+lambda/**/*.zip
+
+# Security - Sensitive Configuration Files
+admin_config.json
+**/env.json
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# AWS Credentials
+credentials
+*.pem
+*.key
+
+# Build artifacts
+aggregator/build/
+wrapper/build_local/
+
+# Package locks (Lambda)
+lambda/**/package-lock.json
+mm-service/package-lock.json
+.claude/worktrees/

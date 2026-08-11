@@ -1,0 +1,246 @@
+name: Deploy Lambda Layers
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'lambda/layers/**'
+  workflow_dispatch:
+    inputs:
+      layer_name:
+        description: 'Layer to deploy (supernoba-common, supernoba-auth, supernoba-pg, or all)'
+        required: false
+        default: 'all'
+        type: string
+
+env:
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      common: ${{ steps.changes.outputs.common }}
+      auth: ${{ steps.changes.outputs.auth }}
+      pg: ${{ steps.changes.outputs.pg }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect layer changes
+        id: changes
+        run: |
+          LAYER_INPUT="${{ github.event.inputs.layer_name }}"
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "$LAYER_INPUT" == "all" ] || [ "$LAYER_INPUT" == "supernoba-common" ]; then
+              echo "common=true" >> $GITHUB_OUTPUT
+            else
+              echo "common=false" >> $GITHUB_OUTPUT
+            fi
+            if [ "$LAYER_INPUT" == "all" ] || [ "$LAYER_INPUT" == "supernoba-auth" ]; then
+              echo "auth=true" >> $GITHUB_OUTPUT
+            else
+              echo "auth=false" >> $GITHUB_OUTPUT
+            fi
+            if [ "$LAYER_INPUT" == "all" ] || [ "$LAYER_INPUT" == "supernoba-pg" ]; then
+              echo "pg=true" >> $GITHUB_OUTPUT
+            else
+              echo "pg=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # git diff로 변경 감지
+            CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD)
+
+            if echo "$CHANGED" | grep -q "lambda/layers/supernoba-common/"; then
+              echo "common=true" >> $GITHUB_OUTPUT
+            else
+              echo "common=false" >> $GITHUB_OUTPUT
+            fi
+            if echo "$CHANGED" | grep -q "lambda/layers/supernoba-auth/"; then
+              echo "auth=true" >> $GITHUB_OUTPUT
+            else
+              echo "auth=false" >> $GITHUB_OUTPUT
+            fi
+            if echo "$CHANGED" | grep -q "lambda/layers/supernoba-pg/"; then
+              echo "pg=true" >> $GITHUB_OUTPUT
+            else
+              echo "pg=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  deploy-common:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.common == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        working-directory: lambda/layers/supernoba-common/nodejs
+        run: npm install --omit=dev
+
+      - name: Package layer
+        working-directory: lambda/layers/supernoba-common
+        run: zip -r layer.zip nodejs/
+
+      - name: Publish layer version
+        working-directory: lambda/layers/supernoba-common
+        run: |
+          RESULT=$(aws lambda publish-layer-version \
+            --layer-name supernoba-common \
+            --zip-file fileb://layer.zip \
+            --compatible-runtimes nodejs20.x nodejs22.x \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+
+          VERSION=$(echo $RESULT | jq -r '.Version')
+          ARN=$(echo $RESULT | jq -r '.LayerVersionArn')
+          echo "Published supernoba-common layer version: $VERSION"
+          echo "ARN: $ARN"
+          echo "LAYER_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "LAYER_ARN=$ARN" >> $GITHUB_ENV
+
+      - name: Summary
+        run: |
+          echo "### supernoba-common Layer Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ env.LAYER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ARN**: ${{ env.LAYER_ARN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runtimes**: nodejs20.x, nodejs22.x" >> $GITHUB_STEP_SUMMARY
+
+  deploy-auth:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.auth == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        working-directory: lambda/layers/supernoba-auth/nodejs
+        run: npm install --omit=dev
+
+      - name: Package layer
+        working-directory: lambda/layers/supernoba-auth
+        run: zip -r layer.zip nodejs/
+
+      - name: Publish layer version
+        working-directory: lambda/layers/supernoba-auth
+        run: |
+          RESULT=$(aws lambda publish-layer-version \
+            --layer-name supernoba-auth \
+            --zip-file fileb://layer.zip \
+            --compatible-runtimes nodejs20.x nodejs22.x \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+
+          VERSION=$(echo $RESULT | jq -r '.Version')
+          ARN=$(echo $RESULT | jq -r '.LayerVersionArn')
+          echo "Published supernoba-auth layer version: $VERSION"
+          echo "ARN: $ARN"
+          echo "LAYER_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "LAYER_ARN=$ARN" >> $GITHUB_ENV
+
+      - name: Summary
+        run: |
+          echo "### supernoba-auth Layer Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ env.LAYER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ARN**: ${{ env.LAYER_ARN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runtimes**: nodejs20.x, nodejs22.x" >> $GITHUB_STEP_SUMMARY
+
+  deploy-pg:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.pg == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        working-directory: lambda/layers/supernoba-pg/nodejs
+        run: npm install --omit=dev
+
+      - name: Package layer
+        working-directory: lambda/layers/supernoba-pg
+        run: zip -r layer.zip nodejs/
+
+      - name: Publish layer version
+        working-directory: lambda/layers/supernoba-pg
+        run: |
+          RESULT=$(aws lambda publish-layer-version \
+            --layer-name supernoba-pg \
+            --zip-file fileb://layer.zip \
+            --compatible-runtimes nodejs20.x nodejs22.x \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+
+          VERSION=$(echo $RESULT | jq -r '.Version')
+          ARN=$(echo $RESULT | jq -r '.LayerVersionArn')
+          echo "Published supernoba-pg layer version: $VERSION"
+          echo "ARN: $ARN"
+          echo "LAYER_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "LAYER_ARN=$ARN" >> $GITHUB_ENV
+
+      - name: Summary
+        run: |
+          echo "### supernoba-pg Layer Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ env.LAYER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ARN**: ${{ env.LAYER_ARN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runtimes**: nodejs20.x, nodejs22.x" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    needs: [deploy-common, deploy-auth, deploy-pg]
+    if: always() && (needs.deploy-common.result == 'success' || needs.deploy-auth.result == 'success' || needs.deploy-pg.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        if: always()
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            LAYERS=""
+            if [ "${{ needs.deploy-common.result }}" == "success" ]; then LAYERS="$LAYERS common"; fi
+            if [ "${{ needs.deploy-auth.result }}" == "success" ]; then LAYERS="$LAYERS auth"; fi
+            if [ "${{ needs.deploy-pg.result }}" == "success" ]; then LAYERS="$LAYERS pg"; fi
+
+            COMMIT_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+
+            curl -s -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"attachments\": [{
+                  \"color\": \"good\",
+                  \"title\": \"Lambda Layer 배포 완료\",
+                  \"fields\": [
+                    {\"title\": \"레이어\", \"value\": \"$LAYERS\", \"short\": true},
+                    {\"title\": \"브랜치\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                    {\"title\": \"커밋\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$COMMIT_SHORT>\", \"short\": true}
+                  ],
+                  \"footer\": \"GitHub Actions\",
+                  \"ts\": $(date +%s)
+                }]
+              }" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}"
+          fi

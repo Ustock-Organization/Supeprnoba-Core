@@ -61,7 +61,13 @@ public:
     void setOrderQty(liquibook::book::Quantity q) { order_qty_ = q; }
     void setStopPrice(liquibook::book::Price p) { stop_price_ = p; }
     void setConditions(liquibook::book::OrderConditions c) { conditions_ = c; }
+    void setFilledQty(liquibook::book::Quantity q) { filled_qty_ = q; }
+    void setFilledCost(liquibook::book::Cost c) { filled_cost_ = c; }
     void setTimestamp(int64_t ts) { timestamp_ = ts; }
+
+    // 주문 유형 (MARKET / LIMIT) — Kinesis order_type 필드에서 직접 읽음
+    const std::string& order_type() const { return order_type_; }
+    void setOrderType(const std::string& t) { order_type_ = t; }
 
 private:
     std::string order_id_;
@@ -75,6 +81,7 @@ private:
     liquibook::book::Price stop_price_ = 0;
     liquibook::book::OrderConditions conditions_ = 0;
     int64_t timestamp_ = 0;
+    std::string order_type_ = "LIMIT";
 };
 
 using OrderPtr = std::shared_ptr<Order>;
