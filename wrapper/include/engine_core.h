@@ -56,6 +56,13 @@ private:
     OrderPtr findOrder(const std::string& symbol, const std::string& order_id);
     void cleanupProcessedOrders();
 
+    // Self-Trade Prevention (STP): cancel-oldest 정책.
+    // aggressor의 limit price까지 반대편 북에서 동일 user_id의 resting 주문을 취소.
+    // 락(rw_mutex_) 보유 상태에서 호출. MM 계정은 면제(의도적 자전체결).
+    // 반환: 취소된 주문 수.
+    int applySelfTradePrevention(const std::string& symbol, const OrderPtr& aggressor);
+    static bool isMarketMaker(const std::string& user_id);
+
     std::map<std::string, OrderBookPtr> books_;
     std::map<std::string, std::map<std::string, OrderPtr>> order_maps_;
     mutable std::shared_mutex rw_mutex_;  // shared_mutex for read-write locking
@@ -69,6 +76,7 @@ private:
     uint64_t total_orders_processed_ = 0;
     uint64_t total_trades_executed_ = 0;
     uint64_t duplicates_rejected_ = 0;
+    uint64_t self_trades_prevented_ = 0;
 };
 
 } // namespace aws_wrapper
