@@ -6,13 +6,25 @@
 
 ## 프로젝트 개요
 
-**Supernoba**는 실시간 주식 거래 시뮬레이션 플랫폼으로, 다음 3개의 주요 저장소로 구성됩니다:
+**Supernoba**는 실시간 주식 거래 시뮬레이션 플랫폼으로, 다음 4개의 저장소로 구성됩니다:
 
 | 저장소 | 경로 | 기술 스택 | 역할 |
 |--------|------|----------|------|
-| **Supernoba-Core_Old** | `C:\develop\supernoba\Supernoba-Core_Old` | C++17, Node.js, Lambda | 매칭 엔진, 스트리밍, Lambda 함수 |
-| **Supernoba-front** | `C:\develop\supernoba\Supernoba-front` | React 18, Redux Toolkit | 웹/모바일 프론트엔드 |
-| **Supernoba-back** | `C:\develop\supernoba\Supernoba-back` | C++17 | Lambda 통합 프로세서 (stock-processor) |
+| **Supeprnoba-Core** (본 레포) | `C:\develop\supernoba\Supeprnoba-Core` | C++17, Node.js, Lambda | 매칭 엔진, 집계기, 스트리머, MM 봇, Lambda 함수 |
+| **Supernoba-front** | `C:\develop\supernoba\Supernoba-front` | React 18, Capacitor(iOS) | 웹/모바일 프론트엔드 |
+| **Supernoba-back** | `C:\develop\supernoba\Supernoba-back` | C++17 | 정산 프로세서 (stock-processor) |
+| **Supernoba-game** | `C:\develop\supernoba\Supernoba-game` | C++20, SDL2 | 3D 게임 클라이언트 (동결 프로토타입, 서버 미구현) |
+
+> (구 로컬 디렉토리명 `Supernoba-Core_Old`은 본 레포와 동일 — 구 문서·배포 경로에 이름이 남아 있다)
+
+### 현재 상태 (2026-08-12)
+
+- **하이버네이션 → 재활성화 준비 중.** AWS 인프라(EC2·Kinesis·DynamoDB·RDS·ElastiCache·CloudFront)는
+  2026-06-18 전면 해체됨 — 이 문서의 아키텍처 설명은 코드가 구현하는 설계의 기록이며, 살아있는
+  인프라가 아니다. GitHub Actions 배포 워크플로 4종도 비활성화 상태(2026-08-12).
+- **브랜치 전략**: `master`=최신 정본(hibernation 흡수), `develop`=master 동기,
+  `infra/aws`=AWS 재구축용(작업 계획 `tasks/todo.md`), `infra/raspi`=라즈베리파이 이전용.
+- 재가동 시 필수 선행: `tasks/todo.md` Phase 0~1 (신뢰성 P0 — 다운타임 주문 블랙홀·정산 멱등화·WAL 재생).
 
 ---
 
