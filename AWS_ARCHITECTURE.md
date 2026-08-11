@@ -1,6 +1,10 @@
 # AWS Supernoba 아키텍처
 
-Amazon Kinesis + Valkey 기반 실시간 매칭 엔진 인프라 (2025-12-21 최신)
+Amazon Kinesis + Valkey 기반 실시간 매칭 엔진 인프라 (2025-12-21 작성)
+
+> 📦 **상태(2026-08-12)**: 여기 기술된 AWS 리소스는 2026-06-18 하이버네이션으로 **전부 해체됨**.
+> 이 문서는 코드가 전제하는 설계의 레퍼런스로 유지한다. 재구축 계획(계정 이전·SQS 전환 검토 포함)은
+> `tasks/todo.md` 참조.
 
 > **핵심 원칙**: Kinesis는 주문/체결용만 사용. Depth 데이터는 Valkey에 직접 저장 → Streamer가 폴링하여 WebSocket 푸시.
 

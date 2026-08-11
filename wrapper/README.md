@@ -1,6 +1,9 @@
 # Liquibook AWS Wrapper
 
-Liquibook 매칭 엔진을 AWS 환경 (EC2 + MSK + Redis)에서 운영하기 위한 C++ 네이티브 래퍼입니다.
+Liquibook 매칭 엔진을 AWS 환경 (EC2 + **Kinesis** + Valkey)에서 운영하기 위한 C++ 네이티브 래퍼입니다.
+
+> 주: 초기 설계의 MSK(Kafka)는 Kinesis로 대체되었다 (`-DUSE_KINESIS`, `config.h`의 KAFKA_* 상수는 잔재).
+> 주문 유입 = `supernoba-orders` 폴링 소비, 산출 = `supernoba-fills`/`supernoba-order-status` 발행.
 
 ## 빠른 시작 (EC2 Linux)
 
