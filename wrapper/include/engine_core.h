@@ -5,6 +5,7 @@
 #include "market_data_handler.h"
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -45,6 +46,14 @@ public:
     // === 주문 조회 API ===
     bool hasOrder(const std::string& symbol, const std::string& order_id) const;
 
+    // === VI 서킷브레이커 (동적: 직전 체결가 대비 급변 시 종목 일시정지) ===
+    // 체결 콜백(MarketDataHandler)에서 호출. 변동률이 임계 초과면 halt 설정 + 상태 전파.
+    void onTradeForVI(const std::string& symbol, uint64_t fill_price);
+    // 현재 halt 중인지(자동 해제 포함). 락 없이 호출 가능하도록 자체 뮤텍스 사용.
+    bool isHalted(const std::string& symbol);
+    // 변동률이 VI 임계를 초과하는지(순수 판정). |cur-ref|/ref >= pct.
+    static bool exceedsViThreshold(uint64_t ref_price, uint64_t cur_price, double pct);
+
     // === 메트릭 API ===
     size_t getSymbolCount() const;
     std::vector<std::string> getAllSymbols() const;
@@ -83,9 +92,17 @@ private:
     uint64_t duplicates_rejected_ = 0;
     uint64_t self_trades_prevented_ = 0;
     uint64_t price_band_rejects_ = 0;
+    uint64_t vi_halt_rejects_ = 0;
 
     // 가격 밴드 폭(직전 체결가 대비 ±비율). 0이면 비활성. PRICE_BAND_PCT env로 설정.
     double price_band_pct_ = 0.0;
+
+    // VI 서킷브레이커 설정/상태
+    double vi_dynamic_pct_ = 0.0;      // 동적 VI 임계(직전 체결가 대비). 0이면 비활성.
+    int vi_halt_seconds_ = 120;        // halt 지속(초)
+    std::unordered_map<std::string, uint64_t> vi_last_price_;   // 심볼별 직전 체결가(VI 기준)
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> halt_until_;
+    mutable std::mutex vi_mutex_;      // vi_last_price_/halt_until_ 보호(콜백 스레드/주문 스레드)
 };
 
 } // namespace aws_wrapper

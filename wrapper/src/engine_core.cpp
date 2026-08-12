@@ -4,6 +4,7 @@
 #include "config.h"
 #include <mutex>
 #include <cstdlib>
+#include <cmath>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
@@ -23,7 +24,68 @@ EngineCore::EngineCore(MarketDataHandler* handler, RedisClient* redis)
     if (price_band_pct_ > 0.0) {
         Logger::info("Price band enabled: ±", price_band_pct_ * 100.0, "% of last trade");
     }
+    // VI 서킷브레이커 설정
+    try {
+        vi_dynamic_pct_ = std::stod(Config::get("VI_DYNAMIC_PCT", "0"));
+    } catch (...) {
+        vi_dynamic_pct_ = 0.0;
+    }
+    vi_halt_seconds_ = std::stoi(Config::get("VI_HALT_SECONDS", "120"));
+    if (vi_dynamic_pct_ > 0.0) {
+        Logger::info("VI circuit breaker enabled: ±", vi_dynamic_pct_ * 100.0,
+                     "% dynamic, halt", vi_halt_seconds_, "s");
+    }
     Logger::info("EngineCore initialized");
+}
+
+bool EngineCore::exceedsViThreshold(uint64_t ref_price, uint64_t cur_price, double pct) {
+    if (pct <= 0.0 || ref_price == 0) return false;
+    const double change = std::abs(static_cast<double>(cur_price) -
+                                   static_cast<double>(ref_price)) /
+                          static_cast<double>(ref_price);
+    return change >= pct;
+}
+
+void EngineCore::onTradeForVI(const std::string& symbol, uint64_t fill_price) {
+    if (vi_dynamic_pct_ <= 0.0 || fill_price == 0) return;
+
+    bool newly_halted = false;
+    {
+        std::lock_guard<std::mutex> lock(vi_mutex_);
+        auto it = vi_last_price_.find(symbol);
+        if (it != vi_last_price_.end() &&
+            exceedsViThreshold(it->second, fill_price, vi_dynamic_pct_)) {
+            halt_until_[symbol] = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(vi_halt_seconds_);
+            newly_halted = true;
+        }
+        vi_last_price_[symbol] = fill_price;
+    }
+
+    if (newly_halted) {
+        Logger::warn("VI HALT:", symbol, "price:", fill_price,
+                     "(급변 ±", vi_dynamic_pct_ * 100.0, "% 초과) —", vi_halt_seconds_, "s 정지");
+        // 상태 전파: MM·스트리머·프론트가 구독. MM은 halt 시 호가를 걷어야 함(재개 단일가 왜곡 방지).
+        if (operating_redis_ && operating_redis_->isConnected()) {
+            operating_redis_->set("symbol:" + symbol + ":state", "HALTED");
+        }
+    }
+}
+
+bool EngineCore::isHalted(const std::string& symbol) {
+    if (vi_dynamic_pct_ <= 0.0) return false;
+    std::lock_guard<std::mutex> lock(vi_mutex_);
+    auto it = halt_until_.find(symbol);
+    if (it == halt_until_.end()) return false;
+    if (std::chrono::steady_clock::now() >= it->second) {
+        // 자동 해제
+        halt_until_.erase(it);
+        if (operating_redis_ && operating_redis_->isConnected()) {
+            operating_redis_->set("symbol:" + symbol + ":state", "CONTINUOUS");
+        }
+        return false;
+    }
+    return true;
 }
 
 bool EngineCore::violatesPriceBand(const OrderPtr& order) const {
@@ -161,8 +223,18 @@ bool EngineCore::addOrder(OrderPtr order) {
             return false;
         }
 
+        // VI 서킷브레이커: halt 중인 종목의 신규 주문 거부 (무결성 원칙: halt 검사가 밴드보다 우선).
+        if (isHalted(symbol)) {
+            ++vi_halt_rejects_;
+            lock.unlock();
+            if (handler_) {
+                handler_->on_reject(order, "Symbol halted (volatility interruption)");
+            }
+            Logger::warn("Order rejected (VI halt):", order_id, symbol);
+            return false;
+        }
+
         // 가격 밴드: 직전 체결가 대비 과도하게 벗어난 LIMIT 주문 거부 (fat-finger·조작 차단).
-        // TODO(VI): 서킷브레이커 도입 시 halt 상태 검사를 밴드 검사보다 '먼저' 수행할 것.
         if (violatesPriceBand(order)) {
             ++price_band_rejects_;
             lock.unlock();

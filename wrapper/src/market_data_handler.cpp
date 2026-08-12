@@ -95,6 +95,11 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     day.last_price = fill_price;
     day.volume += fill_qty;  // 거래량 누적
 
+    // VI 서킷브레이커: 직전 체결가 대비 급변이면 종목 halt (엔진이 판정·전파).
+    if (engine_) {
+        engine_->onTradeForVI(symbol, fill_price);
+    }
+
     Logger::debug("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume);
     
     // === OHLC 캐시 저장 (당일만) ===
