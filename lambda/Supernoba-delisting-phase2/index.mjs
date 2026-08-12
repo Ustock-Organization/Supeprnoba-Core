@@ -93,6 +93,14 @@ function getGrpcClient() {
   return grpcClient;
 }
 
+// 관리 채널 인증 토큰(x-engine-token)을 담은 메타데이터. 엔진이 ENGINE_GRPC_TOKEN과 대조한다.
+function buildAuthMetadata() {
+  const metadata = new grpc.Metadata();
+  const token = process.env.ENGINE_GRPC_TOKEN;
+  if (token) metadata.set('x-engine-token', token);
+  return metadata;
+}
+
 // ---------------------------------------------------------------------------
 // gRPC Promise 래퍼
 // ---------------------------------------------------------------------------
@@ -109,7 +117,7 @@ function cancelAllOrders(symbol) {
   return new Promise((resolve, reject) => {
     const client = getGrpcClient();
     const deadline = new Date(Date.now() + 30000); // 30초 -- 대량 주문 취소 대비
-    client.CancelAllOrders({ symbol }, { deadline }, (err, response) => {
+    client.CancelAllOrders({ symbol }, buildAuthMetadata(), { deadline }, (err, response) => {
       if (err) {
         reject(new Error(`gRPC CancelAllOrders failed: ${err.message} (code=${err.code})`));
       } else {
@@ -130,7 +138,7 @@ function removeOrderBook(symbol) {
   return new Promise((resolve, reject) => {
     const client = getGrpcClient();
     const deadline = new Date(Date.now() + 10000); // 10초
-    client.RemoveOrderBook({ symbol }, { deadline }, (err, response) => {
+    client.RemoveOrderBook({ symbol }, buildAuthMetadata(), { deadline }, (err, response) => {
       if (err) {
         reject(new Error(`gRPC RemoveOrderBook failed: ${err.message} (code=${err.code})`));
       } else {

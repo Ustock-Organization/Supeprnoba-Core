@@ -1,18 +1,43 @@
 #include "grpc_service.h"
 #include "logger.h"
+#include "config.h"
 #include <grpcpp/grpcpp.h>
+#include <cstdlib>
 
 namespace aws_wrapper {
 
 GrpcServiceImpl::GrpcServiceImpl(EngineCore* engine, RedisClient* redis)
     : engine_(engine)
     , redis_(redis)
+    , auth_token_(Config::get("ENGINE_GRPC_TOKEN", ""))
     , start_time_(std::chrono::steady_clock::now()) {
+    if (auth_token_.empty()) {
+        Logger::warn("gRPC 관리 채널 인증 비활성 (ENGINE_GRPC_TOKEN 미설정) — "
+                     "프로덕션에서는 반드시 설정할 것");
+    } else {
+        Logger::info("gRPC 관리 채널 인증 활성 (x-engine-token 검증)");
+    }
+}
+
+bool GrpcServiceImpl::authorize(grpc::ServerContext* context, const char* rpc_name) const {
+    if (auth_token_.empty()) {
+        return true;  // 미설정 시 허용(하위호환) — 생성자에서 경고 로깅됨
+    }
+    const auto& md = context->client_metadata();
+    auto it = md.find("x-engine-token");
+    if (it != md.end() &&
+        std::string(it->second.data(), it->second.length()) == auth_token_) {
+        return true;
+    }
+    Logger::warn("gRPC UNAUTHENTICATED:", rpc_name, "(토큰 누락/불일치)");
+    return false;
 }
 
 grpc::Status GrpcServiceImpl::CreateSnapshot(grpc::ServerContext* context,
                                                const SnapshotRequest* request,
                                                SnapshotResponse* response) {
+    if (!authorize(context, "CreateSnapshot"))
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid or missing x-engine-token");
     Logger::info("gRPC CreateSnapshot:", request->symbol());
     
     std::string data = engine_->snapshotOrderBook(request->symbol());
@@ -36,6 +61,8 @@ grpc::Status GrpcServiceImpl::CreateSnapshot(grpc::ServerContext* context,
 grpc::Status GrpcServiceImpl::RestoreSnapshot(grpc::ServerContext* context,
                                                 const RestoreRequest* request,
                                                 RestoreResponse* response) {
+    if (!authorize(context, "RestoreSnapshot"))
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid or missing x-engine-token");
     Logger::info("gRPC RestoreSnapshot:", request->symbol());
     
     std::string data = request->data();
@@ -66,6 +93,8 @@ grpc::Status GrpcServiceImpl::RestoreSnapshot(grpc::ServerContext* context,
 grpc::Status GrpcServiceImpl::RemoveOrderBook(grpc::ServerContext* context,
                                                 const RemoveRequest* request,
                                                 RemoveResponse* response) {
+    if (!authorize(context, "RemoveOrderBook"))
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid or missing x-engine-token");
     Logger::info("gRPC RemoveOrderBook:", request->symbol());
     
     bool success = engine_->removeOrderBook(request->symbol());
@@ -103,6 +132,8 @@ grpc::Status GrpcServiceImpl::CancelAllOrders(
         return grpc::Status::OK;
     }
 
+    if (!authorize(context, "CancelAllOrders"))
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid or missing x-engine-token");
     Logger::info("gRPC CancelAllOrders:", symbol);
 
     try {
@@ -137,6 +168,8 @@ grpc::Status GrpcServiceImpl::CancelOrder(
         return grpc::Status::OK;
     }
 
+    if (!authorize(context, "CancelOrder"))
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid or missing x-engine-token");
     Logger::info("gRPC CancelOrder:", symbol, order_id);
 
     try {

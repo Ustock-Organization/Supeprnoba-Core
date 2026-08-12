@@ -122,7 +122,11 @@ int main(int argc, char* argv[]) {
         
         // Kinesis Producer 생성
         KinesisProducer producer(aws_region);
-        
+
+        // WAL 재생: 이전 세션에서 발행 실패로 남은 체결/상태 이벤트를 재발행.
+        // 정산 멱등화(trade_id dedup)와 결합해 유실 없이 안전하게 복구(effectively-once).
+        producer.replayWAL();
+
         // Trade history is now saved via Lambda (Kinesis fills stream)
         
         // RankingManager 생성 (백업용 Redis 2개: main thread write + bg thread read)

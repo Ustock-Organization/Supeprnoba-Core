@@ -6,6 +6,11 @@
 #include <chrono>
 #include <fstream>
 #include <thread>
+#include <cstdio>
+
+namespace {
+constexpr const char* WAL_PATH = "/var/log/supernoba/kinesis-wal.log";
+}
 
 namespace aws_wrapper {
 
@@ -92,8 +97,6 @@ void KinesisProducer::produce(const std::string& stream_name,
 void KinesisProducer::saveToWAL(const std::string& stream_name,
                                   const std::string& partition_key,
                                   const std::string& data) {
-    static const char* WAL_PATH = "/var/log/supernoba/kinesis-wal.log";
-
     try {
         std::ofstream wal_file(WAL_PATH, std::ios::app);
         if (wal_file.is_open()) {
@@ -111,6 +114,58 @@ void KinesisProducer::saveToWAL(const std::string& stream_name,
     } catch (const std::exception& e) {
         Logger::error("[WAL] Failed to save:", e.what());
     }
+}
+
+int KinesisProducer::replayWAL() {
+    // WAL을 원자적으로 rename 후 재발행 → 실패분은 fresh WAL(WAL_PATH)로 다시 쌓인다.
+    // (읽는 중 produce() 실패가 같은 파일에 append되어 무한 성장하는 것을 방지)
+    const std::string replaying = std::string(WAL_PATH) + ".replaying";
+
+    // WAL이 없으면 조용히 반환
+    {
+        std::ifstream check(WAL_PATH);
+        if (!check.good()) return 0;
+    }
+
+    if (std::rename(WAL_PATH, replaying.c_str()) != 0) {
+        Logger::warn("[WAL] rename failed, skipping replay");
+        return 0;
+    }
+
+    std::ifstream in(replaying);
+    if (!in.is_open()) {
+        Logger::error("[WAL] cannot open", replaying, "for replay");
+        return 0;
+    }
+
+    int replayed = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+
+        // 포맷: ts|stream|partition_key|data  (data는 JSON이라 '|' 포함 가능 → 앞 3개만 split)
+        auto p1 = line.find('|');
+        auto p2 = (p1 == std::string::npos) ? std::string::npos : line.find('|', p1 + 1);
+        auto p3 = (p2 == std::string::npos) ? std::string::npos : line.find('|', p2 + 1);
+        if (p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos) {
+            Logger::warn("[WAL] malformed line skipped");
+            continue;
+        }
+        std::string stream = line.substr(p1 + 1, p2 - p1 - 1);
+        std::string pkey = line.substr(p2 + 1, p3 - p2 - 1);
+        std::string data = line.substr(p3 + 1);
+
+        // 재발행 — 실패 시 produce()가 fresh WAL_PATH에 다시 기록한다.
+        produce(stream, pkey, data);
+        ++replayed;
+    }
+    in.close();
+
+    std::remove(replaying.c_str());
+    if (replayed > 0) {
+        Logger::info("[WAL] replayed", replayed, "record(s) from WAL");
+    }
+    return replayed;
 }
 
 void KinesisProducer::publishFill(const std::string& symbol,

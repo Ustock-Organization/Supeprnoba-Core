@@ -46,7 +46,13 @@ public:
                             const std::string& order_type = "") override;
     
     void flush(int timeout_ms = 1000) override;
-    
+
+    // WAL 재생: 발행 실패로 로컬 WAL에 남은 이벤트를 재발행한다.
+    // 기동 시 호출. 재발행 실패분은 새 WAL로 남아 다음 기동에 재시도된다.
+    // 정산 멱등화(trade_id dedup)와 결합하면 중복 재발행도 안전(effectively-once).
+    // 반환: 재발행 시도한 레코드 수.
+    int replayWAL();
+
 private:
     void produce(const std::string& stream_name,
                  const std::string& partition_key,
