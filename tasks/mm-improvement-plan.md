@@ -35,21 +35,21 @@
 - [ ] **filled_order_delay**(기본 60s): 체결 직후 재호가 대기 — 한 방향 연속 체결 쏠림 1차 방어
 - [ ] 호가 최소 존치 시간(0.5s+)·`order_refresh_tolerance` — 과도한 cancel/replace 억제
 
-### M2 — legacy_sine 대체: `organic` 전략 (가격 프로세스 + 주문 흐름)
-- [ ] `_calculatePrice()` 교체: 사인파 → **OU 정확해 + Hawkes 변조 점프**
-      `Y' = Y·e^(−λΔt) + Ȳ(1−e^(−λΔt)) + σ√((1−e^(−2λΔt))/2λ)·Z`
-      파라미터 매핑으로 하위호환: `Ȳ=basePrice`, `σ = amplitude·basePrice·√(2λ)`
-- [ ] 레짐 전환(3-state CTMC: bull/bear/range)이 OU 중심선을 이동 — 고점/저점 암기 원천 차단
-- [ ] **주문 크기 분포**: 고정 `tradeQuantity` → 라운드넘버 군집({1,10,50,100,…} Dirac) + 기하 꼬리
-      (균등난수는 그 자체가 봇 시그니처 — Benford 통과 필수)
-- [ ] **MM ID 풀 분리**: `mm-buyer`/`mm-seller` 2종 → `mm-agent-{0..N}` 풀, ZI-C 규칙
-      (랜덤 예약가 제약 내 무작위 호가)로 독립 발주 → 자가체결 비율 <5%
-- [ ] 취소 흐름 추가(주문 수명 멱함수) — 호가창이 "살아있게"
+### M2 — legacy_sine 대체: `organic` 전략 (가격 프로세스 + 주문 흐름) ✅ **완료**
+- [x] `utils/price-process.mjs`: **OU 정확해 + Hawkes 변조 점프**(하위호환 매핑 Ȳ=basePrice,
+      σ=amplitude·√(2λ)). 🔴 Hawkes 분기비 α/β<1 정상성 수정(초임계=가격 폭발 실버그 적발).
+- [x] 레짐 전환(3-state CTMC bull/bear/range)이 OU 중심선 이동 + 펀더멘털 앵커(4x 소프트 바운드).
+- [x] `utils/order-size.mjs`: 라운드넘버 군집 + 기하 꼬리 → Benford 통과.
+- [x] `strategies/organic-strategy.mjs` + MM ID 풀(mm-agent-0..N) ZI-C 호가 → 자가체결 회피.
+- [x] 취소 흐름(cancelInterval) — 호가창 갱신. index.mjs 팩토리 "organic" 등록 + config.
+- [x] (cross-repo) back isMmId를 mm- 접두사 인식으로 일반화(에이전트 풀 지원, `7249d66`).
+- 검증: price-process.test 12 + organic-strategy.test 10 PASS(팻테일·사인파제거·Benford·다양성).
 
-### M3 — 재고 스큐 활성화 (M1 완료 시 자동 + 보강)
-- [ ] spread 전략: AS `reservation = mid − skew·q` — 피드백 연결로 자동 활성
-- [ ] Hummingbot 선형보간 수량 스큐(`bid_adj + ask_adj = 2.0`, 밴드 경계에서 한쪽 0) 추가
-- [ ] 유저 포지션 인지 스큐(L5): 특정 유저 대량 매집 감지 시 해당 방향 호가 후퇴
+### M3 — 재고 스큐 활성화 (M1 완료 시 자동 + 보강) ✅ **완료(L5 제외)**
+- [x] spread 전략: AS `reservation = mid − skew·q` — M1 피드백 연결로 자동 활성.
+- [x] Hummingbot 선형 수량 스큐 `calculateInventorySkew`(bid+ask=2.0, 경계 0) + spread 전략 적용.
+      검증: inventory-skew.test 15 PASS.
+- [ ] 유저 포지션 인지 스큐(L5): 특정 유저 대량 매집 감지 시 해당 방향 호가 후퇴 (미착수)
 
 ### M4 — CPMM 백스톱 (유계 손실, Vertex 하이브리드)
 - [ ] 심볼별 가상 준비금 (x₀, y₀) 설정 — **y₀ = 그 심볼의 총 발권 예산(하드 캡)**
