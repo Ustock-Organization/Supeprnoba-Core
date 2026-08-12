@@ -22,13 +22,26 @@ const mockKinesis = {
     return {};
   },
 };
-const mockRedis = { set: async () => {}, get: async () => null };
+// 키-값을 실제로 보관하는 mock (CPMM 영속 검증에 필요)
+const store = new Map();
+const mockRedis = {
+  set: async (k, v) => { store.set(k, v); },
+  get: async (k) => (store.has(k) ? store.get(k) : null),
+};
+
+// organic은 재고 방어선(M1 체결 피드백)을 실제로 소비한다 — null이면 동작하지 않는다.
+const { default: InventoryTracker } = await import("../utils/inventory.mjs");
+function makeInventory(netPosition = 0) {
+  const inv = new InventoryTracker(mockRedis);
+  inv.getPosition = async () => ({ netPosition, totalBought: 0, totalSold: 0, limit: 2000 });
+  return inv;
+}
 
 const deps = {
   kinesis: mockKinesis,
   operatingCache: mockRedis,
   orderManager: new OrderManager(mockKinesis, "supernoba-orders"),
-  inventory: null,
+  inventory: makeInventory(0),
   priceFeed: null,
   internalFeed: null,
   config: { kinesisStream: "supernoba-orders" },
@@ -103,6 +116,84 @@ check(newOrders.length > 0, "신규 주문 존재", `new=${newOrders.length} can
     [1,5,10,50,100,200,500].includes(o.quantity)).length;
   check(roundHits / newOrders.length > 0.3, "라운드넘버 군집 존재",
         `frac=${(roundHits/newOrders.length*100).toFixed(0)}%`);
+}
+
+// ── 8. 재고 방어선이 실제로 배선되어 있다 (감사 D2) ────────────────────
+// 이전엔 organic이 InventoryTracker를 한 번도 호출하지 않아 5단계 방어선이
+// 통째로 우회됐다(inventory: null로도 테스트가 통과하던 것이 증거).
+{
+  let called = false;
+  const inv = makeInventory(0);
+  const orig = inv.getPosition;
+  inv.getPosition = async (s) => { called = true; return orig(s); };
+  const s = new OrganicStrategy("CHK", config, { ...deps, inventory: inv });
+  await s.execute({ elapsed: 0, tickCount: 0 });
+  check(called, "★ 재고 방어선 배선됨 (InventoryTracker.getPosition 호출)");
+}
+
+// ── 9. 서킷브레이커 STOPPED면 호가를 걷고 멈춘다 (감사 D4) ──────────────
+{
+  const before = published.length;
+  // netPosition이 kill 임계(positionLimit×4=2000)를 넘으면 STOPPED
+  const s = new OrganicStrategy("STOP", { ...config, positionLimit: 500 },
+                                { ...deps, inventory: makeInventory(99999) });
+  await s.execute({ elapsed: 0, tickCount: 0 });
+  const emitted = published.slice(before);
+  const newOrdersAfter = emitted.filter((o) => o.action !== "CANCEL" && o.order_type);
+  check(newOrdersAfter.length === 0, "★ STOPPED: 신규 호가 발행 없음",
+        `n=${newOrdersAfter.length}`);
+}
+
+// ── 10. VI halt 중이면 호가를 걷고 대기한다 (감사 C10/D-halt) ───────────
+{
+  store.set("symbol:HALT:state", "HALTED");
+  const before = published.length;
+  const s = new OrganicStrategy("HALT", config, deps);
+  await s.execute({ elapsed: 0, tickCount: 0 });
+  const emitted = published.slice(before);
+  const newOrdersAfter = emitted.filter((o) => o.action !== "CANCEL" && o.order_type);
+  check(newOrdersAfter.length === 0, "★ HALTED: 신규 호가 발행 없음",
+        `n=${newOrdersAfter.length}`);
+}
+
+// ── 11. CPMM 예산이 Redis에 영속된다 (감사 D1) ─────────────────────────
+// 인메모리로만 두면 재시작마다 예산이 y₀로 복구되어 캡이 무의미해진다.
+{
+  const s = new OrganicStrategy("CPMM", config, deps);
+  await s.execute({ elapsed: 0, tickCount: 0 });
+  const saved = store.get("mm:cpmm:CPMM");
+  check(!!saved, "★ CPMM 상태가 Redis에 저장됨");
+  if (saved) {
+    const st = JSON.parse(saved);
+    check(st.y0 > 0 && st.x > 0 && st.y > 0, "CPMM 상태 유효(x,y,y0 > 0)",
+          `y0=${st.y0}`);
+    // 재시작 시뮬레이션: 같은 키로 새 인스턴스를 만들면 저장분을 복원해야 한다
+    const s2 = new OrganicStrategy("CPMM", config, deps);
+    const restored = await s2._loadCpmm();
+    check(Math.abs(restored.y - st.y) < 1e-6 && restored.y0 === st.y0,
+          "★ 재시작 후 CPMM 예산 복원(리셋 안 됨)",
+          `y=${restored.y.toFixed(2)}`);
+  }
+}
+
+// ── 12. CPMM 예산 소진 시 매수(발권 방향) 호가가 철회된다 ────────────────
+{
+  // 준비금을 바닥 근처로 만들어 저장 → 매수 호가가 나오면 안 된다
+  const s = new OrganicStrategy("DRY", config, deps);
+  const c = await s._loadCpmm();
+  c.y = c.y0 * 0.01;          // floor(2%) 미만
+  c.x = c.k / c.y;
+  await s._saveCpmm();
+
+  const before = published.length;
+  const s2 = new OrganicStrategy("DRY", config, deps);
+  await s2.execute({ elapsed: 0, tickCount: 0 });
+  const emitted = published.slice(before)
+    .filter((o) => o.action !== "CANCEL" && o.order_type);
+  const buys = emitted.filter((o) => o.side === "BUY").length;
+  check(emitted.length > 0 && buys === 0,
+        "★ CPMM 예산 소진: 매수 호가 없음(무한 발권 차단)",
+        `total=${emitted.length} buy=${buys}`);
 }
 
 console.log("=== " + (failures === 0 ? "ALL PASS" : failures + " FAIL") + " ===");

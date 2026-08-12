@@ -58,8 +58,11 @@ export default class SpreadStrategy extends BaseStrategy {
     });
 
     if (cb.status === "STOPPED") {
+      // 호가를 걷고 멈춘다. 걷지 않으면 마지막 사이클의 bid/ask가 오더북에 영구히 남아
+      // 킬 스위치 이후에도 체결이 이어지고, 스테일 가격이 시세 기준을 왜곡한다.
+      await this.orderManager.cancelAllForSymbol(this.symbol);
       console.log(
-        `[spread] ${this.symbol} STOPPED — net=${pos.netPosition}, limit=${posLimit}`
+        `[spread] ${this.symbol} STOPPED — net=${pos.netPosition}, limit=${posLimit} (호가 철회)`
       );
       return;
     }
