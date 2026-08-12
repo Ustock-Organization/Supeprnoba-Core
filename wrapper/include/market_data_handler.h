@@ -76,6 +76,9 @@ public:
     void checkDayReset(const std::string& symbol);
     int getCurrentTradingDay() const;
 
+    // 직전 체결가(가격 밴드 기준가). 체결 이력이 없으면 0. 엔트리를 생성하지 않는다.
+    uint64_t getLastPrice(const std::string& symbol) const;
+
     // EngineCore 설정 (완전 체결된 주문 제거용)
     void setEngineCore(EngineCore* engine) { engine_ = engine; }
 

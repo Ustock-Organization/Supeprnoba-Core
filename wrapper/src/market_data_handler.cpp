@@ -95,6 +95,11 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
     day.last_price = fill_price;
     day.volume += fill_qty;  // 거래량 누적
 
+    // VI 서킷브레이커: 직전 체결가 대비 급변이면 종목 halt (엔진이 판정·전파).
+    if (engine_) {
+        engine_->onTradeForVI(symbol, fill_price);
+    }
+
     Logger::debug("DayData updated:", symbol, "price:", fill_price, "vol:", day.volume);
     
     // === OHLC 캐시 저장 (당일만) ===
@@ -366,6 +371,12 @@ void MarketDataHandler::on_bbo_change(const OrderBook* book,
 
 DayData& MarketDataHandler::getDayData(const std::string& symbol) {
     return symbol_day_data_[symbol];
+}
+
+uint64_t MarketDataHandler::getLastPrice(const std::string& symbol) const {
+    auto it = symbol_day_data_.find(symbol);
+    if (it == symbol_day_data_.end()) return 0;
+    return it->second.last_price;
 }
 
 int MarketDataHandler::getCurrentTradingDay() const {
