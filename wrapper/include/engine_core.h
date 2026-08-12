@@ -63,6 +63,11 @@ private:
     int applySelfTradePrevention(const std::string& symbol, const OrderPtr& aggressor);
     static bool isMarketMaker(const std::string& user_id);
 
+    // 가격 밴드: LIMIT 주문 가격이 직전 체결가 ±price_band_pct_ 범위를 벗어나면 true(위반).
+    // 얇은 종목에서 단일 주문이 가격을 붕괴/급등시키는 fat-finger·조작을 차단.
+    // 직전 체결가가 없거나(첫 거래 전) 밴드 비활성(pct<=0)이면 위반 아님.
+    bool violatesPriceBand(const OrderPtr& order) const;
+
     std::map<std::string, OrderBookPtr> books_;
     std::map<std::string, std::map<std::string, OrderPtr>> order_maps_;
     mutable std::shared_mutex rw_mutex_;  // shared_mutex for read-write locking
@@ -77,6 +82,10 @@ private:
     uint64_t total_trades_executed_ = 0;
     uint64_t duplicates_rejected_ = 0;
     uint64_t self_trades_prevented_ = 0;
+    uint64_t price_band_rejects_ = 0;
+
+    // 가격 밴드 폭(직전 체결가 대비 ±비율). 0이면 비활성. PRICE_BAND_PCT env로 설정.
+    double price_band_pct_ = 0.0;
 };
 
 } // namespace aws_wrapper

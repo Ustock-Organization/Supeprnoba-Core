@@ -1,7 +1,9 @@
 #include "engine_core.h"
 #include "redis_client.h"
 #include "logger.h"
+#include "config.h"
 #include <mutex>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 namespace aws_wrapper {
@@ -12,7 +14,29 @@ EngineCore::EngineCore(MarketDataHandler* handler, RedisClient* redis)
     if (handler_) {
         handler_->setEngineCore(this);
     }
+    // 가격 밴드 폭 (예: 0.5 = ±50%). 0/미설정이면 비활성.
+    try {
+        price_band_pct_ = std::stod(Config::get("PRICE_BAND_PCT", "0"));
+    } catch (...) {
+        price_band_pct_ = 0.0;
+    }
+    if (price_band_pct_ > 0.0) {
+        Logger::info("Price band enabled: ±", price_band_pct_ * 100.0, "% of last trade");
+    }
     Logger::info("EngineCore initialized");
+}
+
+bool EngineCore::violatesPriceBand(const OrderPtr& order) const {
+    if (price_band_pct_ <= 0.0) return false;              // 비활성
+    const liquibook::book::Price px = order->price();
+    if (px == 0) return false;                              // MARKET 주문은 밴드 대상 아님
+    if (!handler_) return false;
+    const uint64_t ref = handler_->getLastPrice(order->symbol());
+    if (ref == 0) return false;                             // 첫 거래 전 = 가격 발견 전, 통과
+
+    const double lo = ref * (1.0 - price_band_pct_);
+    const double hi = ref * (1.0 + price_band_pct_);
+    return (static_cast<double>(px) < lo) || (static_cast<double>(px) > hi);
 }
 
 bool EngineCore::isMarketMaker(const std::string& user_id) {
@@ -134,6 +158,20 @@ bool EngineCore::addOrder(OrderPtr order) {
                 handler_->on_reject(order, "Symbol is blocked or deleted");
             }
             Logger::warn("Order rejected (blocked/deleted symbol):", order_id, symbol);
+            return false;
+        }
+
+        // 가격 밴드: 직전 체결가 대비 과도하게 벗어난 LIMIT 주문 거부 (fat-finger·조작 차단).
+        // TODO(VI): 서킷브레이커 도입 시 halt 상태 검사를 밴드 검사보다 '먼저' 수행할 것.
+        if (violatesPriceBand(order)) {
+            ++price_band_rejects_;
+            lock.unlock();
+            if (handler_) {
+                handler_->on_reject(order, "Price outside allowed band");
+            }
+            Logger::warn("Order rejected (price band):", order_id, symbol,
+                         "price:", order->price(),
+                         "last:", handler_ ? handler_->getLastPrice(symbol) : 0);
             return false;
         }
 

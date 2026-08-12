@@ -368,6 +368,12 @@ DayData& MarketDataHandler::getDayData(const std::string& symbol) {
     return symbol_day_data_[symbol];
 }
 
+uint64_t MarketDataHandler::getLastPrice(const std::string& symbol) const {
+    auto it = symbol_day_data_.find(symbol);
+    if (it == symbol_day_data_.end()) return 0;
+    return it->second.last_price;
+}
+
 int MarketDataHandler::getCurrentTradingDay() const {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
