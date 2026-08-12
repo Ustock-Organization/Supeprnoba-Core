@@ -121,37 +121,58 @@ async function claimPremiumReward(userId) {
 }
 
 // ── POST /rewards/ad-complete ───────────────────────────
+function adRewardOk(Attributes, points) {
+  const newBalance = Attributes?.balances?.BOLT || {};
+  return response.ok({
+    claimed: points,
+    remaining_today: Attributes?.ad_claims_today,
+    balance: {
+      available: newBalance.available || 0,
+      locked: newBalance.locked || 0,
+      total: (newBalance.available || 0) + (newBalance.locked || 0),
+    },
+  }, CORS.STANDARD);
+}
+
 async function claimAdReward(userId) {
   const rewards = await getRewardSettings();
   const points = rewards.adRewardPoints ?? 1000;
+  const dailyLimit = rewards.adDailyLimit ?? 10;   // 일일 광고 보상 상한 (무한 발행 차단)
+  const today = getTodayKST();
+  const now = new Date().toISOString();
 
+  // 경로 1: 오늘 첫 수령 — 카운터를 1로 리셋하며 지급
   try {
     const { Attributes } = await dynamodb.send(new UpdateCommand({
       TableName: USER_TABLE,
       Key: { user_id: userId },
-      UpdateExpression: 'ADD balances.BOLT.available :pts SET updated_at = :now',
-      ConditionExpression: 'attribute_exists(user_id)',
-      ExpressionAttributeValues: {
-        ':pts': points,
-        ':now': new Date().toISOString(),
-      },
+      UpdateExpression: 'ADD balances.BOLT.available :pts SET ad_claims_today = :one, ad_claim_date = :today, updated_at = :now',
+      ConditionExpression: 'attribute_exists(user_id) AND (attribute_not_exists(ad_claim_date) OR ad_claim_date <> :today)',
+      ExpressionAttributeValues: { ':pts': points, ':one': 1, ':today': today, ':now': now },
       ReturnValues: 'ALL_NEW',
     }));
+    console.log(`[point-claim] Ad reward (1st today): user=${userId}, points=${points}`);
+    return adRewardOk(Attributes, points);
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
 
-    const newBalance = Attributes?.balances?.BOLT || {};
-    console.log(`[point-claim] Ad reward: user=${userId}, points=${points}, newAvailable=${newBalance.available}`);
-
-    return response.ok({
-      claimed: points,
-      balance: {
-        available: newBalance.available || 0,
-        locked: newBalance.locked || 0,
-        total: (newBalance.available || 0) + (newBalance.locked || 0),
-      },
-    }, CORS.STANDARD);
+  // 경로 2: 오늘 추가 수령 — 상한 미만일 때만 원자적으로 증가하며 지급
+  try {
+    const { Attributes } = await dynamodb.send(new UpdateCommand({
+      TableName: USER_TABLE,
+      Key: { user_id: userId },
+      UpdateExpression: 'ADD balances.BOLT.available :pts, ad_claims_today :one SET updated_at = :now',
+      ConditionExpression: 'attribute_exists(user_id) AND ad_claim_date = :today AND ad_claims_today < :limit',
+      ExpressionAttributeValues: { ':pts': points, ':one': 1, ':today': today, ':limit': dailyLimit, ':now': now },
+      ReturnValues: 'ALL_NEW',
+    }));
+    console.log(`[point-claim] Ad reward (count=${Attributes?.ad_claims_today}): user=${userId}, points=${points}`);
+    return adRewardOk(Attributes, points);
   } catch (err) {
     if (err.name === 'ConditionalCheckFailedException') {
-      return response.error(404, 'User not found', CORS.STANDARD);
+      // 상한 초과 (또는 유저 부재) — 무한 발행 차단
+      return response.error(429, `일일 광고 보상 한도(${dailyLimit}회)를 초과했습니다`, CORS.STANDARD);
     }
     throw err;
   }

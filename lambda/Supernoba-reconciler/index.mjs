@@ -22,6 +22,8 @@ const REGION = process.env.AWS_REGION || "ap-northeast-2";
 const ORDERS_TABLE = process.env.DYNAMODB_ORDERS_TABLE || "supernoba-orders";
 const WALLETS_TABLE = process.env.DYNAMODB_WALLETS_TABLE || "supernoba-users";
 const THRESHOLD_MS = (Number(process.env.SWEEP_THRESHOLD_MINUTES) || 15) * 60000;
+// PENDING_CANCEL은 엔진이 정상 취소·환불 중일 수 있어 더 길게 기다린다(이중환불 방지).
+const CANCEL_THRESHOLD_MS = (Number(process.env.CANCEL_SWEEP_THRESHOLD_MINUTES) || 60) * 60000;
 const DRY_RUN = process.env.DRY_RUN === "true";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
@@ -76,7 +78,7 @@ export const handler = async () => {
   const orders = await scanAll({ TableName: ORDERS_TABLE });
 
   // 1) 블랙홀 스윕
-  const stale = orders.filter((o) => isStalePending(o, nowMs, THRESHOLD_MS));
+  const stale = orders.filter((o) => isStalePending(o, nowMs, THRESHOLD_MS, CANCEL_THRESHOLD_MS));
   let swept = 0, refunded = 0, sweepErrors = 0;
   for (const o of stale) {
     const plan = refundPlan(o);

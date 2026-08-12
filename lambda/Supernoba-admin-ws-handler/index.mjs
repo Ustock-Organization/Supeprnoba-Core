@@ -36,7 +36,9 @@ async function syncToDb(action, data) {
       Payload: JSON.stringify({
         httpMethod: 'POST',
         body: JSON.stringify({ action, ...data }),
-        headers: { 'x-internal-call': 'true' },
+        // 내부 표식은 최상위 필드로 전달(클라이언트 위조 불가). event.headers는
+        // API GW 프록시가 클라이언트 헤더를 그대로 실어오므로 인증 판별에 쓰지 않는다.
+        internalInvoke: true,
       }),
     }));
     console.log(`[admin-ws] DB sync dispatched: ${action}`);

@@ -7,6 +7,7 @@
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { verifySelf, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-2' }));
 
@@ -33,6 +34,12 @@ export const handler = async (event) => {
 
   if (!userId) {
     return err(400, 'Missing userId parameter');
+  }
+
+  // 인증: 요청 userId가 토큰 소유자와 일치해야 함 (임의 userId 자산 조회 차단)
+  const auth = await verifySelf(event, userId);
+  if (!auth.success) {
+    return authErrorResponse(auth, CORS);
   }
 
   try {
