@@ -51,12 +51,35 @@ export const handler = async (event) => {
     const action = pathParts[baseIndex + 2]; // 'approve' or 'reject'
 
     // GET /creator-requests/pending - Admin: get all pending requests
+    // 관리자 전용 — 인증이 없으면 심사 대기 중인 크리에이터의 신청 내역(연락처·소개
+    // 포함)이 익명에게 전부 노출된다.
     if (method === 'GET' && param1 === 'pending') {
+      if (!auth?.verifyAdmin) {
+        console.error('[creator-requests] Auth layer 없음 — pending 조회 거부');
+        return response(503, { error: 'AUTH_UNAVAILABLE', message: '인증 서비스를 사용할 수 없습니다' });
+      }
+      const adminCheck = await auth.verifyAdmin(event);
+      if (!adminCheck.success) {
+        return response(403, { error: 'FORBIDDEN', message: '관리자 권한이 필요합니다' });
+      }
       return await getPendingRequests();
     }
 
     // GET /creator-requests/{userId} - Get user's requests
+    // 본인 것만 조회 가능(관리자는 예외). 예전엔 임의 userId로 타인 신청을 열람할 수 있었다.
     if (method === 'GET' && param1 && param1 !== 'pending') {
+      if (!auth?.verifySelf) {
+        console.error('[creator-requests] Auth layer 없음 — 사용자 조회 거부');
+        return response(503, { error: 'AUTH_UNAVAILABLE', message: '인증 서비스를 사용할 수 없습니다' });
+      }
+      const selfCheck = await auth.verifySelf(event, param1);
+      if (!selfCheck.success) {
+        // 관리자면 타인 조회 허용
+        const adminCheck = auth.verifyAdmin ? await auth.verifyAdmin(event) : { success: false };
+        if (!adminCheck.success) {
+          return response(403, { error: 'FORBIDDEN', message: '본인의 신청만 조회할 수 있습니다' });
+        }
+      }
       return await getMyRequests(param1);
     }
 

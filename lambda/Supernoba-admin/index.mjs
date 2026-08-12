@@ -33,7 +33,6 @@ const SETTINGS_TABLE = process.env.SETTINGS_TABLE || 'supernoba-settings';
 const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const ANNOUNCEMENTS_TABLE = process.env.ANNOUNCEMENTS_TABLE || 'supernoba-announcements';
 const NOTIFICATIONS_TABLE = process.env.NOTIFICATIONS_TABLE || 'supernoba-notifications';
-const WALLETS_TABLE = process.env.WALLETS_TABLE || 'supernoba-wallets';
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'supernoba-announcements-media';
 const s3 = new S3Client({ region: 'ap-northeast-2' });
 
@@ -716,14 +715,38 @@ export const handler = async (event) => {
 
           if (rewardAmount > 0) {
             // 2. 잔고에 포인트 추가 (ADD 연산 — 원자적)
-            await dynamodb.send(new UpdateCommand({
-              TableName: WALLETS_TABLE,
-              Key: { user_id: resolvedUserId },
-              UpdateExpression: 'ADD #avail :amount',
-              ExpressionAttributeNames: { '#avail': 'available' },
-              ExpressionAttributeValues: { ':amount': rewardAmount }
-            }));
-            console.log(`[claimReward] ${resolvedUserId} claimed ${rewardAmount} BOLT from ${notificationId}`);
+            //    ★ supernoba-users.balances.BOLT.available 이 정본이다.
+            //    예전엔 폐기된 supernoba-wallets 테이블에 넣어, 위 1단계가 알림을
+            //    reward_claimed=true 로 비가역 봉인한 뒤 BOLT는 사라졌다(재수령 불가).
+            try {
+              await dynamodb.send(new UpdateCommand({
+                TableName: USERS_TABLE,
+                Key: { user_id: resolvedUserId },
+                UpdateExpression: 'ADD balances.BOLT.available :amount SET updated_at = :now',
+                ConditionExpression: 'attribute_exists(user_id)',
+                ExpressionAttributeValues: {
+                  ':amount': rewardAmount,
+                  ':now': new Date().toISOString(),
+                }
+              }));
+              console.log(`[claimReward] ${resolvedUserId} claimed ${rewardAmount} BOLT from ${notificationId}`);
+            } catch (payErr) {
+              // 지급 실패 시 봉인을 되돌려 재시도 가능하게 한다.
+              // 되돌리지 못하면 사용자는 보상을 영원히 못 받으므로 반드시 알린다.
+              console.error(`[claimReward] 지급 실패, 봉인 롤백 시도: ${payErr.message}`);
+              try {
+                await dynamodb.send(new UpdateCommand({
+                  TableName: NOTIFICATIONS_TABLE,
+                  Key: { user_id: resolvedUserId, notification_id: notificationId },
+                  UpdateExpression: 'SET reward_claimed = :false REMOVE claimed_at',
+                  ExpressionAttributeValues: { ':false': false },
+                }));
+              } catch (rollbackErr) {
+                console.error(`[claimReward] 롤백 실패 — 수동 보정 필요: user=${resolvedUserId} ` +
+                              `notification=${notificationId} amount=${rewardAmount}: ${rollbackErr.message}`);
+              }
+              return err(500, 'Failed to credit reward. Please try again.');
+            }
           }
 
           return ok({ claimed: true, amount: rewardAmount, symbol: notification.symbol });

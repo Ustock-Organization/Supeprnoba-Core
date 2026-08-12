@@ -579,6 +579,26 @@ export const handler = async (event) => {
       const b = JSON.parse(event.body || '{}');
       const { action, userId, reason } = b;
 
+      // ==========================================
+      // 상태 변경 액션은 Supernoba-admin-users로 이관됨 (410)
+      //
+      // 이 Lambda는 admin-users의 구버전 중복본이다. 프론트가 /users로 보내는
+      // setAdmin·setTester·setSubscription·deleteUser·deleteUserStatus가 여기엔
+      // 없으므로 실제 라우팅 대상은 admin-users다(배제법 확정).
+      // 그런데 여기 남은 setBalance/setHolding에는 2026-08-13 보안 강화(G4)가
+      // 적용되지 않아 **상한·사유·낙관적잠금 없이 잔고를 임의 설정**할 수 있고,
+      // CI가 매 배포마다 이 Lambda를 갱신한다. 라우트가 하나라도 살아있으면
+      // 무제한 자금 창출 경로가 되므로 변경 계열을 전면 차단한다.
+      // (읽기 계열 getSettings/getAllHoldings는 무해하므로 유지)
+      // ==========================================
+      const MUTATING_ACTIONS = new Set([
+        'saveSettings', 'suspend', 'unsuspend', 'setBalance', 'setHolding',
+      ]);
+      if (MUTATING_ACTIONS.has(action)) {
+        console.warn(`[admin-core] BLOCKED deprecated mutating action: ${action}`);
+        return err(410, `Action '${action}' moved to /Supernoba-admin-users endpoint`);
+      }
+
       // getSettings
       if (action === 'getSettings') {
         try {
