@@ -26,9 +26,10 @@
 ## 구현 로드맵 (파일 단위)
 
 ### M1 — 체결 피드백 루프 + 안전장치 [최우선 전제]
-- [ ] **(cross-repo) Supernoba-back `fill_processor.cpp`**: MM 측 체결 시
-      `mm:inventory:{SYMBOL}` 갱신. 이미 `isMmId()` 판별(94-95행)과 operating cache 연결 보유
-      — 한 곳 수정으로 5단계 방어선 전체가 살아난다. (형식은 inventory.mjs recordFill과 동일 JSON)
+- [x] **(cross-repo) Supernoba-back `fill_processor.cpp`**: MM 측 체결 시
+      `mm:inventory:{SYMBOL}` 갱신. ✅ **완료(back main `1f5e850`)** — RedisClient.recordMmInventory
+      (GET-modify-SET 원자, inventory.mjs 스키마 유지) + processFill에서 정확히 한쪽만 MM인 체결 갱신.
+      검증: mm_inventory_test 14 PASS(실 redis) + 전체 빌드. → 5단계 방어선 활성화.
 - [ ] **mm-service 킬스위치 = Deribit MMP형**: 롤링 윈도우(interval) 내 체결수량/순델타 한도 초과
       → 봇 전체가 아니라 **해당 심볼만 frozen_time 동결 후 자동 복귀** (유동성 전멸 방지)
 - [ ] **filled_order_delay**(기본 60s): 체결 직후 재호가 대기 — 한 방향 연속 체결 쏠림 1차 방어
