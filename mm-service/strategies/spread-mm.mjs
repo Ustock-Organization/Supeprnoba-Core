@@ -101,14 +101,12 @@ export default class SpreadStrategy extends BaseStrategy {
     bid = Math.max(1, bid);
     ask = Math.max(bid + 1, ask); // ask always > bid
 
-    // ── 6. Tapered quantities ───────────────────────────────────
+    // ── 6. Inventory-skewed quantities (Hummingbot 선형 스큐, bid+ask=2.0) ──
+    // M1 체결 피드백 루프로 netPosition이 실제 값을 가지므로 스큐가 실동작한다.
     const baseQty = this.config.tradeQuantity;
-    let buyQty = this.inventory.calculateTaperedQuantity(
-      baseQty, "BUY", pos.netPosition, posLimit
-    );
-    let sellQty = this.inventory.calculateTaperedQuantity(
-      baseQty, "SELL", pos.netPosition, posLimit
-    );
+    const skew = this.inventory.calculateInventorySkew(pos.netPosition, posLimit);
+    let buyQty = Math.max(0, Math.round(baseQty * skew.bidMultiplier));
+    let sellQty = Math.max(0, Math.round(baseQty * skew.askMultiplier));
 
     // Apply circuit breaker direction limits
     if (!cb.canBuy) buyQty = 0;

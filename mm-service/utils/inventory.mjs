@@ -145,6 +145,38 @@ export default class InventoryTracker {
     return Math.max(1, Math.round(adjusted));
   }
 
+  /**
+   * Hummingbot 스타일 인벤토리 스큐 — 매수/매도 수량 배수를 재분배한다.
+   *
+   * 핵심 성질: bidMultiplier + askMultiplier ≡ 2.0 (총 노출은 유지, 비중만 이동).
+   * 재고가 목표(중립=0)에서 벗어난 만큼 반대 방향 체결을 촉진한다.
+   *   - 롱 과다(q>0) → 매수 배수↓, 매도 배수↑ (재고 청산 유도)
+   *   - 숏 과다(q<0) → 매수 배수↑, 매도 배수↓ (재고 회복 유도)
+   *   - 밴드 경계(|q| ≥ positionLimit)에서 한쪽 배수가 0으로 수렴 → 한 방향만 호가.
+   *
+   * calculateTaperedQuantity(비대칭 0.5 부스트)와 달리 선형 [0,2]·합2.0이라
+   * 재고 중립화 압력이 명확하고 예측 가능하다(Hummingbot inventory_skew).
+   *
+   * @param {number} netPosition   - 현재 순포지션 (롱 +, 숏 -)
+   * @param {number} positionLimit - 스큐가 완전히 기우는 밴드 폭(=한쪽 배수 0 도달점)
+   * @returns {{ bidMultiplier: number, askMultiplier: number, ratio: number }}
+   */
+  calculateInventorySkew(netPosition, positionLimit) {
+    const limit = positionLimit > 0 ? positionLimit : DEFAULT_LIMITS.soft;
+    // ratio ∈ [-1, 1]: +1 = 최대 롱, -1 = 최대 숏
+    const ratio = Math.max(-1, Math.min(1, netPosition / limit));
+
+    // 롱일수록 매수 줄이고 매도 늘림. 합은 항상 2.0.
+    let bidMultiplier = 1 - ratio;
+    let askMultiplier = 1 + ratio;
+
+    // 방어적 클램프(부동소수 오차 대비)
+    bidMultiplier = Math.max(0, Math.min(2, bidMultiplier));
+    askMultiplier = Math.max(0, Math.min(2, askMultiplier));
+
+    return { bidMultiplier, askMultiplier, ratio };
+  }
+
   // ─────────────────────────────────────────────
   // Layer 4: Circuit Breaker
   // ─────────────────────────────────────────────
