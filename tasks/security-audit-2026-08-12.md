@@ -115,7 +115,47 @@ STP·밴드·halt 우선순위 로직, Apple IAP x5c 체인검증, Stripe 서명
 
 ---
 
-## 착수 순서 (권고)
+---
+
+# 조치 현황 (2026-08-12~13 수정 완료)
+
+**GROUP A~H 전부 수정·검증·커밋·푸시 완료.** 커밋: Core `b3b9106`(A/B) `5bdfe81`(C)
+`9239a8b`(D) `90cb85a`(E) `1337bde`(F) `4c5d7a2`(G/H), back `5a017fc`(B) `8fd94aa`(F) `0f5f215`(H).
+develop·master·infra/raspi 전파 및 4브랜치 푸시 완료.
+
+**검증**: 엔진 테스트 5종(stp·price_band·vi_halt·restore_integrity 신규 18건·journal) ALL PASS,
+MM 4종(cpmm·inventory-skew·organic 신규 5건·price-process) ALL PASS,
+백엔드 2종(settlement_guard·mm_inventory 14건 — **최초 실행**) ALL PASS,
+Lambda 54개 문법 전수 통과, infra/aws·infra/raspi 양 브랜치 클린 빌드.
+
+## 수정 중 발견한 신규 결함 (감사도 못 잡은 것)
+- **IOC가 엔진에서 전혀 작동하지 않았다** (최대 발견): `addOrder`가 `book->add(order)`를
+  conditions 없이 호출했고, liquibook의 주문 자체 플래그 폴백은 ①`LIQUIBOOK_ORDER_KNOWS_CONDITIONS`
+  매크로로 비활성 ②멤버 초기화 후 지역 변수만 수정하는 버그라 무효. 결과: 모든 시장가 주문이
+  미체결 시 취소되지 않고 북에 잔류. MARKET SELL은 price=0으로 남아 이후 매수를 전부 쓸어감.
+  → `order->conditions()` 전달로 수정, 실측 검증.
+- 엔진 테스트가 CMake에 아예 등록되지 않아 재현 불가였다 → `test/*_test.cpp` 자동 등록.
+- `mm_inventory_test`는 어떤 CMakeLists에도 없어 한 번도 컴파일된 적이 없었다 → 등록 후 최초 실행, 14건 통과.
+
+## 결함을 정답으로 고정하던 테스트 핀 3건 교체
+- reconciler `logic.test`: "PENDING_CANCEL도 created_at 기준 대상" = 이중환불의 원인
+- `organic-strategy.test`: `inventory: null`로도 통과 = 재고 방어선 미배선의 증거
+- `settlement_guard_test`: "가드 기본 활성화" = 테이블 부재 시 체결 100% 유실
+
+## 미조치 (사용자 결정·외부 작업 필요)
+1. **E1 상장폐지 보상** — 지급 코드가 설계에 없음. 보상 정책(청산가 산정·지급 시점) 확정 선행 필요.
+2. **G6 시크릿 재발급** — YouTube/Twitter 실키가 git 이력 3커밋(`b702f53`·`0e65225`·`9a21e37`)에 잔존.
+   유출 간주하고 콘솔에서 폐기·재발급 필요(코드는 이미 Secrets Manager 전환됨).
+3. **신규 인프라** — `supernoba-settlements`(PK settlement_id) · `supernoba-audit-logs` ·
+   `supernoba-idempotency` 테이블, `Supernoba-reconciler` EventBridge 스케줄.
+4. **env 주입** — `ENGINE_GRPC_TOKEN`(미설정 시 관리 채널 잠김) · `COGNITO_CLIENT_ID`(aud 검증) ·
+   `ENABLE_SETTLEMENT_GUARD=true`(테이블 생성 후) · `BOOTSTRAP_ADMIN_SUBS`(최초 관리자 지정 후 제거).
+5. **P2 이하 잔여** — 시장데이터 pub/sub 전환, 저장소 삼원화 일원화, 경매(C6),
+   Stripe price_id 허용목록, 웹훅 처리 순서, CPMM 오더북 직접 투사.
+
+---
+
+## 착수 순서 (권고 — 완료됨)
 
 1. **GROUP A 킬체인 봉인** (A1~A7) — 코드 소규모, 익명 자금생성 차단. 최우선.
 2. **B1/B2 정산 회귀 + B3 테이블** — 내 회귀 즉시 교정. B3는 기본값 false로 임시 안전화.
