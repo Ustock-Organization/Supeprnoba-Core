@@ -32,6 +32,11 @@ const loadAuth = async () => {
         console.error('[admin-core] Auth layer not available - rejecting request');
         return { success: false, error: 'AUTH_LAYER_UNAVAILABLE' };
       },
+      verifyAuth: async () => {
+        console.error('[admin-core] Auth layer not available - rejecting request');
+        return { success: false, error: 'AUTH_LAYER_UNAVAILABLE' };
+      },
+      resolveUserId: () => null,
       authErrorResponse: (r) => ({
         statusCode: 503,
         headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
@@ -40,7 +45,7 @@ const loadAuth = async () => {
     };
   }
 };
-const { verifyAdmin, authErrorResponse } = await loadAuth();
+const { verifyAdmin, verifyAuth, resolveUserId, authErrorResponse } = await loadAuth();
 
 // 환경변수
 const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
@@ -102,25 +107,29 @@ export const handler = async (event) => {
     const path = event.path || '';
 
     // ==========================================
-    // GET /auth - 관리자 권한 확인 (공개)
-    // 경로: /auth?userId=xxx 또는 쿼리: ?type=auth&userId=xxx
+    // GET /auth - 본인의 관리자 권한 확인 (토큰 필수)
+    // 경로: /auth 또는 쿼리: ?type=auth
+    //
+    // ★ 판정은 오직 토큰에서 유도한 신원으로만 한다. 예전엔 요청자가 보낸
+    //   userId/googleEmail/twitterUsername만 보고 isAdmin을 반환했고 토큰과
+    //   대조하지 않아, 누구나 관리자 ID를 넣어 true를 받고 관리자 UI를 열 수
+    //   있었다(관리자 계정 열거 오라클로도 동작). 하드코딩된 신원 분기도 제거.
     // ==========================================
     if ((path.includes('/auth') || q.type === 'auth') && m === 'GET') {
-      const { userId, twitterUsername, googleEmail } = q;
+      const auth = await verifyAuth(event);
+      if (!auth.success) {
+        return authErrorResponse(auth, H);
+      }
+      const selfId = resolveUserId(auth);
       let admin = false;
-
-      if (twitterUsername) {
-        admin = twitterUsername.replace('@', '').toLowerCase() === 'tchinnom';
-      }
-      if (googleEmail && !admin) {
-        admin = ['tchinnom@gmail.com', 'admin@supernoba.com'].includes(googleEmail.toLowerCase());
-      }
-      if (userId && !admin) {
+      if (selfId) {
         try {
-          const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
+          const { Item } = await dynamodb.send(new GetCommand({
+            TableName: USERS_TABLE, Key: { user_id: selfId }
+          }));
           if (Item) admin = Item.is_admin === true;
         } catch (e) {
-          console.error('[auth] User cache lookup error:', e.message);
+          console.error('[auth] User lookup error:', e.message);
         }
       }
       return ok({ isAdmin: admin });

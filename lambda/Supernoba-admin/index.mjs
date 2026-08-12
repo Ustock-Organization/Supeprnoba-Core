@@ -25,7 +25,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { getValkeyClient, CORS, response } from '/opt/nodejs/index.mjs';
 
 // Auth Layer - Cognito JWT 검증
-import { verifyAdmin, verifyAuth, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
+import { verifyAdmin, verifyAuth, resolveUserId, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 
 // 환경변수
 const SYMBOLS_TABLE = process.env.SYMBOLS_TABLE || 'supernoba-symbols';
@@ -80,19 +80,24 @@ export const handler = async (event) => {
     // ==========================================
     if (q.type === 'auth') {
       if (m === 'GET') {
-        const { userId } = q;
-        let admin = false;
+        // ★ 판정은 토큰에서 유도한 신원으로만 한다. 요청자가 보낸 userId를 그대로
+        //   조회하면 누구나 관리자 ID를 넣어 true를 받고 관리자 UI를 열 수 있으며,
+        //   관리자 계정 열거 오라클로도 동작한다.
+        const authResult = await verifyAuth(event);
+        if (!authResult.success) return authErrorResponse(authResult, H);
+        const selfId = resolveUserId(authResult);
 
+        let admin = false;
         // DynamoDB supernoba-users에서 is_admin 확인 (SSoT)
-        if (userId) {
+        if (selfId) {
           try {
-            const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: userId } }));
+            const { Item } = await dynamodb.send(new GetCommand({ TableName: USERS_TABLE, Key: { user_id: selfId } }));
             if (Item?.is_admin === true) {
               admin = true;
-              console.log(`[auth] Admin confirmed: ${userId}`);
+              console.log(`[auth] Admin confirmed: ${selfId}`);
             }
           } catch (e) {
-            console.error('[auth] User cache lookup error:', e.message);
+            console.error('[auth] User lookup error:', e.message);
           }
         }
         return ok({ isAdmin: admin });

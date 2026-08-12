@@ -27,6 +27,10 @@ const JWKS_CACHE_TTL = 3600000; // 1시간
 
 // Cognito 설정
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
+// 허용 앱 클라이언트 ID 목록(쉼표 구분). 설정 시 aud를 강제한다.
+// 미설정이면 aud 검증을 건너뛰므로, 프로덕션에서는 반드시 설정할 것.
+const COGNITO_CLIENT_IDS = (process.env.COGNITO_CLIENT_ID || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 const COGNITO_REGION = process.env.COGNITO_REGION || 'ap-northeast-2';
 const COGNITO_ISSUER = COGNITO_USER_POOL_ID
   ? `https://cognito-idp.${COGNITO_REGION}.amazonaws.com/${COGNITO_USER_POOL_ID}`
@@ -180,13 +184,36 @@ async function verifyRS256(token) {
   const payload = JSON.parse(base64UrlDecode(payloadB64));
   const now = Math.floor(Date.now() / 1000);
 
-  if (payload.exp && payload.exp < now) {
+  // exp는 필수 — 없으면 무기한 유효한 토큰이 된다
+  if (!payload.exp || payload.exp < now) {
     throw new Error('TOKEN_EXPIRED');
+  }
+
+  // nbf(not before) — 아직 유효하지 않은 토큰 거부
+  if (payload.nbf && payload.nbf > now + 60) {
+    throw new Error('TOKEN_NOT_YET_VALID');
   }
 
   // issuer 검증
   if (payload.iss !== COGNITO_ISSUER) {
     throw new Error('INVALID_ISSUER');
+  }
+
+  // token_use 검증 — 이 시스템은 id_token만 사용한다(권한·이메일 클레임이 id_token 전용).
+  // 검증하지 않으면 같은 풀·같은 키로 서명된 access_token이 그대로 통과해,
+  // 권한 클레임만 undefined인 채 인증에 성공한다.
+  if (payload.token_use && payload.token_use !== 'id') {
+    throw new Error('INVALID_TOKEN_USE');
+  }
+
+  // audience 검증 — 검증하지 않으면 같은 User Pool의 **어떤 앱 클라이언트**가 발급한
+  // 토큰이든 통용된다(저신뢰 클라이언트로 얻은 토큰이 관리자 API에 사용 가능).
+  // COGNITO_CLIENT_ID가 설정된 경우에만 강제(쉼표 구분 다중 허용).
+  if (COGNITO_CLIENT_IDS.length > 0) {
+    const aud = payload.aud || payload.client_id;
+    if (!aud || !COGNITO_CLIENT_IDS.includes(aud)) {
+      throw new Error('INVALID_AUDIENCE');
+    }
   }
 
   return payload;
@@ -217,10 +244,14 @@ export async function verifyAuth(event, options = {}) {
   const { required = true, allowedRoles = null } = options;
 
   try {
-    // 0. 개발 모드 체크
+    // 0. 설정 검증 — 페일클로즈.
+    // 예전엔 COGNITO_USER_POOL_ID가 없으면 devMode로 통과시켰는데, verifySelf가
+    // devMode에서 "요청자가 보낸 user_id"를 그대로 승인하므로 환경변수 하나가
+    // 빠지면 토큰 없이 아무 유저의 주문·자산 API를 호출할 수 있었다.
     if (!COGNITO_USER_POOL_ID) {
-      console.warn('[verifyAuth] DEV MODE: No auth configured, skipping');
-      return { success: true, userId: null, anonymous: true, devMode: true };
+      console.error('[verifyAuth] CONFIG_ERROR: COGNITO_USER_POOL_ID 미설정 — 인증 거부');
+      return { success: false, error: 'CONFIG_ERROR',
+               message: 'Authentication is not configured' };
     }
 
     // 1. Authorization 헤더에서 토큰 추출
@@ -330,16 +361,20 @@ export async function verifyAdmin(event) {
   // JWT 클레임 또는 DynamoDB supernoba-users에서 is_admin 확인
 
   // 부트스트랩 관리자: Cognito sub로 직접 인식 (DynamoDB 설정 전 임시)
-  const BOOTSTRAP_ADMINS = [
-    '3438cdec-f071-700b-e035-dc6fc4f68009', // njg7194@gmail.com
-  ];
+  // 부트스트랩 관리자: 소스 하드코딩을 폐기하고 환경변수로 옮겼다.
+  // 하드코딩된 sub는 DynamoDB에서 is_admin=false로 강등해도, 계정을 삭제해도
+  // 영원히 관리자로 남는 백도어이며, 레포 접근자 누구나 표적을 알 수 있었다.
+  // 최초 관리자 지정에만 쓰고, 지정 후에는 env에서 제거해 DynamoDB is_admin을
+  // 단일 진실원천으로 둘 것.
+  const BOOTSTRAP_ADMINS = (process.env.BOOTSTRAP_ADMIN_SUBS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
   let isAdmin =
     authResult.role === 'admin' ||
     authResult.role === 'service_role' ||
     authResult.payload?.app_metadata?.is_admin === true ||
     authResult.payload?.user_metadata?.is_admin === true ||
-    BOOTSTRAP_ADMINS.includes(authResult.userId);
+    (BOOTSTRAP_ADMINS.length > 0 && BOOTSTRAP_ADMINS.includes(authResult.userId));
 
   // JWT 클레임에 admin이 없으면 DynamoDB supernoba-users 조회
   if (!isAdmin && authResult.userId) {
@@ -476,9 +511,15 @@ export async function verifySelf(event, resourceUserId) {
     return authResult;
   }
 
-  // 개발 모드 (devMode: true 또는 anonymous: true)면 userId 검증 스킵
-  if (authResult.devMode || authResult.anonymous) {
-    return { ...authResult, userId: resourceUserId };
+  // 익명 인증은 본인 리소스 접근 권한이 없다. (예전엔 devMode/anonymous면
+  // "요청자가 보낸 user_id"를 그대로 승인해, 환경변수 하나가 빠지거나 익명
+  // 경로가 열리면 임의 유저의 자산·주문을 조회할 수 있었다.)
+  if (authResult.anonymous) {
+    return {
+      success: false,
+      error: 'FORBIDDEN',
+      message: '인증이 필요합니다',
+    };
   }
 
   // resolveUserId()로 Cognito sub → 플랫폼 user_id 변환
