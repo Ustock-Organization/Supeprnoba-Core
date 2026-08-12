@@ -72,6 +72,8 @@ private:
 
     // Graceful shutdown
     int drain_timeout_seconds_ = 30;
+    // worker join 실패로 detach된 적이 있는가 — restart()가 UAF/이중소비를 피하도록 판단.
+    bool detached_ = false;
     std::atomic<bool> draining_{false};
 
     // 메트릭

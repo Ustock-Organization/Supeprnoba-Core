@@ -58,18 +58,32 @@ void EngineCore::onTradeForVI(const std::string& symbol, uint64_t fill_price) {
             halt_until_[symbol] = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(vi_halt_seconds_);
             newly_halted = true;
+            // 기준가 동결: halt를 유발한 그 체결가로 기준가를 갱신하면, 해제 후 그 가격이
+            // 정상가로 취급되어 같은 폭으로 다시 밀 수 있다(halt는 조작을 지연시킬 뿐
+            // 막지 못한다). 정통 VI처럼 충격 이전 가격을 기준으로 유지한다.
+        } else {
+            vi_last_price_[symbol] = fill_price;
         }
-        vi_last_price_[symbol] = fill_price;
     }
 
     if (newly_halted) {
         Logger::warn("VI HALT:", symbol, "price:", fill_price,
                      "(급변 ±", vi_dynamic_pct_ * 100.0, "% 초과) —", vi_halt_seconds_, "s 정지");
         // 상태 전파: MM·스트리머·프론트가 구독. MM은 halt 시 호가를 걷어야 함(재개 단일가 왜곡 방지).
+        // TTL을 halt 길이로 걸어, 거래가 끊겨 아무도 addOrder를 호출하지 않아도(자동 해제가
+        // addOrder에만 의존) 상태 키가 스스로 만료되게 한다 — HALTED 영구 고착 방지.
         if (operating_redis_ && operating_redis_->isConnected()) {
-            operating_redis_->set("symbol:" + symbol + ":state", "HALTED");
+            operating_redis_->setEx("symbol:" + symbol + ":state", "HALTED", vi_halt_seconds_);
+            operating_redis_->publish("symbol:state",
+                                      "{\"symbol\":\"" + symbol + "\",\"state\":\"HALTED\"}");
         }
     }
+}
+
+uint64_t EngineCore::viReferencePrice(const std::string& symbol) const {
+    std::lock_guard<std::mutex> lock(vi_mutex_);
+    auto it = vi_last_price_.find(symbol);
+    return it == vi_last_price_.end() ? 0 : it->second;
 }
 
 bool EngineCore::isHalted(const std::string& symbol) {
@@ -82,6 +96,8 @@ bool EngineCore::isHalted(const std::string& symbol) {
         halt_until_.erase(it);
         if (operating_redis_ && operating_redis_->isConnected()) {
             operating_redis_->set("symbol:" + symbol + ":state", "CONTINUOUS");
+            operating_redis_->publish("symbol:state",
+                                      "{\"symbol\":\"" + symbol + "\",\"state\":\"CONTINUOUS\"}");
         }
         return false;
     }
@@ -91,7 +107,11 @@ bool EngineCore::isHalted(const std::string& symbol) {
 bool EngineCore::violatesPriceBand(const OrderPtr& order) const {
     if (price_band_pct_ <= 0.0) return false;              // 비활성
     const liquibook::book::Price px = order->price();
-    if (px == 0) return false;                              // MARKET 주문은 밴드 대상 아님
+    if (px == 0) return false;                              // MARKET SELL(price=0)
+    // MARKET BUY는 collar 때문에 price=max_price(0이 아님)로 들어온다. 이는 "얼마까지
+    // 지불할 수 있다"는 상한이지 호가가 아니므로 밴드로 판정하면 안 된다 — 얇은 종목에서
+    // 정상 시장가 매수가 상시 거부된다. 시장가의 과도한 가격 이동은 VI가 담당한다.
+    if (order->order_type() == "MARKET") return false;
     if (!handler_) return false;
     const uint64_t ref = handler_->getLastPrice(order->symbol());
     if (ref == 0) return false;                             // 첫 거래 전 = 가격 발견 전, 통과
@@ -211,6 +231,22 @@ bool EngineCore::addOrder(OrderPtr order) {
             return false;
         }
 
+        // Dedup Layer 2: 이미 북에 살아 있는 주문의 재등록 차단.
+        // processed_orders_는 메모리 전용(재시작 시 비고, TTL도 짧음)이라 Layer 1만으로는
+        // 스냅샷 복원 + 앵커 리플레이가 만드는 중복 ADD를 걸러내지 못한다. 통과시키면
+        // liquibook이 같은 order_id로 Tracker를 하나 더 만들어 북에 이중 등록되고,
+        // order_maps_ 엔트리는 덮어써져 옛 사본이 취소·조회 불가능한 유령 유동성이 된다.
+        {
+            auto sym_it = order_maps_.find(symbol);
+            if (sym_it != order_maps_.end() &&
+                sym_it->second.find(order_id) != sym_it->second.end()) {
+                Logger::warn("DUPLICATE order rejected (already resting in book):",
+                             order_id, symbol);
+                ++duplicates_rejected_;
+                return false;
+            }
+        }
+
         auto book = getOrCreateBook(symbol);
 
         if (!book) {
@@ -254,8 +290,14 @@ bool EngineCore::addOrder(OrderPtr order) {
         // 주문 맵에 저장
         order_maps_[symbol][order_id] = order;
 
-        // Liquibook에 추가
-        book->add(order);
+        // Liquibook에 추가 — conditions(IOC/AON)를 반드시 전달해야 한다.
+        // liquibook의 OrderTracker는 add()로 받은 conditions만 신뢰한다: 주문 자체의
+        // 플래그를 읽는 폴백은 (a) LIQUIBOOK_ORDER_KNOWS_CONDITIONS 매크로로 막혀 있고
+        // (b) 멤버 초기화 리스트에서 conditions_를 이미 설정한 뒤 지역 변수만 수정하는
+        // 버그라 무효다. 전달하지 않으면 IOC가 통째로 무시되어, 미체결 시장가 주문이
+        // 취소되지 않고 북에 잔류한다 — MARKET SELL은 price=0으로 남아 이후 들어오는
+        // 매수를 전부 쓸어간다.
+        book->add(order, order->conditions());
         book->perform_callbacks();
 
         ++total_orders_processed_;
@@ -456,8 +498,34 @@ bool EngineCore::restoreOrderBook(const std::string& symbol,
                     continue;
                 }
 
+                // 부분체결 주문은 "잔량"으로 등재해야 한다. liquibook의 OrderTracker는
+                // open_qty를 order_qty()로 초기화하며 filled_qty를 모르기 때문에, 원주문
+                // 수량 그대로 넣으면 이미 체결된 몫이 되살아나 잠금수량을 초과 체결한다.
+                // (DynamoDB 복원 경로는 remaining으로 넣고 있어 규칙을 맞춘다)
+                const uint64_t ordered = order->order_qty();
+                const uint64_t filled = order->filled_qty();
+                if (filled > 0) {
+                    if (filled >= ordered) {
+                        ++count;   // 이미 전량 체결 — 복원 대상 아님
+                        continue;
+                    }
+                    order->setOrderQty(ordered - filled);
+                    order->setFilledQty(0);
+                }
+
                 order_maps_[symbol][order->order_id()] = order;
-                book->add(order);
+                // 복원은 리스너를 붙이기 전에 수행되므로, 여기서 교차가 일어나면 on_fill이
+                // 호출되지 않아 Kinesis 체결 이벤트 없이 잔량만 소멸한다(무음 체결 = 미정산).
+                // 정상 스냅샷은 uncrossed여야 하므로 matched=true는 데이터 이상 신호다.
+                if (book->add(order)) {
+                    ++silent_restore_matches_;
+                    Logger::error("복원 중 교차 발생(무음 체결 위험):", symbol,
+                                  order->order_id(), "price:", order->price(),
+                                  "— 스냅샷이 uncrossed가 아님");
+                }
+                // 복원된 주문을 dedup에 시딩 — 앵커 리플레이가 같은 ADD를 재전달해도
+                // 북에 이중 등록되지 않는다(addOrder의 Layer 2와 이중 방어).
+                processed_orders_[order->order_id()] = std::chrono::steady_clock::now();
                 ++restored;
 
                 // 프로그레스 업데이트

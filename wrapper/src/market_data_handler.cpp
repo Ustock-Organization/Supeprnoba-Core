@@ -205,7 +205,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
-    
+
     // Kinesis로 CANCEL 이벤트 발행 (DynamoDB 업데이트를 위해)
     if (producer_) {
         std::string otype = order->order_type();
@@ -213,6 +213,14 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
                                       order->user_id(), "CANCELLED", "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published CANCEL event to Kinesis:", order->order_id());
+    }
+
+    // 주문 맵에서 제거. 이 경로가 없으면 IOC 잔량 취소(모든 MARKET 주문이 IOC다)로
+    // 북에는 들어가지 않은 주문이 order_maps_에 영구 잔류하고, 10초 스냅샷에 실려
+    // 재시작 시 일반 지정가처럼 복원된다. MARKET SELL 유령은 price=0이라 liquibook에서
+    // 시장가로 해석되어 복원된 매수호가 전 구간을 쓸어버린다(리스너 부재로 무음 체결).
+    if (engine_) {
+        engine_->removeFilledOrderUnsafe(order->symbol(), order->order_id());
     }
 }
 

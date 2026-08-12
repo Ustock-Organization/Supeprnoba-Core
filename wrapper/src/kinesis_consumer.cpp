@@ -187,13 +187,19 @@ void KinesisConsumer::stop() {
     //    GetRecords(client_->...) 진행 중이면 use-after-free가 됐다(TOCTOU: !client_ 체크와
     //    실제 호출 사이 reset). requestTimeoutMs=3000이라 in-flight 요청은 ~3초 내 반환되고
     //    worker가 스스로 종료하므로 reset으로 강제 취소할 필요가 없다. 여유롭게 10초 대기.
+    //    ⚠ 대기 시간은 drain 타임아웃보다 길어야 한다. worker는 루프 탈출 후
+    //    drainQueue()를 최대 drain_timeout_seconds_(기본 30s)만큼 수행하므로, 고정 10초로
+    //    재면 잔여 레코드가 있는 정상 종료마다 detach로 빠져 UAF 창이 열리고 체크포인트
+    //    flush도 건너뛰게 된다.
+    const int join_wait_s = drain_timeout_seconds_ + 5;
     bool joined = false;
     if (worker_.joinable()) {
         auto future = std::async(std::launch::async, [this]() { worker_.join(); });
-        if (future.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
-            Logger::error("KinesisConsumer worker did not exit within 10s - detaching "
-                          "(client_ 유지: reset 시 UAF 위험)");
+        if (future.wait_for(std::chrono::seconds(join_wait_s)) == std::future_status::timeout) {
+            Logger::error("KinesisConsumer worker did not exit within", join_wait_s,
+                          "s - detaching (client_ 유지: reset 시 UAF 위험)");
             worker_.detach();
+            detached_ = true;
         } else {
             joined = true;
         }
@@ -233,6 +239,17 @@ void KinesisConsumer::restart() {
     Logger::warn("KinesisConsumer restarting...");
     stop();
     std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // detach된 worker가 아직 살아 있으면 재시작하면 안 된다:
+    //  ① client_ 재대입이 구 client를 파괴 → 구 worker의 GetRecords가 UAF
+    //  ② shard_iterators_/last_sequence_numbers_를 clear하면 구 worker가 순회 중 자료구조 손상
+    //  ③ running_=true 복원으로 구 worker 루프가 부활 → 같은 스트림 이중 소비(주문 이중 처리)
+    // 상태를 안전하게 되돌릴 방법이 없으므로 프로세스를 종료해 systemd 재시작에 위임한다.
+    if (detached_) {
+        Logger::error("이전 worker가 detach된 상태 — 안전한 재시작 불가. "
+                      "프로세스를 종료해 systemd 재시작에 위임합니다.");
+        std::_Exit(EXIT_FAILURE);
+    }
 
     // KinesisClient 재생성 (새 TCP 연결 풀)
     Aws::Client::ClientConfiguration config;

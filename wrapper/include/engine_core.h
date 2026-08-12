@@ -46,6 +46,9 @@ public:
     // === 주문 조회 API ===
     bool hasOrder(const std::string& symbol, const std::string& order_id) const;
 
+    // VI 기준가 조회(진단·테스트용). 미설정이면 0.
+    uint64_t viReferencePrice(const std::string& symbol) const;
+
     // === VI 서킷브레이커 (동적: 직전 체결가 대비 급변 시 종목 일시정지) ===
     // 체결 콜백(MarketDataHandler)에서 호출. 변동률이 임계 초과면 halt 설정 + 상태 전파.
     void onTradeForVI(const std::string& symbol, uint64_t fill_price);
@@ -93,6 +96,8 @@ private:
     uint64_t self_trades_prevented_ = 0;
     uint64_t price_band_rejects_ = 0;
     uint64_t vi_halt_rejects_ = 0;
+    // 복원 중 교차(무음 체결 위험) 발생 횟수 — 정상 스냅샷이면 항상 0이어야 한다.
+    uint64_t silent_restore_matches_ = 0;
 
     // 가격 밴드 폭(직전 체결가 대비 ±비율). 0이면 비활성. PRICE_BAND_PCT env로 설정.
     double price_band_pct_ = 0.0;

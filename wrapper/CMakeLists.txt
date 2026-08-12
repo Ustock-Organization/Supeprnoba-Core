@@ -80,3 +80,27 @@ target_link_libraries(matching_engine PRIVATE
     CURL::libcurl
     ${AWSSDK_LINK_LIBRARIES}
 )
+
+# === 테스트 =================================================================
+# main.cpp를 뺀 엔진 소스(테스트가 자체 main을 갖는다)
+set(ENGINE_TEST_SOURCES ${SOURCES})
+list(REMOVE_ITEM ENGINE_TEST_SOURCES src/main.cpp)
+
+# test/*_test.cpp 를 각각 실행파일로 등록 — 신규 테스트는 파일만 추가하면 잡힌다.
+file(GLOB ENGINE_TEST_SOURCES_LIST ${CMAKE_SOURCE_DIR}/test/*_test.cpp)
+foreach(test_src ${ENGINE_TEST_SOURCES_LIST})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src} ${ENGINE_TEST_SOURCES})
+    target_link_libraries(${test_name} PRIVATE
+        proto_lib
+        gRPC::grpc++
+        nlohmann_json::nlohmann_json
+        hiredis::hiredis
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        CURL::libcurl
+        ${AWSSDK_LINK_LIBRARIES}
+    )
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+enable_testing()

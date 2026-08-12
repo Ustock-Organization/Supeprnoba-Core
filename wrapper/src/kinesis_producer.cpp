@@ -9,7 +9,10 @@
 #include <cstdio>
 
 namespace {
-constexpr const char* WAL_PATH = "/var/log/supernoba/kinesis-wal.log";
+// 서비스 계정(ec2-user)이 소유한 디렉터리 하위여야 한다. 부모 /var/log/supernoba는
+// install-services.sh가 sudo로 만들어 root:root로 남으므로, 그 직하에 파일을 만들려 하면
+// EACCES로 WAL이 통째로 무력화된다(발행 실패분 영구 유실). engine/ 하위는 chown 대상이다.
+constexpr const char* WAL_PATH = "/var/log/supernoba/engine/kinesis-wal.log";
 }
 
 namespace aws_wrapper {
