@@ -78,8 +78,10 @@ let pgClient = null;
 // Helpers
 // ============================================================
 
+// admin:events 채널·심볼 라이프사이클 키는 operating(6382)에 있다. type을 생략하면
+// depth(6379)로 폴백해 구독자가 없는 캐시에 발행하게 된다.
 function getValkey() {
-  return getValkeyClient({ preset: 'admin' });
+  return getValkeyClient({ type: 'operating', preset: 'admin' });
 }
 
 /**
@@ -326,71 +328,100 @@ function chunkArray(array, size) {
 async function step3A_cleanValkey(symbol) {
   console.log(`[delisting-phase3][3A] Starting Valkey cleanup for ${symbol}`);
 
-  try {
-    const valkey = getValkey();
-    const pipeline = valkey.pipeline();
+  // ★ 4-Cache는 포트가 다른 별개 인스턴스다. 과거엔 getValkey()(type 누락 → depth로
+  // 폴백) 하나에 전 키를 지워, candle(6380)·backup(6381)·operating(6382)의 키가 전부
+  // 잔존했다. 결과: 폐지 종목이 랭킹 API에 계속 노출되고, RDS 행 삭제 후 차트 폴백이
+  // Valkey를 읽어 1분봉이 되살아나며, 스트리머가 구독 목록에 남은 심볼을 영원히 폴링했다.
+  // 삭제 카운트는 0으로 찍히지만 non-fatal이라 성공으로 보고됐다.
+  const depthKeys = [
+    `ticker:${symbol}`,
+    `depth:${symbol}`,
+    `ohlc:${symbol}`,
+    `prev:${symbol}`,
+  ];
+  const candleKeys = [
+    `candle:closed:1m:${symbol}`,
+    ...TIMEFRAMES.map(tf => `candle:${tf}:${symbol}`),
+  ];
+  const operatingKeys = [
+    `symbol:${symbol}:listingPrice`,
+    `symbol:${symbol}:main`,
+    `symbol:${symbol}:sub`,
+    `symbol:${symbol}:subscribers`,
+    `symbol:${symbol}:state`,        // VI halt 상태(엔진이 기록)
+    `mm:config:${symbol}`,
+    `mm:price:${symbol}`,
+    `mm:orderCount:${symbol}`,
+    `mm:started_at:${symbol}`,
+    `mm:inventory:${symbol}`,        // MM 재고(백엔드가 기록)
+    `mm:cpmm:${symbol}`,             // CPMM 백스톱 예산 상태
+  ];
 
-    // --- Individual key deletions ---
-    const keysToDelete = [
-      // Core market data
-      `ticker:${symbol}`,
-      `depth:${symbol}`,
-      `ohlc:${symbol}`,
-      `prev:${symbol}`,
+  // 캐시별 (클라이언트, 키목록, 멤버제거 작업) — 각각 독립 파이프라인으로 실행
+  const plans = [
+    {
+      name: 'depth',
+      client: getValkeyClient({ type: 'depth', preset: 'admin' }),
+      keys: depthKeys,
+      members: [],
+    },
+    {
+      name: 'candle',
+      client: getValkeyClient({ type: 'candle', preset: 'admin' }),
+      keys: candleKeys,
+      members: [],
+    },
+    {
+      name: 'backup',
+      client: getValkeyClient({ type: 'backup', preset: 'admin' }),
+      keys: [`snapshot:${symbol}`],
+      members: ['gainers', 'losers', 'marketcap', 'volume']
+        .map(r => ({ op: 'zrem', key: `ranking:${r}` })),
+    },
+    {
+      name: 'operating',
+      client: getValkeyClient({ type: 'operating', preset: 'admin' }),
+      keys: operatingKeys,
+      members: [
+        { op: 'srem', key: 'mm:running:symbols' },
+        // Defense-in-depth: streamer가 다시 넣었을 수 있어 재삭제
+        { op: 'srem', key: 'active:symbols' },
+        { op: 'srem', key: 'subscribed:symbols' },
+      ],
+    },
+  ];
 
-      // Symbol metadata
-      `symbol:${symbol}:listingPrice`,
-      `symbol:${symbol}:main`,
-      `symbol:${symbol}:sub`,
-      `symbol:${symbol}:subscribers`,
+  let deletedKeys = 0;
+  let removedMembers = 0;
+  const errors = [];
 
-      // Closed candle queue
-      `candle:closed:1m:${symbol}`,
-
-      // Candle data per timeframe (9 keys)
-      ...TIMEFRAMES.map(tf => `candle:${tf}:${symbol}`),
-
-      // Market maker keys (4 keys)
-      `mm:config:${symbol}`,
-      `mm:price:${symbol}`,
-      `mm:orderCount:${symbol}`,
-      `mm:started_at:${symbol}`
-    ];
-
-    keysToDelete.forEach(k => pipeline.del(k));
-
-    // --- ZSet/Set membership removal ---
-    ['gainers', 'losers', 'marketcap', 'volume'].forEach(r => {
-      pipeline.zrem(`ranking:${r}`, symbol);
-    });
-    pipeline.srem('mm:running:symbols', symbol);
-    // Defense-in-depth: re-remove from active/subscribed in case streamer re-added them
-    pipeline.srem('active:symbols', symbol);
-    pipeline.srem('subscribed:symbols', symbol);
-
-    const results = await pipeline.exec();
-
-    // Count actual deletions from pipeline results
-    let deletedKeys = 0;
-    let removedMembers = 0;
-    if (results) {
-      // DEL results: first N entries are key deletions
-      for (let i = 0; i < keysToDelete.length; i++) {
-        if (results[i] && results[i][1] > 0) deletedKeys++;
+  for (const plan of plans) {
+    try {
+      const pipeline = plan.client.pipeline();
+      plan.keys.forEach(k => pipeline.del(k));
+      plan.members.forEach(m => pipeline[m.op](m.key, symbol));
+      const results = await pipeline.exec();
+      if (results) {
+        for (let i = 0; i < plan.keys.length; i++) {
+          if (results[i] && results[i][1] > 0) deletedKeys++;
+        }
+        for (let i = plan.keys.length; i < results.length; i++) {
+          if (results[i] && results[i][1] > 0) removedMembers++;
+        }
       }
-      // ZREM/SREM results: remaining entries
-      for (let i = keysToDelete.length; i < results.length; i++) {
-        if (results[i] && results[i][1] > 0) removedMembers++;
-      }
+    } catch (err) {
+      // 캐시 하나가 실패해도 나머지는 정리한다(부분 잔존이 전면 잔존보다 낫다).
+      console.warn(`[delisting-phase3][3A] ${plan.name} cache cleanup failed: ${err.message}`);
+      errors.push(`${plan.name}: ${err.message}`);
     }
-
-    console.log(`[delisting-phase3][3A] Valkey cleanup done: ${deletedKeys} keys deleted, ${removedMembers} set/zset members removed`);
-    return { deletedKeys, removedMembers };
-
-  } catch (err) {
-    console.warn(`[delisting-phase3][3A] Valkey cleanup failed (non-fatal): ${err.message}`);
-    return { deletedKeys: 0, removedMembers: 0, error: err.message };
   }
+
+  console.log(`[delisting-phase3][3A] Valkey cleanup done: ${deletedKeys} keys deleted, ` +
+              `${removedMembers} set/zset members removed` +
+              (errors.length ? ` (errors: ${errors.join('; ')})` : ''));
+  return errors.length
+    ? { deletedKeys, removedMembers, error: errors.join('; ') }
+    : { deletedKeys, removedMembers };
 }
 
 /**

@@ -30,16 +30,32 @@ export const handler = async (event) => {
   console.log(`[delete-user-phase2] Starting CANCEL_ORDERS for user=${user_id}, job=${job_id}`);
 
   // 1. DynamoDB에서 미체결 주문 조회
+  //    ★ 페이지네이션 필수: Query는 1MB에서 잘리는데 order_id가 UUID라 정렬이 무작위다.
+  //    잘린 페이지를 그대로 쓰면 임의의 미체결 주문에 CANCEL이 발행되지 않고, 이후
+  //    주문 행·유저 행이 삭제되어 엔진 오더북에만 남는 유령 주문이 된다(체결 시 상대
+  //    유저의 정상 체결까지 트랜잭션 롤백되거나 좀비 holdings가 재생성된다).
+  //    OPEN 상태만 DDB 레벨에서 걸러 1MB 예산이 체결 이력에 소모되지 않게 한다.
+  const OPEN_STATUSES = ['ACCEPTED', 'PARTIALLY_FILLED', 'PARTIAL_FILL', 'PENDING'];
   let openOrders = [];
   try {
-    const result = await dynamodb.send(new QueryCommand({
-      TableName: ORDERS_TABLE,
-      KeyConditionExpression: 'user_id = :uid',
-      ExpressionAttributeValues: { ':uid': user_id }
-    }));
-    openOrders = (result.Items || []).filter(
-      o => ['ACCEPTED', 'PARTIALLY_FILLED', 'PARTIAL_FILL', 'PENDING'].includes(o.status)
-    );
+    let ExclusiveStartKey;
+    do {
+      const result = await dynamodb.send(new QueryCommand({
+        TableName: ORDERS_TABLE,
+        KeyConditionExpression: 'user_id = :uid',
+        FilterExpression: '#s IN (:s0, :s1, :s2, :s3)',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':uid': user_id,
+          ':s0': OPEN_STATUSES[0], ':s1': OPEN_STATUSES[1],
+          ':s2': OPEN_STATUSES[2], ':s3': OPEN_STATUSES[3],
+        },
+        ProjectionExpression: 'order_id, symbol, #s',
+        ExclusiveStartKey,
+      }));
+      openOrders.push(...(result.Items || []));
+      ExclusiveStartKey = result.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
     console.log(`[delete-user-phase2] Found ${openOrders.length} open orders`);
   } catch (e) {
     console.error(`[delete-user-phase2] Order query failed:`, e.message);
