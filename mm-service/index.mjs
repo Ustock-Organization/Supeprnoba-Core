@@ -35,6 +35,7 @@ import InventoryTracker from "./utils/inventory.mjs";
 import SineStrategy from "./strategies/sine-strategy.mjs";
 import SpreadStrategy from "./strategies/spread-mm.mjs";
 import DepthStrategy from "./strategies/depth-mm.mjs";
+import OrganicStrategy from "./strategies/organic-strategy.mjs";
 import PriceFeed from "./feeds/price-feed.mjs";
 import InternalFeed from "./feeds/internal-feed.mjs";
 
@@ -120,6 +121,10 @@ const DEFAULT_CONFIG = {
   positionLimit: 500,
   riskAversion: 0.5,
   volatility: 0.0001,
+  // organic 전략 전용
+  agentCount: 4,          // MM 에이전트 풀 크기(자가체결 시그니처 분산)
+  maxOrderSize: 1000,     // 주문 크기 상한
+  crossProb: 0.5,         // 매 틱 교차(체결) 발생 확률
 };
 
 // === Strategy Factory ===
@@ -143,6 +148,7 @@ function createStrategy(symbol, config) {
   if (priceFeed) deps.priceFeed = priceFeed;
 
   switch (strategyName) {
+    case "organic": return new OrganicStrategy(symbol, config, deps);
     case "spread": return new SpreadStrategy(symbol, config, deps);
     case "depth": return new DepthStrategy(symbol, config, deps);
     case "legacy_sine":
@@ -174,6 +180,10 @@ function parseConfigFields(raw) {
     positionLimit: parseInt(raw.positionLimit) || DEFAULT_CONFIG.positionLimit,
     riskAversion: parseFloat(raw.riskAversion) || DEFAULT_CONFIG.riskAversion,
     volatility: parseFloat(raw.volatility) || DEFAULT_CONFIG.volatility,
+    // organic 전략 전용
+    agentCount: parseInt(raw.agentCount) || DEFAULT_CONFIG.agentCount,
+    maxOrderSize: parseInt(raw.maxOrderSize) || DEFAULT_CONFIG.maxOrderSize,
+    crossProb: raw.crossProb != null ? parseFloat(raw.crossProb) : DEFAULT_CONFIG.crossProb,
   };
 }
 
