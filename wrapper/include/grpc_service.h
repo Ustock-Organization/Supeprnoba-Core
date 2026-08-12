@@ -39,8 +39,14 @@ public:
                               CancelOrderResponse* response) override;
 
 private:
+    // 관리 채널 인증: 메타데이터 x-engine-token이 공유 시크릿과 일치하는지 확인.
+    // ENGINE_GRPC_TOKEN 미설정 시 경고 후 허용(하위호환), 설정 시 강제.
+    // 파괴적 RPC(CancelAllOrders/RemoveOrderBook 등)를 무인증 노출로부터 보호.
+    bool authorize(grpc::ServerContext* context, const char* rpc_name) const;
+
     EngineCore* engine_;
     RedisClient* redis_;
+    std::string auth_token_;
     std::chrono::steady_clock::time_point start_time_;
 };
 
