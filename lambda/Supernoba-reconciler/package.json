@@ -1,0 +1,10 @@
+{
+  "name": "supernoba-reconciler",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "주문 블랙홀 스위퍼 + 잔고 보존 리컨실러 (P0 감시)",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
+  }
+}

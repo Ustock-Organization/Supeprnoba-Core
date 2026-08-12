@@ -178,25 +178,36 @@ void KinesisConsumer::stop() {
 
     Logger::info("KinesisConsumer stopping - initiating graceful shutdown");
 
-    // 1. 새 레코드 수신 중단
+    // 1. 새 레코드 수신 중단 (worker는 다음 루프에서 running_=false를 보고 빠져나온다)
     draining_ = true;
     running_ = false;
 
-    // 2. AWS SDK 클라이언트 파괴 → 진행 중인 GetRecords 등 요청 강제 취소
-    //    이렇게 하면 블로킹된 API 호출이 즉시 에러로 반환되어 worker 스레드 탈출 가능
-    client_.reset();
-
-    // 3. 워커 스레드 종료 대기 (5초 타임아웃 — client_ 파괴로 빠르게 종료됨)
+    // 2. worker join 대기 — client_는 아직 유지한다.
+    //    ⚠ 종료 SEGV 근본원인: 예전엔 join 전에 client_.reset()을 호출했는데, worker가
+    //    GetRecords(client_->...) 진행 중이면 use-after-free가 됐다(TOCTOU: !client_ 체크와
+    //    실제 호출 사이 reset). requestTimeoutMs=3000이라 in-flight 요청은 ~3초 내 반환되고
+    //    worker가 스스로 종료하므로 reset으로 강제 취소할 필요가 없다. 여유롭게 10초 대기.
+    bool joined = false;
     if (worker_.joinable()) {
         auto future = std::async(std::launch::async, [this]() { worker_.join(); });
-        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-            Logger::warn("KinesisConsumer worker thread did not exit within 5s - detaching");
+        if (future.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
+            Logger::error("KinesisConsumer worker did not exit within 10s - detaching "
+                          "(client_ 유지: reset 시 UAF 위험)");
             worker_.detach();
+        } else {
+            joined = true;
         }
+    } else {
+        joined = true;
     }
 
-    // 4. 마지막 체크포인트 저장
-    if (checkpoint_enabled_ && checkpoint_manager_) {
+    // 3. worker가 확실히 종료된 뒤에만 client_ 파괴 (안전 — 더 이상 참조자 없음).
+    if (joined) {
+        client_.reset();
+    }
+
+    // 4. 마지막 체크포인트 저장 — join 이후에만 last_sequence_numbers_ 접근(경쟁 방지).
+    if (joined && checkpoint_enabled_ && checkpoint_manager_) {
         Logger::info("Flushing final checkpoints...");
         for (const auto& [shard_id, seq] : last_sequence_numbers_) {
             if (!seq.empty()) {
@@ -205,9 +216,11 @@ void KinesisConsumer::stop() {
         }
         checkpoint_manager_->flush();
         Logger::info("Final checkpoints saved");
+    } else if (!joined) {
+        Logger::warn("Skipping checkpoint flush — worker detached (상태 불확실)");
     }
 
-    Logger::info("KinesisConsumer stopped gracefully, records processed:", records_processed_.load());
+    Logger::info("KinesisConsumer stopped, records processed:", records_processed_.load());
 }
 
 std::map<std::string, std::string> KinesisConsumer::getShardPositions() const {
