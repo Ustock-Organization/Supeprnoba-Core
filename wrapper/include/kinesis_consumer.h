@@ -7,6 +7,8 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <map>
+#include <mutex>
 #include <chrono>
 
 namespace aws_wrapper {
@@ -42,6 +44,10 @@ public:
     int64_t getLastProgressEpochMs() const { return last_progress_epoch_ms_.load(); }
     static constexpr int WATCHDOG_TIMEOUT_SECONDS = 60;
 
+    // 리플레이 복구용 앵커: 현재까지 처리한 샤드별 마지막 시퀀스의 스냅샷.
+    // main thread에서 호출(consumer thread가 갱신하므로 mutex 보호).
+    std::map<std::string, std::string> getShardPositions() const;
+
 private:
     void consumeLoop();
     std::string getShardIterator(const std::string& shard_id);
@@ -62,9 +68,12 @@ private:
     CheckpointManager* checkpoint_manager_ = nullptr;
     bool checkpoint_enabled_ = true;
     std::unordered_map<std::string, std::string> last_sequence_numbers_;  // shard별 마지막 시퀀스
+    mutable std::mutex seq_mutex_;  // last_sequence_numbers_ 보호(consumer 쓰기 / main 읽기)
 
     // Graceful shutdown
     int drain_timeout_seconds_ = 30;
+    // worker join 실패로 detach된 적이 있는가 — restart()가 UAF/이중소비를 피하도록 판단.
+    bool detached_ = false;
     std::atomic<bool> draining_{false};
 
     // 메트릭

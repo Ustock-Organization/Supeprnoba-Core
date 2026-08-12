@@ -82,11 +82,16 @@ phase_scp() {
         "$EC2_HOST:$REMOTE_CORE/streamer/node/index.mjs"
     log_success "Streamer: 1 file uploaded"
 
-    # --- MM Service (1 file) ---
+    # --- MM Service (디렉터리 전체) ---
+    # index.mjs만 올리면 strategies/·utils/·feeds/ 가 없어 import가
+    # ERR_MODULE_NOT_FOUND로 실패하고 MM이 기동조차 못 한다.
     log_info "Uploading MM Service..."
-    scp "$LOCAL_BASE/mm-service/index.mjs" \
-        "$EC2_HOST:$REMOTE_CORE/mm-service/index.mjs"
-    log_success "MM Service: 1 file uploaded"
+    scp -r "$LOCAL_BASE/mm-service/index.mjs" \
+           "$LOCAL_BASE/mm-service/strategies" \
+           "$LOCAL_BASE/mm-service/utils" \
+           "$LOCAL_BASE/mm-service/feeds" \
+        "$EC2_HOST:$REMOTE_CORE/mm-service/"
+    log_success "MM Service: index + strategies/utils/feeds uploaded"
 
     # --- Deploy scripts & env ---
     log_info "Uploading deploy scripts and env files..."

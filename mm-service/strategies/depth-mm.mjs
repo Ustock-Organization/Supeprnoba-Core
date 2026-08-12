@@ -51,8 +51,10 @@ export default class DepthStrategy extends SpreadStrategy {
     });
 
     if (cb.status === "STOPPED") {
+      // 호가 철회 후 정지 — 남겨두면 킬 스위치 이후에도 체결이 이어진다.
+      await this.orderManager.cancelAllForSymbol(this.symbol);
       console.log(
-        `[depth] ${this.symbol} STOPPED — net=${pos.netPosition}, limit=${posLimit}`
+        `[depth] ${this.symbol} STOPPED — net=${pos.netPosition}, limit=${posLimit} (호가 철회)`
       );
       return;
     }

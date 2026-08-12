@@ -36,7 +36,9 @@ const connectHandler = async (event) => {
     testMode: testMode,
   });
 
-  let userId = legacyUserId || generateAnonymousId();
+  // 기본은 익명. 클라이언트가 보낸 userId(legacyUserId)는 토큰 검증을 통과하기 전에는
+  // 절대 신뢰하지 않는다 — 그러지 않으면 ?userId=피해자 로 타인 실시간 데이터 탈취 가능.
+  let userId = generateAnonymousId();
   let isLoggedIn = false;
   let userEmail = null;
 
@@ -54,10 +56,11 @@ const connectHandler = async (event) => {
         isLoggedIn = true;
         console.log(`[connect] ✅ JWT validated (${authResult.provider}) - user: ${userId} (${userEmail})`);
       } else {
-        console.log(`[connect] ❌ JWT validation failed:`, authResult.error);
+        // 검증 실패 → 익명으로 강등(공격자 지정 userId 무시)
+        console.log(`[connect] ❌ JWT validation failed → anonymous:`, authResult.error);
       }
     } catch (e) {
-      console.warn(`[connect] ❌ JWT validation error:`, e.message);
+      console.warn(`[connect] ❌ JWT validation error → anonymous:`, e.message);
     }
   } else {
     console.log(`[connect] No token → anonymous user: ${userId}`);

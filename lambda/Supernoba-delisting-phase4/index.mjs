@@ -135,6 +135,32 @@ async function createRdsClient() {
  * @param {() => Promise<boolean>} fn - Async function returning true if check passes
  * @returns {{ name: string, pass: boolean, error?: string }}
  */
+/**
+ * 해당 심볼의 잔여 항목이 정말 0건인지 확인한다.
+ *
+ * 과거엔 `Limit: 1` + FilterExpression을 썼는데, DynamoDB의 Limit은 **필터 적용 전**
+ * 평가 항목 수라 테이블의 첫 1건만 읽고 필터링했다. 잔여가 수천 건이어도 사실상 항상
+ * "0건"으로 통과했고, 삭제 실패를 삼키는 phase3와 겹쳐 누락이 있어도 COMPLETED로
+ * 종료됐다. Select: COUNT로 전 페이지를 순회해 실제 잔여를 센다.
+ */
+async function hasNoResidue(tableName, sym) {
+  let ExclusiveStartKey;
+  let count = 0;
+  do {
+    const res = await dynamodb.send(new ScanCommand({
+      TableName: tableName,
+      FilterExpression: 'symbol = :sym',
+      ExpressionAttributeValues: { ':sym': sym },
+      Select: 'COUNT',
+      ExclusiveStartKey,
+    }));
+    count += res.Count || 0;
+    if (count > 0) return false;   // 하나라도 남았으면 즉시 실패
+    ExclusiveStartKey = res.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return true;
+}
+
 async function runCheck(name, fn) {
   try {
     const pass = await fn();
@@ -226,26 +252,10 @@ export const handler = async (event) => {
     }
 
     // --- 4. DynamoDB holdings check ---
-    checks.push(await runCheck('dynamodb:holdings', async () => {
-      const result = await dynamodb.send(new ScanCommand({
-        TableName: HOLDINGS_TABLE,
-        FilterExpression: 'symbol = :sym',
-        ExpressionAttributeValues: { ':sym': sym },
-        Limit: 1,
-      }));
-      return (result.Items || []).length === 0;
-    }));
+    checks.push(await runCheck('dynamodb:holdings', () => hasNoResidue(HOLDINGS_TABLE, sym)));
 
     // --- 5. DynamoDB orders check ---
-    checks.push(await runCheck('dynamodb:orders', async () => {
-      const result = await dynamodb.send(new ScanCommand({
-        TableName: ORDERS_TABLE,
-        FilterExpression: 'symbol = :sym',
-        ExpressionAttributeValues: { ':sym': sym },
-        Limit: 1,
-      }));
-      return (result.Items || []).length === 0;
-    }));
+    checks.push(await runCheck('dynamodb:orders', () => hasNoResidue(ORDERS_TABLE, sym)));
   } finally {
     // Always release the RDS connection
     if (pgClient) {
@@ -352,8 +362,10 @@ export const handler = async (event) => {
       await dynamodb.send(new UpdateCommand({
         TableName: DELIST_JOBS_TABLE,
         Key: { job_id },
-        UpdateExpression: 'SET #status = :status, phase = :phase, completed_at = :now, updated_at = :now, phases_completed = list_append(if_not_exists(phases_completed, :empty), :newPhase)',
-        ExpressionAttributeNames: { '#status': 'status' },
+        // 'phase'는 DynamoDB 예약어라 별칭이 필요하다. raw로 쓰면 ValidationException이
+        // 나고, 이미 Valkey 정리를 마친 뒤라 "캐시는 완료, job은 FAILED"로 영구 불일치가 된다.
+        UpdateExpression: 'SET #status = :status, #phase = :phase, completed_at = :now, updated_at = :now, phases_completed = list_append(if_not_exists(phases_completed, :empty), :newPhase)',
+        ExpressionAttributeNames: { '#status': 'status', '#phase': 'phase' },
         ExpressionAttributeValues: {
           ':status': 'COMPLETED',
           ':phase': 'VERIFIED',

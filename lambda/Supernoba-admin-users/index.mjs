@@ -39,6 +39,37 @@ let cachedSettings = null;
 
 const USERS_TABLE = process.env.USERS_TABLE || 'supernoba-users';
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE || 'supernoba-audit-logs';
+// 관리자 잔고 설정 상한. 없으면 단일 관리자가 임의 금액을 창출할 수 있다.
+const MAX_ADMIN_BALANCE = Number(process.env.MAX_ADMIN_BALANCE || 100000000);
+
+/**
+ * 관리자 특권 행위 감사 기록.
+ * 기존 코드는 전부 `catch { console.log('...(ignored)') }`로 실패를 삼켰다 —
+ * 잔고 변경·권한 부여가 무기록으로 성공하면 내부자 위협에 사후 포렌식이 불가능하다.
+ * 실패를 호출자에게 알려(auditLogged: false) 최소한 드러나게 한다.
+ * @returns {Promise<boolean>} 기록 성공 여부
+ */
+async function writeAudit({ action, actor_user_id, target_user_id, details }) {
+  try {
+    await dynamodb.send(new PutCommand({
+      TableName: AUDIT_LOGS_TABLE,
+      Item: {
+        log_id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+        action,
+        actor_user_id,          // 누가 했는지 — 없으면 추적 자체가 불가능하다
+        target_user_id,
+        details,
+        created_at: new Date().toISOString(),
+      }
+    }));
+    return true;
+  } catch (e) {
+    // 테이블 미생성 등 설정 문제도 여기서 드러난다.
+    console.error(`[AUDIT FAILED] action=${action} actor=${actor_user_id} ` +
+                  `target=${target_user_id}: ${e.message}`);
+    return false;
+  }
+}
 
 // Layer를 통한 클라이언트 초기화
 const valkey = getValkeyClient({ type: 'operating', preset: 'admin' });
@@ -584,38 +615,38 @@ export const handler = async (event) => {
       if (action === 'setAdmin') {
         const { isAdmin } = b;
         if (typeof isAdmin !== 'boolean') return err(400, 'isAdmin must be a boolean');
+        // 자기 자신의 권한은 이 경로로 바꿀 수 없다(실수로 마지막 관리자가
+        // 스스로를 강등해 잠기는 것과, 권한 세탁을 함께 막는다).
+        if (userId === authResult?.userId) {
+          return err(400, '자신의 관리자 권한은 변경할 수 없습니다');
+        }
 
         try {
           await dynamodb.send(new UpdateCommand({
             TableName: USERS_TABLE,
             Key: { user_id: userId },
             UpdateExpression: 'SET is_admin = :isAdmin, updated_at = :updatedAt',
+            ConditionExpression: 'attribute_exists(user_id)',
             ExpressionAttributeValues: {
               ':isAdmin': isAdmin,
               ':updatedAt': new Date().toISOString()
             }
           }));
         } catch (e) {
+          if (e.name === 'ConditionalCheckFailedException') return err(404, 'User not found');
           return err(500, 'Failed to update admin status: ' + e.message);
         }
 
-        // 감사 로그 (DynamoDB) - 오류 무시
-        try {
-          await dynamodb.send(new PutCommand({
-            TableName: AUDIT_LOGS_TABLE,
-            Item: {
-              log_id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-              action: 'set_admin',
-              target_user_id: userId,
-              details: { isAdmin },
-              created_at: new Date().toISOString()
-            }
-          }));
-        } catch (e) {
-          console.log('Audit log error (ignored):', e.message);
-        }
+        // 권한 부여는 가장 위험한 특권 행위다 — 무기록으로 통과시키지 않는다.
+        const auditOk = await writeAudit({
+          action: 'set_admin',
+          actor_user_id: authResult?.userId || null,
+          target_user_id: userId,
+          details: { isAdmin },
+        });
 
-        return ok({ success: true, message: `User ${userId} admin status set to ${isAdmin}` });
+        return ok({ success: true, auditLogged: auditOk,
+                    message: `User ${userId} admin status set to ${isAdmin}` });
       }
 
       // 테스터 권한 설정
@@ -702,53 +733,70 @@ export const handler = async (event) => {
       // 잔고 설정 (값 직접 변경)
       if (action === 'setBalance') {
         const { currency = 'BOLT', newBalance, adjustReason } = b;
-        if (typeof newBalance !== 'number' || newBalance < 0) return err(400, 'newBalance must be a non-negative number');
+        if (typeof newBalance !== 'number' || !Number.isFinite(newBalance) || newBalance < 0) {
+          return err(400, 'newBalance must be a non-negative number');
+        }
+        // 상한 — 단일 관리자가 무제한으로 자금을 만들 수 없게 한다.
+        if (newBalance > MAX_ADMIN_BALANCE) {
+          return err(400, `newBalance exceeds limit (${MAX_ADMIN_BALANCE})`);
+        }
+        // 사유 필수 — 감사 추적의 최소 조건
+        if (!adjustReason || String(adjustReason).trim().length < 3) {
+          return err(400, 'adjustReason is required (min 3 chars)');
+        }
 
-        // users 테이블에서 현재 잔고 조회
+        // 현재 잔고·버전 조회. 실패를 무시하면 잘못된 previousBalance가 감사에 남는다.
         let currentBalance = 0;
+        let currentVersion;
         try {
           const { Item: user } = await dynamodb.send(new GetCommand({
             TableName: USERS_TABLE,
             Key: { user_id: userId },
-            ProjectionExpression: 'balances'
+            ProjectionExpression: 'balances, version'
           }));
+          if (!user) return err(404, 'User not found');
           currentBalance = user?.balances?.BOLT?.available || 0;
+          currentVersion = user.version;
         } catch (e) {
-          console.log('Balance fetch error (ignored):', e.message);
+          return err(500, 'Balance fetch failed: ' + e.message);
         }
 
-        // users 테이블의 balances.BOLT.available 직접 업데이트
+        // 낙관적 잠금 — 동시 거래 중 실행되면 체결 결과를 소실시키고 locked와
+        // 불일치한 회계 상태를 만든다. version이 바뀌었으면 거부하고 재시도하게 한다.
         try {
           await dynamodb.send(new UpdateCommand({
             TableName: USERS_TABLE,
             Key: { user_id: userId },
-            UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now',
+            UpdateExpression: 'SET balances.BOLT.available = :bal, updated_at = :now, version = if_not_exists(version, :zero) + :one',
+            ConditionExpression: currentVersion === undefined
+              ? 'attribute_exists(user_id)'
+              : 'version = :ver',
             ExpressionAttributeValues: {
               ':bal': newBalance,
-              ':now': new Date().toISOString()
+              ':now': new Date().toISOString(),
+              ':one': 1,
+              ':zero': 0,
+              ...(currentVersion === undefined ? {} : { ':ver': currentVersion }),
             }
           }));
         } catch (updateErr) {
+          if (updateErr.name === 'ConditionalCheckFailedException') {
+            return err(409, '잔고가 동시에 변경되었습니다. 다시 시도하세요.');
+          }
           return err(500, 'Failed to update balance: ' + updateErr.message);
         }
 
-        // 감사 로그 (DynamoDB) - 오류 무시
-        try {
-          await dynamodb.send(new PutCommand({
-            TableName: AUDIT_LOGS_TABLE,
-            Item: {
-              log_id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-              action: 'set_balance',
-              target_user_id: userId,
-              details: { currency, previousBalance: currentBalance, newBalance, reason: adjustReason },
-              created_at: new Date().toISOString()
-            }
-          }));
-        } catch (e) {
-          console.log('Audit log error (ignored):', e.message);
-        }
+        // 감사 로그 — 실패해도 무시하지 않는다. 특권 행위는 기록 없이 성공으로
+        // 보고되면 안 되며(내부자 위협 무방비), 최소한 호출자가 알아야 한다.
+        const auditOk = await writeAudit({
+          action: 'set_balance',
+          actor_user_id: authResult?.userId || null,
+          target_user_id: userId,
+          details: { currency, previousBalance: currentBalance, newBalance, reason: adjustReason },
+        });
 
-        return ok({ success: true, previousBalance: currentBalance, newBalance, currency });
+        return ok({ success: true, previousBalance: currentBalance, newBalance, currency,
+                    auditLogged: auditOk });
       }
 
       // 보유자산 수정/추가

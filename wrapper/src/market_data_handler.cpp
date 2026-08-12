@@ -205,7 +205,7 @@ void MarketDataHandler::on_fill(const OrderPtr& order,
 
 void MarketDataHandler::on_cancel(const OrderPtr& order) {
     Logger::info("Order CANCELLED:", order->order_id());
-    
+
     // Kinesis로 CANCEL 이벤트 발행 (DynamoDB 업데이트를 위해)
     if (producer_) {
         std::string otype = order->order_type();
@@ -213,6 +213,14 @@ void MarketDataHandler::on_cancel(const OrderPtr& order) {
                                       order->user_id(), "CANCELLED", "",
                                       order->price(), order->order_qty(), order->is_buy(), otype);
         Logger::info("Published CANCEL event to Kinesis:", order->order_id());
+    }
+
+    // 주문 맵에서 제거. 이 경로가 없으면 IOC 잔량 취소(모든 MARKET 주문이 IOC다)로
+    // 북에는 들어가지 않은 주문이 order_maps_에 영구 잔류하고, 10초 스냅샷에 실려
+    // 재시작 시 일반 지정가처럼 복원된다. MARKET SELL 유령은 price=0이라 liquibook에서
+    // 시장가로 해석되어 복원된 매수호가 전 구간을 쓸어버린다(리스너 부재로 무음 체결).
+    if (engine_) {
+        engine_->removeFilledOrderUnsafe(order->symbol(), order->order_id());
     }
 }
 
@@ -343,7 +351,10 @@ void MarketDataHandler::on_depth_change(const OrderBook* book,
         std::string key = "depth:" + symbol;
         std::string json_str = depth_json.dump();
         Logger::debug("DEPTH_SAVE:", key, "=", json_str.substr(0, 200));  // 앞 200자만
-        bool saved = depth_redis_->set(key, json_str);
+        // TTL 부여: 엔진이 죽으면 이 키가 만료되어 스트리머가 스테일 호가를 계속
+        // 브로드캐스트하지 못하게 한다. TTL이 없으면 사용자에겐 "거래가 잠잠한 정상
+        // 시장"으로 보이고, 그 상태로 넣은 주문은 체결되지 않은 채 쌓인다.
+        bool saved = depth_redis_->setEx(key, json_str, MARKET_DATA_TTL_SECONDS);
         if (saved) {
             Logger::debug("Depth saved OK:", key);
         } else {
@@ -409,7 +420,8 @@ void MarketDataHandler::updateTickerCache(const std::string& symbol, uint64_t pr
         std::chrono::system_clock::now().time_since_epoch()).count();
     ticker["p"] = price;
 
-    depth_redis_->set("ticker:" + symbol, ticker.dump());
+    // depth와 동일하게 TTL 부여(엔진 사망 시 스테일 현재가 방송 차단).
+    depth_redis_->setEx("ticker:" + symbol, ticker.dump(), MARKET_DATA_TTL_SECONDS);
     Logger::debug("Ticker saved:", symbol, "price:", price);
 }
 

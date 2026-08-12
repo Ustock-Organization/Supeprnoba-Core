@@ -108,7 +108,10 @@ const DEFAULT_CONFIG = {
   tradeInterval: 1,
   tradeQuantity: 10,
   // v10 extensions
-  strategy: "legacy_sine",
+  // 기본 전략은 organic. legacy_sine은 결정론적 사인파(basePrice·period·amplitude·
+  // started_at만 알면 미래 가격이 계산된다)라 무위험 차익 익스플로잇의 원본이며,
+  // 봇 예산이 무한이라 무한 발권으로 이어진다. 명시적으로 선택할 때만 쓴다.
+  strategy: "organic",
   spread: 0.02,
   depthLevels: 3,
   depthDecay: 0.5,
@@ -128,8 +131,22 @@ const DEFAULT_CONFIG = {
 };
 
 // === Strategy Factory ===
+const VALID_STRATEGIES = new Set(["organic", "spread", "depth", "legacy_sine"]);
+
 function createStrategy(symbol, config) {
-  const strategyName = config.strategy || "legacy_sine";
+  let strategyName = config.strategy || DEFAULT_CONFIG.strategy;
+  // 화이트리스트: 오타("Organic"·"ORGANIC")가 조용히 default로 떨어져 legacy_sine으로
+  // 기동하던 경로를 막는다. 로그 한 줄만 남아 운영자가 알아채기 어려웠다.
+  if (!VALID_STRATEGIES.has(strategyName)) {
+    console.error(`[MM] 알 수 없는 전략 "${strategyName}" → ${DEFAULT_CONFIG.strategy} 사용 (${symbol})`);
+    strategyName = DEFAULT_CONFIG.strategy;
+  }
+  // legacy_sine은 결정론적이라 익스플로잇 대상 — 명시적 옵트인을 요구한다.
+  if (strategyName === "legacy_sine" && process.env.MM_ALLOW_LEGACY_SINE !== "true") {
+    console.error(`[MM] legacy_sine은 MM_ALLOW_LEGACY_SINE=true 없이는 사용할 수 없습니다 ` +
+                  `(결정론적 가격 → 무위험 차익). organic으로 대체합니다. (${symbol})`);
+    strategyName = "organic";
+  }
   const deps = {
     kinesis,
     operatingCache,
@@ -151,39 +168,53 @@ function createStrategy(symbol, config) {
     case "organic": return new OrganicStrategy(symbol, config, deps);
     case "spread": return new SpreadStrategy(symbol, config, deps);
     case "depth": return new DepthStrategy(symbol, config, deps);
-    case "legacy_sine":
-    default: return new SineStrategy(symbol, config, deps);
+    case "legacy_sine": return new SineStrategy(symbol, config, deps);
+    // 위 화이트리스트를 통과한 값만 도달하므로 default는 도달 불가.
+    default: return new OrganicStrategy(symbol, config, deps);
   }
 }
 
 // === Config Parsing Helper ===
+// 범위 강제 헬퍼 — `parseFloat(x) || 기본값` 패턴은 음수를 그대로 통과시킨다.
+// 예: spread=-0.5면 bid = reservation×1.25가 되어 봇이 현재가보다 25% 높은 값에
+// 매수 호가를 깔고(가격밴드도 통과) 매도 물량을 전부 받아준다.
+function clampNum(v, fallback, min, max, isInt = false) {
+  let n = isInt ? parseInt(v) : parseFloat(v);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < min || n > max) {
+    console.error(`[MM] config 값 ${n}이 허용 범위 [${min}, ${max}] 밖 → 기본값 ${fallback} 사용`);
+    return fallback;
+  }
+  return n;
+}
+
 function parseConfigFields(raw) {
   return {
     // v9 legacy fields
-    basePrice: parseFloat(raw.basePrice) || DEFAULT_CONFIG.basePrice,
-    period: parseFloat(raw.period) || DEFAULT_CONFIG.period,
-    amplitude: parseFloat(raw.amplitude) || DEFAULT_CONFIG.amplitude,
-    tickInterval: parseInt(raw.tickInterval) || DEFAULT_CONFIG.tickInterval,
-    tradeInterval: parseFloat(raw.tradeInterval) || DEFAULT_CONFIG.tradeInterval,
-    tradeQuantity: parseInt(raw.tradeQuantity) || DEFAULT_CONFIG.tradeQuantity,
+    basePrice: clampNum(raw.basePrice, DEFAULT_CONFIG.basePrice, 0.01, 1e9),
+    period: clampNum(raw.period, DEFAULT_CONFIG.period, 1, 86400),
+    amplitude: clampNum(raw.amplitude, DEFAULT_CONFIG.amplitude, 0, 1),
+    tickInterval: clampNum(raw.tickInterval, DEFAULT_CONFIG.tickInterval, 100, 600000, true),
+    tradeInterval: clampNum(raw.tradeInterval, DEFAULT_CONFIG.tradeInterval, 0.001, 3600),
+    tradeQuantity: clampNum(raw.tradeQuantity, DEFAULT_CONFIG.tradeQuantity, 1, 1e6, true),
     // v10 extensions
-    strategy: raw.strategy || DEFAULT_CONFIG.strategy,
-    spread: parseFloat(raw.spread) || DEFAULT_CONFIG.spread,
-    depthLevels: parseInt(raw.depthLevels) || DEFAULT_CONFIG.depthLevels,
-    depthDecay: parseFloat(raw.depthDecay) || DEFAULT_CONFIG.depthDecay,
+    strategy: raw.strategy || DEFAULT_CONFIG.strategy,   // 화이트리스트는 createStrategy에서
+    spread: clampNum(raw.spread, DEFAULT_CONFIG.spread, 0.0001, 0.5),
+    depthLevels: clampNum(raw.depthLevels, DEFAULT_CONFIG.depthLevels, 1, 10, true),
+    depthDecay: clampNum(raw.depthDecay, DEFAULT_CONFIG.depthDecay, 0.01, 1),
     externalFeed: raw.externalFeed || DEFAULT_CONFIG.externalFeed,
     externalSymbol: raw.externalSymbol || DEFAULT_CONFIG.externalSymbol,
-    correlation: parseFloat(raw.correlation) || DEFAULT_CONFIG.correlation,
-    cancelInterval: parseInt(raw.cancelInterval) || DEFAULT_CONFIG.cancelInterval,
-    maxOpenOrders: parseInt(raw.maxOpenOrders) || DEFAULT_CONFIG.maxOpenOrders,
-    trendBias: parseFloat(raw.trendBias) || DEFAULT_CONFIG.trendBias,
-    positionLimit: parseInt(raw.positionLimit) || DEFAULT_CONFIG.positionLimit,
-    riskAversion: parseFloat(raw.riskAversion) || DEFAULT_CONFIG.riskAversion,
-    volatility: parseFloat(raw.volatility) || DEFAULT_CONFIG.volatility,
+    correlation: clampNum(raw.correlation, DEFAULT_CONFIG.correlation, -1, 1),
+    cancelInterval: clampNum(raw.cancelInterval, DEFAULT_CONFIG.cancelInterval, 1, 1000, true),
+    maxOpenOrders: clampNum(raw.maxOpenOrders, DEFAULT_CONFIG.maxOpenOrders, 1, 1000, true),
+    trendBias: clampNum(raw.trendBias, DEFAULT_CONFIG.trendBias, -1, 1),
+    positionLimit: clampNum(raw.positionLimit, DEFAULT_CONFIG.positionLimit, 1, 1e7, true),
+    riskAversion: clampNum(raw.riskAversion, DEFAULT_CONFIG.riskAversion, 0, 10),
+    volatility: clampNum(raw.volatility, DEFAULT_CONFIG.volatility, 0, 1),
     // organic 전략 전용
-    agentCount: parseInt(raw.agentCount) || DEFAULT_CONFIG.agentCount,
-    maxOrderSize: parseInt(raw.maxOrderSize) || DEFAULT_CONFIG.maxOrderSize,
-    crossProb: raw.crossProb != null ? parseFloat(raw.crossProb) : DEFAULT_CONFIG.crossProb,
+    agentCount: clampNum(raw.agentCount, DEFAULT_CONFIG.agentCount, 2, 50, true),
+    maxOrderSize: clampNum(raw.maxOrderSize, DEFAULT_CONFIG.maxOrderSize, 1, 1e6, true),
+    crossProb: clampNum(raw.crossProb, DEFAULT_CONFIG.crossProb, 0, 1),
   };
 }
 
@@ -437,7 +468,13 @@ async function main() {
   });
 
   // 주기적 상태 발행
-  statusInterval = setInterval(publishStatus, CONFIG.statusPublishInterval);
+  // .catch 필수: setInterval은 반환된 Promise를 잡지 않으므로, Valkey 페일오버 등으로
+  // publish가 reject되면 unhandled rejection이 되어 Node가 프로세스를 종료시킨다.
+  // MM이 죽으면 오더북에 고아 호가가 남고(추적은 인메모리) 재시작 시 정리되지 않는다.
+  statusInterval = setInterval(
+    () => publishStatus().catch((e) => console.error("[MM] publishStatus 실패:", e.message)),
+    CONFIG.statusPublishInterval
+  );
 
   // 시작 시 Redis 상태와 동기화
   await syncWithRedis();
@@ -468,6 +505,16 @@ async function shutdown(signal) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// 안전망: 일시적 인프라 오류(Valkey 페일오버·Kinesis 스로틀)로 프로세스가 죽으면
+// 오더북에 고아 MM 호가가 남는다(주문 추적이 인메모리라 재시작해도 취소 불가).
+// 로그만 남기고 계속 돌린다 — streamer와 동일한 정책.
+process.on("unhandledRejection", (reason) => {
+  console.error("[MM] Unhandled rejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[MM] Uncaught exception:", err?.message || err);
+});
 
 // Start
 main().catch((e) => {

@@ -63,13 +63,39 @@ export default class CpmmBackstop {
    * @returns {number} 유저가 지불한 현금(=봇 수취). x 소진 시 0(체결 불가).
    */
   buyFromBot(dx) {
-    if (!(dx > 0) || dx >= this.x) return 0;   // 토큰 소진 방어
+    // 실효 상한: dx가 x에 근접하면 xNew→0이라 cost가 Infinity로 발산해 잔고에
+    // NaN/Infinity가 전파된다. 한 번에 준비금의 절반 이상은 살 수 없게 막는다.
+    if (!(dx > 0) || dx >= this.x * 0.5) return 0;
     const xNew = this.x - dx;
     const yNew = this.k / xNew;       // y 증가
     const cost = yNew - this.y;
     this.x = xNew;
     this.y = yNew;
     return cost;
+  }
+
+  /** Redis 등에 저장할 직렬화 상태. 재시작 시 예산이 리셋되면 캡이 무의미해진다. */
+  toJSON() {
+    return { x: this.x, y: this.y, k: this.k, y0: this.y0 };
+  }
+
+  /**
+   * 저장된 상태 복원. 유효하지 않으면 null을 반환해 호출자가 새로 시드하게 한다.
+   * @param {object|string} raw
+   */
+  static fromJSON(raw) {
+    try {
+      const s = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!s || !(s.x > 0) || !(s.y > 0) || !(s.y0 > 0)) return null;
+      const inst = new CpmmBackstop({ basePrice: s.y / s.x, budget: s.y0 });
+      inst.x = s.x;
+      inst.y = s.y;
+      inst.y0 = s.y0;
+      inst.k = s.k > 0 ? s.k : s.x * s.y;
+      return inst;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -88,8 +114,12 @@ export default class CpmmBackstop {
     const bids = [];
     const asks = [];
     for (let i = 1; i <= levels; i++) {
-      const bidPrice = Math.max(1, Math.round(p * (1 - stepPct * i)));
-      const askPrice = Math.max(1, Math.round(p * (1 + stepPct * i)));
+      // 저가 종목에서 반올림으로 bid==ask가 되면 봇이 자기 자신과 무한 자전체결한다
+      // (예: p=3, stepPct=0.01 → round(2.97)=3, round(3.03)=3). 최소 1틱 이격 강제.
+      const bidPrice = Math.max(1, Math.min(Math.round(p * (1 - stepPct * i)),
+                                            Math.ceil(p) - i));
+      const askPrice = Math.max(bidPrice + 1,
+                                Math.round(p * (1 + stepPct * i)));
       if (canBuy) bids.push({ price: bidPrice, size: sizePerLevel });
       asks.push({ price: askPrice, size: sizePerLevel });
     }

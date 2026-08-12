@@ -115,9 +115,12 @@ export const handler = async (event) => {
     const q = event.queryStringParameters || {};
     const action = q.action;
 
-    // 내부 호출(admin-ws-handler → Lambda invoke)은 인증 스킵
-    const headers = event.headers || {};
-    const isInternal = headers['x-internal-call'] === 'true';
+    // 내부 호출 판별은 위조 불가능한 신호로만 한다:
+    //  ① 직접 Lambda invoke는 API Gateway가 붙이는 requestContext가 없다
+    //  ② admin-ws-handler가 붙이는 최상위 internalInvoke 표식(클라이언트는 event body만 통제)
+    // 과거의 x-internal-call 헤더 방식은 API GW 프록시가 클라이언트 헤더를 그대로
+    // 전달하므로 익명 우회가 가능했다(제거).
+    const isInternal = event.internalInvoke === true && !event.requestContext;
     if (!isInternal) {
       const adminCheck = await checkAdmin(event);
       if (!adminCheck.authorized) return adminCheck.response;

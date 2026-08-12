@@ -3,11 +3,11 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { PutCommand, DeleteCommand, GetCommand, UpdateCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { KinesisClient, PutRecordCommand } from "@aws-sdk/client-kinesis";
+import { verifyAdmin, authErrorResponse } from '/opt/nodejs/verifyAuth.mjs';
 import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 
 // === Configuration ===
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const CREATOR_REQUESTS_TABLE = process.env.CREATOR_REQUESTS_TABLE || 'supernoba-creator-requests';
 
 // RDS Config
@@ -148,24 +148,15 @@ const detectPlatform = (url) => {
     return 'ETC';
 };
 
-// Admin Check
-function isAdmin(event) {
-  const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  if (!ADMIN_API_KEY) return true; 
-  if (authHeader !== ADMIN_API_KEY) {
-      console.log(`[AUTH FAIL] Expected: '${ADMIN_API_KEY}', Got: '${authHeader}'`);
-      return false;
-  }
-  return true; 
-}
-
 export const handler = async (event) => {
     if (event.httpMethod === 'OPTIONS') {
         return { statusCode: 200, headers, body: '' };
     }
 
-    if (!isAdmin(event)) {
-        return { statusCode: 403, headers, body: JSON.stringify({ error: 'Unauthorized' }) };
+    // 관리자 인증: Cognito JWT + is_admin (정적 공유키 fail-open 폐기)
+    const adminCheck = await verifyAdmin(event);
+    if (!adminCheck.success) {
+        return authErrorResponse(adminCheck, headers);
     }
 
     try {
@@ -194,9 +185,9 @@ export const handler = async (event) => {
                 return { statusCode: 400, headers, body: JSON.stringify({error: 'Invalid symbol or name'}) };
             }
 
-            // Validate numeric inputs
-            if (listingPrice !== undefined && listingPrice !== 0 && (isNaN(listingPrice) || listingPrice < 0 || !isFinite(listingPrice))) {
-                return { statusCode: 400, headers, body: JSON.stringify({error: 'Invalid listingPrice'}) };
+            // Validate numeric inputs — listingPrice는 0 초과 강제(marketCap/전일종가 0 오염 차단)
+            if (isNaN(listingPrice) || listingPrice <= 0 || !isFinite(listingPrice)) {
+                return { statusCode: 400, headers, body: JSON.stringify({error: 'listingPrice must be greater than 0'}) };
             }
             if (totalShares !== undefined && totalShares !== 0 && (isNaN(totalShares) || totalShares < 0 || !isFinite(totalShares))) {
                 return { statusCode: 400, headers, body: JSON.stringify({error: 'Invalid totalShares'}) };

@@ -39,6 +39,10 @@ class MarketDataHandler
     , public liquibook::book::BboListener<OrderBook>
 {
 public:
+    // depth/ticker 캐시 TTL(초). 엔진이 죽으면 만료되어 스트리머가 스테일 시장데이터를
+    // 계속 브로드캐스트하지 못하게 한다. 정상 운영 중에는 갱신 주기가 훨씬 짧아 무해.
+    static constexpr int MARKET_DATA_TTL_SECONDS = 60;
+
     explicit MarketDataHandler(IProducer* producer,
                                RedisClient* depth_redis = nullptr,
                                RedisClient* candle_redis = nullptr,

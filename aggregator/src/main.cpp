@@ -248,9 +248,32 @@ int main(int argc, char* argv[]) {
 
     Logger::info("=== Incremental Aggregation Mode ===");
 
+    // 연결 헬스체크 주기(초). 매 루프(10ms)마다 PING하면 캐시에 부하가 크다.
+    int64_t last_health_check = 0;
+    int consecutive_health_failures = 0;
+
     while (running) {
         try {
             int64_t now = get_current_epoch();
+
+            // -1. 연결 헬스체크 — 재연결이 없으면 Valkey 블립 한 번에 좀비가 된다.
+            //     redisCommand는 nullptr을 반환하지만 프로세스는 살아 있어
+            //     systemd Restart=on-failure가 발동하지 않고 캔들 집계만 조용히 멈춘다.
+            if (now - last_health_check >= 5) {
+                last_health_check = now;
+                bool ok = candle_valkey.ensureConnected() && depth_valkey.ensureConnected();
+                if (!ok) {
+                    if (++consecutive_health_failures >= 12) {   // 약 1분
+                        Logger::error("Valkey 재연결 1분 이상 실패 — 프로세스를 종료해 "
+                                      "systemd 재시작에 위임합니다");
+                        return 1;
+                    }
+                    Logger::warn("Valkey 재연결 실패(", consecutive_health_failures, "회) — 재시도");
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+                consecutive_health_failures = 0;
+            }
 
             // 0. Close stale 1m candles (every 10s)
             if (now - last_stale_check > 10) {

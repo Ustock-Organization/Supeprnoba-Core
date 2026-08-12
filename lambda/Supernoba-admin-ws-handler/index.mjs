@@ -17,6 +17,10 @@ import { verifyAdmin } from '/opt/nodejs/verifyAuth.mjs';
 const depthCache = getValkeyClient({ type: 'depth', preset: 'admin' });
 const operatingCache = getValkeyClient({ type: 'operating', preset: 'admin' });
 
+// 관리자 WS 연결 수명(초). 인가는 $connect 1회만 수행되므로, 이 값이 곧
+// "권한 회수·토큰 만료가 반영되기까지의 최대 지연"이다. 1시간으로 제한한다.
+const ADMIN_WS_TTL_SECONDS = Number(process.env.ADMIN_WS_TTL_SECONDS || 3600);
+
 // Lambda 클라이언트 (DB 동기화용)
 const lambdaClient = new LambdaClient({ region: 'ap-northeast-2' });
 
@@ -36,7 +40,9 @@ async function syncToDb(action, data) {
       Payload: JSON.stringify({
         httpMethod: 'POST',
         body: JSON.stringify({ action, ...data }),
-        headers: { 'x-internal-call': 'true' },
+        // 내부 표식은 최상위 필드로 전달(클라이언트 위조 불가). event.headers는
+        // API GW 프록시가 클라이언트 헤더를 그대로 실어오므로 인증 판별에 쓰지 않는다.
+        internalInvoke: true,
       }),
     }));
     console.log(`[admin-ws] DB sync dispatched: ${action}`);
@@ -111,12 +117,14 @@ async function handleConnect(event) {
     headers: { Authorization: `Bearer ${token}` }
   };
 
+  let adminUserId = null;
   try {
     const authResult = await verifyAdmin(authEvent);
     if (!authResult.success) {
       console.log(`[admin-ws] REJECT Auth failed:`, authResult.error, authResult.message);
       return { statusCode: 401, body: `Unauthorized - ${authResult.message}` };
     }
+    adminUserId = authResult.userId || null;
     console.log(`[admin-ws] Auth OK - userId: ${authResult.userId}, method: ${authResult.method}`);
   } catch (authError) {
     console.error(`[admin-ws] Auth exception:`, authError.message);
@@ -132,14 +140,20 @@ async function handleConnect(event) {
     // 캐시 연결 실패해도 연결은 허용
   }
 
-  // 어드민 연결 저장
+  // 어드민 연결 저장 — 관리자 신원을 반드시 남긴다.
+  // 없으면 어떤 관리자가 MM을 조작했는지 특정할 수 없다(감사 로그 부재와 겹쳐
+  // 내부자 행위가 무기록으로 통과한다).
   const connectionInfo = {
     connectedAt: Date.now(),
+    adminUserId,
     subscriptions: [],
   };
 
   try {
-    await operatingCache.setex(`admin:ws:${connectionId}`, 86400, JSON.stringify(connectionInfo));
+    // TTL 축소: 24시간은 권한 회수·토큰 만료가 연결에 전혀 반영되지 않는다는 뜻이다.
+    // 짧게 잡아 주기적으로 재연결(재인증)하게 한다.
+    await operatingCache.setex(`admin:ws:${connectionId}`, ADMIN_WS_TTL_SECONDS,
+                               JSON.stringify(connectionInfo));
     await operatingCache.sadd('admin:connections', connectionId);
     console.log(`[admin-ws] OK Admin connected: ${connectionId}`);
   } catch (e) {
@@ -334,14 +348,31 @@ async function handleMessage(event) {
       });
       return { statusCode: 200, body: 'Data sent' };
 
-    // MM 제어 액션들
+    // MM 제어 액션들 — 시세를 움직이는 파괴적 경로다.
+    // 인가는 $connect 1회뿐이므로, 최소한 연결 레코드가 아직 유효한지(= 만료되지
+    // 않았는지) 확인하고 행위자를 특정한다. 레코드가 없으면 TTL이 지난 연결이므로
+    // 재접속(재인증)을 요구한다.
     case 'start':
     case 'stop':
     case 'startAll':
     case 'stopAll':
     case 'save':
-    case 'delete':
+    case 'delete': {
+      await ensureConnected(operatingCache);
+      const raw = await operatingCache.get(`admin:ws:${connectionId}`);
+      if (!raw) {
+        console.warn(`[admin-ws] REJECT ${action}: 연결 레코드 만료/부재 — 재인증 필요`);
+        await sendToConnection(apiClient, connectionId, {
+          type: 'error', error: 'SESSION_EXPIRED',
+          message: '세션이 만료되었습니다. 다시 접속하세요.',
+        });
+        return { statusCode: 401, body: 'Session expired' };
+      }
+      let actor = null;
+      try { actor = JSON.parse(raw).adminUserId || null; } catch { /* 구 포맷 무시 */ }
+      console.log(`[admin-ws] MM control: action=${action} actor=${actor} conn=${connectionId}`);
       return await handleMMControl(event, apiClient, connectionId, body);
+    }
 
     default:
       console.log(`[admin-ws] Unknown action: ${action}`);

@@ -15,8 +15,17 @@ check(isStalePending({ status: "PENDING", created_at: iso(20 * 60000) }, NOW, 10
   "20분 된 PENDING → 블랙홀");
 check(!isStalePending({ status: "PENDING", created_at: iso(2 * 60000) }, NOW, 10 * 60000),
   "2분 된 PENDING → 아직 아님");
-check(isStalePending({ status: "PENDING_CANCEL", created_at: iso(20 * 60000) }, NOW, 10 * 60000),
-  "PENDING_CANCEL도 대상");
+// PENDING_CANCEL은 취소 요청 시각(updated_at) 기준 + 더 긴 임계.
+// created_at 기준으로 재면, 오래 열려 있던 주문을 사용자가 방금 취소한 순간 즉시
+// stale로 잡혀 엔진의 정상 환불과 겹쳐 이중환불이 난다.
+check(isStalePending({ status: "PENDING_CANCEL", created_at: iso(600 * 60000), updated_at: iso(90 * 60000) },
+  NOW, 10 * 60000, 60 * 60000),
+  "PENDING_CANCEL: 취소 후 90분 → 대상");
+check(!isStalePending({ status: "PENDING_CANCEL", created_at: iso(600 * 60000), updated_at: iso(5 * 60000) },
+  NOW, 10 * 60000, 60 * 60000),
+  "★ 오래된 주문을 방금 취소 → 아직 대상 아님(엔진 환불과 경합 방지)");
+check(!isStalePending({ status: "PENDING_CANCEL", created_at: iso(600 * 60000) }, NOW, 10 * 60000, 60 * 60000),
+  "PENDING_CANCEL에 updated_at 없으면 제외");
 check(!isStalePending({ status: "ACCEPTED", created_at: iso(60 * 60000) }, NOW, 10 * 60000),
   "ACCEPTED는 블랙홀 아님(정상 대기)");
 check(!isStalePending({ status: "FILLED", created_at: iso(60 * 60000) }, NOW, 10 * 60000),
@@ -34,6 +43,32 @@ console.log("=== 스위퍼: refundPlan ===");
   check(p && p.refundAmount === 0, "잠금 0이면 환불 0(주문만 취소)");
 }
 check(refundPlan({ status: "FILLED" }) === null, "FILLED는 환불 계획 없음");
+
+// ★ 부분체결 이중환불 방지: 체결분의 잠금은 엔진이 이미 소진했으므로 미체결분만 환불한다.
+//   전액 환불하면 wallet.locked가 음수가 되며 그 차액만큼 자금이 창출된다.
+{
+  const p = refundPlan({ user_id: "u1", order_id: "o3", status: "PENDING_CANCEL",
+    lock_amount: 1000, quantity: 100, filled_qty: 50 });
+  check(p && p.refundAmount === 500, "★ 100주 중 50주 체결 → 절반(500)만 환불",
+    `refund=${p && p.refundAmount}`);
+}
+{
+  const p = refundPlan({ user_id: "u1", order_id: "o4", status: "PENDING_CANCEL",
+    lock_amount: 1000, quantity: 100, filled_qty: 100 });
+  check(p && p.refundAmount === 0, "★ 전량 체결 → 환불 0(이중환불 차단)",
+    `refund=${p && p.refundAmount}`);
+}
+{
+  const p = refundPlan({ user_id: "u1", order_id: "o5", status: "PENDING",
+    lock_amount: 1000, quantity: 100, filled_qty: 0 });
+  check(p && p.refundAmount === 1000, "미체결 → 전액 환불");
+}
+{
+  // 데이터 이상(quantity 누락)인데 체결 흔적이 있으면 보수적으로 0
+  const p = refundPlan({ user_id: "u1", order_id: "o6", status: "PENDING",
+    lock_amount: 1000, filled_qty: 30 });
+  check(p && p.refundAmount === 0, "수량 불명 + 체결 있음 → 보수적으로 환불 0");
+}
 
 console.log("=== 리컨실러: userLockDrift ===");
 {

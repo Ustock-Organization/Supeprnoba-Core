@@ -52,20 +52,30 @@ const dynamodb = DynamoDBDocumentClient.from(
 // ---------------------------------------------------------------------------
 // Valkey (ioredis) -- lazy 초기화, Lambda 컨테이너 재활용
 // ---------------------------------------------------------------------------
-let redis = null;
-function getRedis() {
-  if (redis) return redis;
-  redis = new Redis({
+// 4-Cache는 포트가 다른 별개 인스턴스다. 단일 연결(6379=depth)로 다루면
+// admin:events(operating 6382)는 구독자 없는 캐시에 발행되고, snapshot:{sym}
+// (backup 6381)은 지워지지 않고 남는다.
+const CACHE_PORTS = {
+  depth: parseInt(process.env.DEPTH_CACHE_PORT || '6379', 10),
+  candle: parseInt(process.env.CANDLE_CACHE_PORT || '6380', 10),
+  backup: parseInt(process.env.BACKUP_CACHE_PORT || '6381', 10),
+  operating: parseInt(process.env.OPERATING_CACHE_PORT || '6382', 10),
+};
+const redisClients = {};
+function getRedis(type = 'operating') {
+  if (redisClients[type]) return redisClients[type];
+  const client = new Redis({
     host: VALKEY_HOST,
-    port: VALKEY_PORT,
+    port: CACHE_PORTS[type] || VALKEY_PORT,
     connectTimeout: 5000,
     maxRetriesPerRequest: 2,
     lazyConnect: true,
   });
-  redis.on('error', (err) => {
-    console.error('[delisting-phase2] Redis connection error:', err.message);
+  client.on('error', (err) => {
+    console.error(`[delisting-phase2] Redis(${type}) connection error:`, err.message);
   });
-  return redis;
+  redisClients[type] = client;
+  return client;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +275,7 @@ export const handler = async (event) => {
   // =========================================================================
   console.log(`[delisting-phase2] Step 4: Valkey snapshot cleanup`);
   try {
-    const r = getRedis();
+    const r = getRedis('backup');   // snapshot:{sym}은 backup 캐시(6381)에 있다
     await r.connect().catch(() => {}); // 이미 연결된 경우 무시
     const deletedCount = await r.del(`snapshot:${sym}`, `snapshot:${sym}:timestamp`);
     console.log(`[delisting-phase2] Valkey DEL snapshot keys: ${deletedCount} removed`);

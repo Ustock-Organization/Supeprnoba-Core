@@ -324,7 +324,9 @@ async function unlockBalanceOnce(userId, amount) {
       UpdateExpression: 'SET balances.BOLT.available = balances.BOLT.available + :amt, '
                       + 'balances.BOLT.locked = balances.BOLT.locked - :amt, '
                       + 'version = version + :one, updated_at = :now',
-      ConditionExpression: 'version = :ver',
+      // locked 하한 필수: 없으면 중복 해제·이중 환불로 locked가 음수가 되어 자금이 창출된다
+      // (lock 쪽의 available >= :amt 와 대칭)
+      ConditionExpression: 'version = :ver AND balances.BOLT.locked >= :amt',
       ExpressionAttributeValues: {
         ':amt': amount,
         ':ver': user.version || 1,
@@ -433,14 +435,6 @@ export const handler = async (event) => {
 
     if (!symbol || !user_id) return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'Missing required fields' }) };
 
-    // === Idempotency Check (Optional - Skip if no key provided) ===
-    if (idempotency_key && action === 'ADD') {
-      const idempotencyResult = await checkIdempotency(idempotency_key, user_id);
-      if (!idempotencyResult.success) {
-        return { statusCode: 409, headers: HEADERS, body: JSON.stringify(idempotencyResult) };
-      }
-    }
-
     // === JWT Authentication (Admin Bypass Supported) ===
     // 1. 먼저 관리자 인증 시도 (API Key 또는 Admin JWT)
     const adminResult = await verifyAdmin(event);
@@ -448,7 +442,7 @@ export const handler = async (event) => {
     let isAdminOrder = false;
 
     if (adminResult.success) {
-      // 관리자는 모든 user_id로 주문 가능 (제약 없음)
+      // 관리자는 모든 user_id로 대리주문 가능 — 단 잔고/보유 잠금은 면제되지 않는다(아래 참조)
       authResult = { success: true, userId: user_id, isAdmin: true };
       isAdminOrder = true;
       console.log(`[order-router] Admin order: ${adminResult.userId} placing order for ${user_id}`);
@@ -458,6 +452,20 @@ export const handler = async (event) => {
       if (!authResult.success) {
         console.warn(`[order-router] Auth failed for user ${user_id}: ${authResult.error}`);
         return authErrorResponse(authResult, HEADERS);
+      }
+    }
+
+    // 잠금 면제는 시스템 계정에만 허용한다. 관리자 신분은 "누구 명의로 주문하느냐"의
+    // 권한일 뿐, 담보 없이 자금·주식을 만들 권한이 아니다. (과거엔 isAdminOrder이면
+    // lockAmount=0으로 무담보 주문이 가능해 단일 관리자가 무제한 자금을 생성할 수 있었다)
+    const isSystemAccount = user_id.startsWith('mm-') || user_id === 'ipo-system';
+
+    // === Idempotency Check (인증 이후 — 미인증 요청이 타인 멱등키를 선점해
+    // 정상 주문을 409로 막는 DoS를 방지) ===
+    if (idempotency_key && action === 'ADD') {
+      const idempotencyResult = await checkIdempotency(idempotency_key, user_id);
+      if (!idempotencyResult.success) {
+        return { statusCode: 409, headers: HEADERS, body: JSON.stringify(idempotencyResult) };
       }
     }
 
@@ -565,11 +573,11 @@ export const handler = async (event) => {
         }
       }
 
-      // [3] Lock 금액 계산 (관리자 주문은 잔고 잠금 스킵)
+      // [3] Lock 금액 계산 (잠금 면제는 시스템 계정에만 — 관리자 대리주문도 잠금 적용)
       let lockAmount = 0;
-      if (isAdminOrder) {
-        // 관리자 주문: 잔고/보유량 잠금 없이 직접 Kinesis로 전송
-        console.log(`[order-router] Admin bypass: skipping balance/holdings lock for ${user_id}`);
+      if (isSystemAccount) {
+        // MM/IPO 시스템 계정: 원장이 없으므로 잠금 대상이 아님
+        console.log(`[order-router] System account: skipping balance/holdings lock for ${user_id}`);
         lockAmount = 0;
       } else if (isBuy) {
         if (type === 'MARKET') {

@@ -81,13 +81,21 @@ export const handler = async (event) => {
   // SK가 있는 테이블들: Query → BatchDelete
   for (const { table, sk } of TABLES_WITH_SK) {
     try {
-      const result = await dynamodb.send(new QueryCommand({
-        TableName: table,
-        KeyConditionExpression: 'user_id = :uid',
-        ExpressionAttributeValues: { ':uid': user_id },
-        ProjectionExpression: `user_id, ${sk}`
-      }));
-      const items = result.Items || [];
+      // 페이지네이션 필수 — Query는 1MB에서 잘린다. 아래 Scan 경로는 이미 순회하고
+      // 있는데 이쪽만 누락되어, 주문·보유가 많은 유저는 일부만 삭제되고 잔여가 남았다.
+      const items = [];
+      let ExclusiveStartKey;
+      do {
+        const result = await dynamodb.send(new QueryCommand({
+          TableName: table,
+          KeyConditionExpression: 'user_id = :uid',
+          ExpressionAttributeValues: { ':uid': user_id },
+          ProjectionExpression: `user_id, ${sk}`,
+          ExclusiveStartKey,
+        }));
+        items.push(...(result.Items || []));
+        ExclusiveStartKey = result.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
       if (items.length > 0) {
         const keys = items.map(item => ({ user_id: item.user_id, [sk]: item[sk] }));
         const deleted = await batchDelete(table, keys);

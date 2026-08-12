@@ -93,9 +93,26 @@ bool ValkeyClient::connect() {
     return true;
 }
 
+bool ValkeyClient::reconnect() {
+    if (ctx_) {
+        redisFree(ctx_);
+        ctx_ = nullptr;
+    }
+    return connect();
+}
+
+bool ValkeyClient::ensureConnected() {
+    // 연결이 끊기면 redisCommand는 nullptr을 반환하지만 ctx_는 non-null로 남는다.
+    // 그 상태로 두면 모든 명령이 실패하는데 프로세스는 살아 있어(systemd
+    // Restart=on-failure가 발동하지 않음) 캔들 집계가 무경보로 영구 중단된다.
+    if (ctx_ && ctx_->err == 0 && ping()) return true;
+    Logger::warn("Valkey 연결 이상 감지 — 재연결 시도:", host_, port_);
+    return reconnect();
+}
+
 bool ValkeyClient::ping() {
     if (!ctx_) return false;
-    
+
     redisReply* reply = (redisReply*)redisCommand(ctx_, "PING");
     if (!reply) return false;
     

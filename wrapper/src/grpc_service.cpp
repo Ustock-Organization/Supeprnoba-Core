@@ -12,8 +12,8 @@ GrpcServiceImpl::GrpcServiceImpl(EngineCore* engine, RedisClient* redis)
     , auth_token_(Config::get("ENGINE_GRPC_TOKEN", ""))
     , start_time_(std::chrono::steady_clock::now()) {
     if (auth_token_.empty()) {
-        Logger::warn("gRPC 관리 채널 인증 비활성 (ENGINE_GRPC_TOKEN 미설정) — "
-                     "프로덕션에서는 반드시 설정할 것");
+        Logger::error("gRPC 관리 채널 잠김: ENGINE_GRPC_TOKEN 미설정 — 모든 관리 RPC가 거부됩니다. "
+                      "배포 시 반드시 강한 토큰을 설정할 것 (예: openssl rand -hex 32)");
     } else {
         Logger::info("gRPC 관리 채널 인증 활성 (x-engine-token 검증)");
     }
@@ -21,7 +21,10 @@ GrpcServiceImpl::GrpcServiceImpl(EngineCore* engine, RedisClient* redis)
 
 bool GrpcServiceImpl::authorize(grpc::ServerContext* context, const char* rpc_name) const {
     if (auth_token_.empty()) {
-        return true;  // 미설정 시 허용(하위호환) — 생성자에서 경고 로깅됨
+        // 페일클로즈: 토큰 미설정 시 관리 채널을 전면 거부한다.
+        // (과거의 페일오픈은 빈 토큰 출하와 결합해 VPC 도달자 누구나 오더북을 파괴할 수 있었다)
+        Logger::warn("gRPC UNAUTHENTICATED:", rpc_name, "(ENGINE_GRPC_TOKEN 미설정 — 관리 채널 잠김)");
+        return false;
     }
     const auto& md = context->client_metadata();
     auto it = md.find("x-engine-token");

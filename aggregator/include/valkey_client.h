@@ -32,6 +32,9 @@ public:
     
     bool connect();
     bool ping();
+    // 연결 상태를 확인하고 필요하면 재연결한다. 폴링 루프마다 호출할 것.
+    bool ensureConnected();
+    bool reconnect();
     
     // 심볼 목록 조회 (candle:closed:1m:* 패턴)
     std::vector<std::string> get_closed_symbols();
